@@ -72,6 +72,12 @@ impl<'a> SlotReader<'a> {
 
 // === Input traits (caller -> spier) ===
 
+/// Encodes a value into slots for passing as a method parameter (caller → spier).
+///
+/// You should not implement this manually. Built-in impls cover all conventional
+/// types (scalars, `&[u8]`, `&str`, `String`, `Vec<u8>`, `&mut Vec<u8>`, tuples,
+/// `Option<T>`, `Result<T,E>`). For custom types, use `#[slot_struct]` or
+/// `#[slot_enum]` — they generate all four slot traits automatically.
 pub trait SlotEncode {
     fn encode(&self, w: &mut SlotWriter);
 }
@@ -120,6 +126,15 @@ impl<A: SlotEncode, B: SlotEncode, C: SlotEncode, D: SlotEncode, E: SlotEncode> 
     }
 }
 
+/// Decodes a value from slots on the spier side (input parameter).
+///
+/// You should not implement this manually. For custom types, use `#[slot_struct]`
+/// or `#[slot_enum]` to generate all four slot traits automatically.
+///
+/// # Safety
+///
+/// The caller must ensure the slots were produced by a matching [`SlotEncode`]
+/// impl in the same process.
 pub trait SlotDecode<'a>: Sized {
     unsafe fn decode(r: &mut SlotReader<'a>) -> Self;
 }
@@ -130,10 +145,25 @@ pub unsafe fn decode_param<'a, T: SlotDecode<'a>>(r: &mut SlotReader<'a>) -> T {
 
 // === Output traits (spier -> caller) ===
 
+/// Encodes a return value into slots (spier → caller).
+///
+/// You should not implement this manually. Built-in impls cover all conventional
+/// types (scalars, `String`, `Vec<u8>`, `Vec<T>`, tuples, `Option<T>`,
+/// `Result<T,E>`). For custom types, use `#[slot_struct]` or `#[slot_enum]` —
+/// they generate all four slot traits automatically.
 pub trait SlotReturn: Sized {
     fn into_slots(self, w: &mut SlotWriter);
 }
 
+/// Decodes a return value from slots on the caller side.
+///
+/// You should not implement this manually. For custom types, use `#[slot_struct]`
+/// or `#[slot_enum]` to generate all four slot traits automatically.
+///
+/// # Safety
+///
+/// The caller must ensure the slots were produced by a matching [`SlotReturn`]
+/// impl in the same process.
 pub trait SlotReceive: Sized {
     unsafe fn from_slots(r: &mut SlotReader) -> Self;
 }

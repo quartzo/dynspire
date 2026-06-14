@@ -746,21 +746,28 @@ pub fn spier_storage(_attr: TokenStream, item: TokenStream) -> TokenStream {
     TokenStream::from(expanded)
 }
 
-// ---------------------------------------------------------------------------
-// #[slot_enum] — generates SlotEncode/SlotDecode/SlotReturn/SlotReceive
-// for enums by composing field impls, same pattern as Option<T> and Result<T,E>.
-//
-// discriminant (1 slot) + each field's existing impls.
-//
-// Example:
-//   #[slot_enum]
-//   pub enum Value {
-//       Text(String),      // disc 0 + String slots
-//       Int64(i64),        // disc 1 + i64 slot
-//       Unknown(i8, u64),  // disc 2 + i8 slot + u64 slot
-//   }
-// ---------------------------------------------------------------------------
-
+/// Generates [`SlotEncode`], [`SlotDecode`], [`SlotReturn`], and [`SlotReceive`]
+/// impls for an enum by flattening its variants into slots.
+///
+/// Each variant is encoded as `(discriminant, field0_slots, field1_slots, ...)`.
+/// Also generates a static [`EnumDescriptor`] for schema reflection.
+///
+/// # Example
+///
+/// ```ignore
+/// #[slot_enum]
+/// pub enum Value {
+///     Text(String),      // disc 0 + String slots
+///     Int64(i64),        // disc 1 + i64 slot
+///     Unknown(i8, u64),  // disc 2 + i8 slot + u64 slot
+/// }
+/// ```
+///
+/// [`SlotEncode`]: dynspire::slots::SlotEncode
+/// [`SlotDecode`]: dynspire::slots::SlotDecode
+/// [`SlotReturn`]: dynspire::slots::SlotReturn
+/// [`SlotReceive`]: dynspire::slots::SlotReceive
+/// [`EnumDescriptor`]: dynspire::ffi::EnumDescriptor
 #[proc_macro_attribute]
 pub fn slot_enum(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let item_enum = parse_macro_input!(item as ItemEnum);
@@ -1004,25 +1011,34 @@ fn slot_enum_impl(item_enum: &ItemEnum) -> syn::Result<TokenStream> {
     Ok(TokenStream::from(expanded))
 }
 
-// ---------------------------------------------------------------------------
-// #[slot_struct] — generates SlotEncode/SlotDecode/SlotReturn/SlotReceive
-// for structs using an opaque Box pointer (1 slot).
-//
-// The struct crosses the FFI boundary as a boxed pointer. Rust callers
-// dereference the Box directly. Foreign callers (Python) receive an opaque
-// handle — the spier author exposes field access via IDL methods if needed.
-//
-// Requires Clone (used by SlotDecode for input-param borrow pattern).
-//
-// Example:
-//   #[slot_struct]
-//   #[derive(Clone)]
-//   pub struct Stmt {
-//       kind: u8,
-//       table: String,
-//   }
-// ---------------------------------------------------------------------------
-
+/// Generates [`SlotEncode`], [`SlotDecode`], [`SlotReturn`], and [`SlotReceive`]
+/// impls for a struct using an opaque boxed pointer (1 slot).
+///
+/// The struct crosses the FFI boundary as `Box::into_raw` on the sender side
+/// and `Box::from_raw` on the receiver side. Rust callers dereference the Box
+/// and access fields natively. Python callers receive an opaque integer handle
+/// and use explicit IDL methods for field access.
+///
+/// Requires `Clone` (used by `SlotDecode` for the input borrow pattern).
+///
+/// # Example
+///
+/// ```ignore
+/// #[slot_struct]
+/// #[derive(Clone)]
+/// pub struct Stmt {
+///     kind: u8,
+///     table: String,
+/// }
+/// ```
+///
+/// The struct can then be used as a parameter type, return type, or nested
+/// inside `Option`, `Result`, tuples, etc. — always consuming exactly 1 slot.
+///
+/// [`SlotEncode`]: dynspire::slots::SlotEncode
+/// [`SlotDecode`]: dynspire::slots::SlotDecode
+/// [`SlotReturn`]: dynspire::slots::SlotReturn
+/// [`SlotReceive`]: dynspire::slots::SlotReceive
 #[proc_macro_attribute]
 pub fn slot_struct(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let item_struct = parse_macro_input!(item as syn::ItemStruct);
