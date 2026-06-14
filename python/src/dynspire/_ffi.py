@@ -18,13 +18,14 @@ IDL_STRING = 10
 IDL_BOOL = 11
 IDL_OUT_VEC = 12
 IDL_ENUM = 13
+IDL_STRUCT = 14
 
 KIND_NAMES = {
     IDL_UNIT: "Unit", IDL_U8: "U8", IDL_U32: "U32", IDL_U64: "U64",
     IDL_ARRAY: "Array", IDL_SLICE: "Slice", IDL_STR: "Str",
     IDL_VEC: "Vec", IDL_OPTION: "Option", IDL_TUPLE: "Tuple",
     IDL_STRING: "String", IDL_BOOL: "Bool", IDL_OUT_VEC: "OutVec",
-    IDL_ENUM: "Enum",
+    IDL_ENUM: "Enum", IDL_STRUCT: "Struct",
 }
 
 

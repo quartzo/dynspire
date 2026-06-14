@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use dynspire_macro::{spier_dispatch, spier_storage};
-use rle_idl::RleEngine;
+use rle_idl::{CompressionReport, RleEngine};
 
 pub struct RleState;
 
@@ -58,5 +58,31 @@ impl RleEngine for RleState {
     fn stats(&self, data: &[u8]) -> Result<(u64, u64), String> {
         let compressed = rle_compress(data);
         Ok((data.len() as u64, compressed.len() as u64))
+    }
+
+    fn analyze(&self, data: &[u8]) -> Result<CompressionReport, String> {
+        let compressed = rle_compress(data);
+        let runs = compressed.len() as u64 / 2;
+        let ratio = if data.is_empty() {
+            0.0
+        } else {
+            compressed.len() as f64 / data.len() as f64
+        };
+        Ok(CompressionReport {
+            original_size: data.len() as u64,
+            compressed_size: compressed.len() as u64,
+            ratio,
+            runs,
+        })
+    }
+
+    fn report_summary(&self, report: CompressionReport) -> Result<String, String> {
+        Ok(format!(
+            "original={} compressed={} ratio={:.1}% runs={}",
+            report.original_size,
+            report.compressed_size,
+            report.ratio * 100.0,
+            report.runs,
+        ))
     }
 }

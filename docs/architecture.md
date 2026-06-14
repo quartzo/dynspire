@@ -101,6 +101,7 @@ pub trait SlotReceive: Sized {
 | `(A, B)` | A + B | Concatenation of A's and B's slots. |
 | `Result<T, E>` | 1 + T or E | Tag (0=Ok, 1=Err) followed by the variant's slots. |
 | Enums (`#[slot_enum]`) | 1 + fields | Discriminant + each field's slots. |
+| Structs (`#[slot_struct]`) | 1 | Opaque boxed pointer (`Box::into_raw` / `Box::from_raw`). Rust dereferences directly; Python receives an opaque handle. |
 
 ### Key Design Points
 
@@ -199,6 +200,10 @@ Also generates `dynspire_idl_hash()`, `dynspire_spier_name()`, and `dynspire_idl
 ### `#[slot_enum]`
 
 Applied to an enum. Generates `SlotEncode`, `SlotDecode`, `SlotReturn`, `SlotReceive` impls plus a static `EnumDescriptor` for schema reflection. Each variant is encoded as `(discriminant, field0_slots, field1_slots, ...)`.
+
+### `#[slot_struct]`
+
+Applied to a struct. Generates `SlotEncode`, `SlotDecode`, `SlotReturn`, `SlotReceive` impls using an opaque boxed pointer (1 slot). The struct crosses the FFI boundary as `Box::into_raw` on the sender side and `Box::from_raw` on the receiver side. Rust callers access fields natively; Python callers receive an opaque integer handle and use explicit IDL methods for field access. Requires `Clone`.
 
 ---
 

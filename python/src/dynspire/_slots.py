@@ -12,6 +12,7 @@ from ._ffi import (
     IDL_SLICE,
     IDL_STR,
     IDL_STRING,
+    IDL_STRUCT,
     IDL_TUPLE,
     IDL_U8,
     IDL_U32,
@@ -144,6 +145,8 @@ def encode_slot(b: SlotBuilder, ti: TypeInfo, schema: SpierSchema, val: Any):
         pass
     elif ti.kind == IDL_ENUM:
         encode_enum(b, ti, schema, val)
+    elif ti.kind == IDL_STRUCT:
+        b.write_u64(val)
     else:
         raise ValueError(f"unsupported input type kind {ti.kind}")
 
@@ -202,6 +205,8 @@ def decode_slot(
         vinfo = enum_desc.variant_by_disc(disc)
         fields = tuple(decode_slot(r, ft, schema, lib) for ft in vinfo.field_types)
         return EnumValue(vinfo.name, *fields)
+    elif ti.kind == IDL_STRUCT:
+        return r.read_u64()
     raise ValueError(f"unsupported return type kind {ti.kind}")
 
 

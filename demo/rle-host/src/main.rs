@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use dynspire::DynSpireClient;
-use rle_idl::RleOp;
+use rle_idl::{CompressionReport, RleOp};
 
 fn hex(bytes: &[u8]) -> String {
     bytes
@@ -83,6 +83,27 @@ fn main() {
     println!("  original  : {orig} bytes");
     println!("  compressed: {comp} bytes");
     println!("  ratio     : {ratio:.1}%");
+    println!();
+
+    // --- analyze: &[u8] -> Result<CompressionReport, String> ---
+    // #[slot_struct] crosses FFI as 1 opaque slot (boxed pointer).
+    // Rust host accesses fields natively — no serialization, no navigator.
+    let report: CompressionReport = client
+        .call(RleOp::Analyze, (&input[..],))
+        .expect("analyze failed");
+    println!("analyze() -> CompressionReport (opaque box, 1 slot)");
+    println!("  original_size  : {}", report.original_size);
+    println!("  compressed_size: {}", report.compressed_size);
+    println!("  ratio          : {:.1}%", report.ratio * 100.0);
+    println!("  runs           : {}", report.runs);
+    println!();
+
+    // --- report_summary: pass struct back through FFI as opaque handle ---
+    let summary: String = client
+        .call(RleOp::ReportSummary, report.clone())
+        .expect("report_summary failed");
+    println!("report_summary(CompressionReport)");
+    println!("  -> \"{summary}\"");
 
     println!();
     println!("Done. Spier was loaded, verified, and dispatched entirely at runtime.");

@@ -389,7 +389,7 @@ impl TypeTableBuilder {
                         }
                         self.add_unit()
                     }
-                    _ => self.add_unit(),
+                    _ => self.add_struct(),
                 }
             }
             Type::Reference(r) => {
@@ -460,6 +460,14 @@ impl TypeTableBuilder {
         let idx = self.nodes.len();
         self.nodes.push(quote! {
             dynspire::ffi::IdlTypeNode { kind: dynspire::ffi::IDL_UNIT, _pad: [0; 3], size: 0, child0: -1, child1: -1 }
+        });
+        idx
+    }
+
+    fn add_struct(&mut self) -> usize {
+        let idx = self.nodes.len();
+        self.nodes.push(quote! {
+            dynspire::ffi::IdlTypeNode { kind: dynspire::ffi::IDL_STRUCT, _pad: [0; 3], size: 0, child0: -1, child1: -1 }
         });
         idx
     }
@@ -989,6 +997,68 @@ fn slot_enum_impl(item_enum: &ItemEnum) -> syn::Result<TokenStream> {
         impl #impl_generics dynspire::slots::SlotEnumDescriptor for #enum_name #ty_generics #where_clause {
             fn descriptor() -> &'static dynspire::ffi::EnumDescriptor {
                 &#desc_static
+            }
+        }
+    };
+
+    Ok(TokenStream::from(expanded))
+}
+
+// ---------------------------------------------------------------------------
+// #[slot_struct] — generates SlotEncode/SlotDecode/SlotReturn/SlotReceive
+// for structs using an opaque Box pointer (1 slot).
+//
+// The struct crosses the FFI boundary as a boxed pointer. Rust callers
+// dereference the Box directly. Foreign callers (Python) receive an opaque
+// handle — the spier author exposes field access via IDL methods if needed.
+//
+// Requires Clone (used by SlotDecode for input-param borrow pattern).
+//
+// Example:
+//   #[slot_struct]
+//   #[derive(Clone)]
+//   pub struct Stmt {
+//       kind: u8,
+//       table: String,
+//   }
+// ---------------------------------------------------------------------------
+
+#[proc_macro_attribute]
+pub fn slot_struct(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let item_struct = parse_macro_input!(item as syn::ItemStruct);
+    slot_struct_impl(&item_struct)
+        .unwrap_or_else(|e| e.to_compile_error().into())
+}
+
+fn slot_struct_impl(item_struct: &syn::ItemStruct) -> syn::Result<TokenStream> {
+    let struct_name = &item_struct.ident;
+    let (impl_generics, ty_generics, where_clause) = item_struct.generics.split_for_impl();
+
+    let expanded = quote! {
+        #item_struct
+
+        impl #impl_generics dynspire::slots::SlotEncode for #struct_name #ty_generics #where_clause {
+            fn encode(&self, w: &mut dynspire::slots::SlotWriter) {
+                w.write_u64(self as *const Self as u64);
+            }
+        }
+
+        impl #impl_generics dynspire::slots::SlotDecode<'_> for #struct_name #ty_generics #where_clause {
+            unsafe fn decode(r: &mut dynspire::slots::SlotReader<'_>) -> Self {
+                let ptr = r.read_u64() as *const Self;
+                (*ptr).clone()
+            }
+        }
+
+        impl #impl_generics dynspire::slots::SlotReturn for #struct_name #ty_generics #where_clause {
+            fn into_slots(self, w: &mut dynspire::slots::SlotWriter) {
+                w.write_u64(Box::into_raw(Box::new(self)) as u64);
+            }
+        }
+
+        impl #impl_generics dynspire::slots::SlotReceive for #struct_name #ty_generics #where_clause {
+            unsafe fn from_slots(r: &mut dynspire::slots::SlotReader) -> Self {
+                *Box::from_raw(r.read_u64() as *mut Self)
             }
         }
     };

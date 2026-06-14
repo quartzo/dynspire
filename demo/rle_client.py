@@ -65,6 +65,21 @@ def main():
         print(f"  original  : {orig} bytes")
         print(f"  compressed: {comp} bytes")
         print(f"  ratio     : {ratio:.1f}%")
+        print()
+
+        # analyze returns a #[slot_struct] — opaque boxed pointer (1 slot).
+        # Python receives a raw integer handle. Fields are accessed via
+        # explicit IDL methods, not by reading Rust memory directly.
+        report_handle = handle.call("analyze", input_data)
+        print("analyze() -> CompressionReport")
+        print(f"  opaque handle : 0x{report_handle:016x}")
+        print()
+
+        # Pass the opaque handle back to an IDL method that reads the struct
+        # on the Rust side and returns a base type (String).
+        summary = handle.call("report_summary", report_handle)
+        print("report_summary(handle)")
+        print(f'  -> "{summary}"')
 
     print()
     print("Done. Everything discovered and dispatched via ctypes at runtime.")

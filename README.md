@@ -44,7 +44,7 @@ with load_spier("rle_spier", lib_dir="target/debug").create_handle() as h:
 - **Type-safe dispatch** — Rust hosts use generated Op enums. No magic numbers.
 - **IDL hash verification** — incompatible plugins are rejected at load time.
 - **Python without codegen** — `ctypes` reads the IDL schema from the `.so` directly. No stub generation, no `bindgen`, no C headers.
-- **Any return type** — `Result<T, String>` where `T` can be `()`, `Vec<u8>`, `(u64, u64)`, `Option<String>`, or any composed type the slot system supports.
+- **Any return type** — `Result<T, String>` where `T` can be `()`, `Vec<u8>`, `(u64, u64)`, `Option<String>`, any `#[slot_enum]` type, any `#[slot_struct]` type, or any composed combination.
 
 ## Performance
 
@@ -96,7 +96,7 @@ stats()
 
 ```
 dynspire/          Core: arena FFI, slot system, tower client
-dynspire-macro/    Proc macros: #[modulo_interface], #[spier_dispatch], #[spier_storage], #[slot_enum]
+dynspire-macro/    Proc macros: #[modulo_interface], #[spier_dispatch], #[spier_storage], #[slot_enum], #[slot_struct]
 dynspire-libs/     Library discovery helpers
 python/            ctypes adapter (schema-driven, zero codegen)
 demo/              RLE compression showcase
@@ -120,7 +120,7 @@ demo/              RLE compression showcase
     dynspire_destroy()  → free State
 ```
 
-Arguments and return values flow through **u64 slots** — a compact calling convention that handles scalars, borrows, owned types, tuples, and enums without heap allocation on the FFI boundary.
+Arguments and return values flow through **u64 slots** — a compact calling convention that handles scalars, borrows, owned types, tuples, enums, and structs without heap allocation on the FFI boundary. Complex structs cross as opaque boxed pointers (1 slot) via `#[slot_struct]`.
 
 For the deep dive, see [docs/architecture.md](docs/architecture.md).
 
