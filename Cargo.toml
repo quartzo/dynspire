@@ -1,0 +1,4 @@
+[workspace]
+members = ["dynspire", "dynspire-macro", "demo/rle-idl", "demo/rle-spier", "demo/rle-host"]
+default-members = ["dynspire", "dynspire-macro", "demo/rle-idl", "demo/rle-spier", "demo/rle-host"]
+resolver = "2"

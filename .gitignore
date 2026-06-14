@@ -1,0 +1,17 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Rust / Cargo
+target/
+
+# Maturin native extensions
+*.so
+*.pyd
+
+# Virtual environments
+.venv

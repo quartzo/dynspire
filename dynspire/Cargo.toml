@@ -1,0 +1,13 @@
+[package]
+name = "dynspire"
+version = "0.1.0"
+edition = "2021"
+description = "DynSpire - dynamic spire framework (arena, runtime, FFI, tower client)"
+license = "MIT"
+
+[dependencies]
+uuid = { version = "1", features = ["v4"] }
+libloading = { version = "0.8" }
+form_urlencoded = "1"
+
+

@@ -1,0 +1,14 @@
+[package]
+name = "dynspire-macro"
+version = "0.1.0"
+edition = "2021"
+description = "Procedural macros for DynSpire spier boilerplate"
+license = "MIT"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"

@@ -1,0 +1,14 @@
+[package]
+name = "rle-spier"
+version = "0.1.0"
+edition = "2021"
+description = "DynSpire spier — RLE compression engine (cdylib, loaded via dlopen)"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+dynspire = { path = "../../dynspire" }
+dynspire-macro = { path = "../../dynspire-macro" }
+rle-idl = { path = "../rle-idl" }
