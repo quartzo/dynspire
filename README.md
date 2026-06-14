@@ -46,6 +46,28 @@ with load_spier("rle_spier", lib_dir="target/debug").create_handle() as h:
 - **Python without codegen** — `ctypes` reads the IDL schema from the `.so` directly. No stub generation, no `bindgen`, no C headers.
 - **Any return type** — `Result<T, String>` where `T` can be `()`, `Vec<u8>`, `(u64, u64)`, `Option<String>`, any `#[slot_enum]` type, any `#[slot_struct]` type, or any composed combination.
 
+## The Boundary as Discipline
+
+The IDL + `.so` split isn't just about runtime loading — it's an architectural
+constraint that enforces clean separation at compile time.
+
+- **Every dependency is explicit.** The IDL crate defines the interface. The
+  spier depends on the IDL, not on the host. The host depends on the IDL, not
+  on the spier's internals. No sneaky imports, no shared private modules. If
+  it's not in the IDL trait, it doesn't cross the boundary.
+- **Interfaces stay focused.** Return types cross as ≤8 `u64` slots. You can't
+  return a 50-field struct without consciously choosing `#[slot_struct]`. This
+  friction is intentional — it surfaces design problems at the interface, not
+  at integration time.
+- **Components are independently built and tested.** Each spier is a separate
+  crate with its own `Cargo.toml`, test suite, and release cycle. You can't
+  reach into another component's internals during a refactor.
+
+This is particularly effective with LLM-assisted development. LLMs naturally
+gravitate toward tight coupling — sharing types, building implicit dependencies,
+reaching across boundaries. DynSpire makes those patterns impossible at compile
+time. The only path through is a clean, explicitly declared interface.
+
 ## Performance
 
 The FFI overhead per dispatch is ~5x a direct function call — tens of nanoseconds for slot encode + indirect call + decode. This is insignificant compared to any real work the function performs: a single `HashMap` lookup or `Vec` allocation already costs more. For plugins that do I/O, data processing, or storage operations, the overhead is unmeasurable noise.
