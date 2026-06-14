@@ -5,6 +5,60 @@ use syn::{
     parse_macro_input, FnArg, Ident, ItemEnum, ItemFn, ItemTrait, Type,
 };
 
+/// Generates the IDL infrastructure for a spier trait.
+///
+/// Given a trait named `{Name}Engine`, produces:
+///
+/// - `{PREFIX}_IDL_HASH: u64` — FNV-1a hash of the canonical method signatures.
+///   Used by the host to verify spier compatibility at load time.
+/// - `pub static IDL: IdlDescriptor` — bundle of hash + method names for
+///   `DynSpireClient::connect()`.
+/// - `{Prefix}Op` — `#[repr(u8)]` enum with one variant per method
+///   (snake_case → PascalCase). Pass to `client.call(Op::Method, args)`.
+/// - `pub mod tower` — internal schema statics (`IDL_TYPE_TABLE`,
+///   `IDL_METHODS`, `IDL_SCHEMA`).
+/// - `idl_schema()` — returns `&'static DynSpireIdl`.
+///
+/// The prefix is derived from the trait name by stripping an `Engine` suffix.
+/// For example, `RleEngine` → prefix `Rle` → `RLE_IDL_HASH`, `RleOp`, `IDL`.
+/// Without the suffix, the full trait name is used.
+///
+/// # Example
+///
+/// ```ignore
+/// #[modulo_interface]
+/// pub trait RleEngine {
+///     fn compress(&self, data: &[u8]) -> Result<Vec<u8>, String>;
+/// }
+///
+/// // Generated:
+/// //   pub const RLE_IDL_HASH: u64 = ...;
+/// //   pub static IDL: IdlDescriptor = ...;
+/// //   pub enum RleOp { Compress, ... }
+/// ```
+///
+/// # Usage in hosts and spiers
+///
+/// IDL crate (shared):
+/// ```ignore
+/// #[modulo_interface]
+/// pub trait MyEngine { ... }
+/// ```
+///
+/// Host:
+/// ```ignore
+/// let client = DynSpireClient::connect("my_spier", &my_idl::IDL, &config)?;
+/// let result: Vec<u8> = client.call(MyOp::DoThing, (&input[..]))?;
+/// ```
+///
+/// Spier:
+/// ```ignore
+/// #[spier_dispatch(name = "my", idl = my_idl::MY_IDL_HASH)]
+/// impl MyEngine for MyState { ... }
+/// ```
+///
+/// Accepts an optional `enums(Name1, Name2, ...)` attribute to register
+/// `#[slot_enum]` types that are not directly referenced by any method.
 #[proc_macro_attribute]
 pub fn modulo_interface(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut item_trait = parse_macro_input!(item as ItemTrait);
@@ -488,6 +542,29 @@ fn classify_return_type(ty: &Type) -> Option<Type> {
     None
 }
 
+/// Generates the C-ABI dispatch functions for a spier implementation.
+///
+/// Applied to `impl Trait for State`. For each method in the trait, generates
+/// a `dynspire_dispatch_{method}` extern "C" function that decodes arguments
+/// from slots, calls the method, and encodes the `Result<T, String>` return.
+///
+/// Also generates `dynspire_idl_hash()`, `dynspire_spier_name()`, and
+/// `dynspire_idl_schema()`.
+///
+/// # Attributes
+///
+/// - `name = "..."` — the spier name (used for discovery).
+/// - `idl = path::to::HASH` — the IDL hash constant from the IDL crate
+///   (e.g., `my_idl::MY_IDL_HASH`).
+///
+/// # Example
+///
+/// ```ignore
+/// #[spier_dispatch(name = "my", idl = my_idl::MY_IDL_HASH)]
+/// impl MyEngine for MyState {
+///     fn do_thing(&self, data: &[u8]) -> Result<Vec<u8>, String> { ... }
+/// }
+/// ```
 #[proc_macro_attribute]
 pub fn spier_dispatch(attr: TokenStream, item: TokenStream) -> TokenStream {
     spier_dispatch_impl(attr, item)
@@ -672,6 +749,23 @@ fn parse_dispatch_attrs(attr: TokenStream) -> DispatchAttrs {
     }
 }
 
+/// Generates `dynspire_create` and `dynspire_destroy` C-ABI entry points.
+///
+/// Applied to an init function that takes `&HashMap<String, String>` and
+/// returns `Result<StateType, String>`. Generates:
+///
+/// - `dynspire_create(data_ptr, data_len) -> *mut c_void` — deserializes the
+///   config kvmap, calls the init function, returns `Box::into_raw(state)`.
+/// - `dynspire_destroy(handle)` — drops the boxed state.
+///
+/// # Example
+///
+/// ```ignore
+/// #[spier_storage]
+/// fn init(config: &HashMap<String, String>) -> Result<MyState, String> {
+///     Ok(MyState { ... })
+/// }
+/// ```
 #[proc_macro_attribute]
 pub fn spier_storage(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let item_fn = parse_macro_input!(item as ItemFn);
