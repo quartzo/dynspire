@@ -17,4 +17,6 @@ pub trait RleEngine {
     fn stats(&self, data: &[u8]) -> Result<(u64, u64), String>;
     fn analyze(&self, data: &[u8]) -> Result<CompressionReport, String>;
     fn report_summary(&self, report: CompressionReport) -> Result<String, String>;
+    fn run_labels(&self, data: &[u8]) -> Result<Vec<String>, String>;
+    fn split_runs(&self, data: &[u8]) -> Result<Vec<Vec<u8>>, String>;
 }

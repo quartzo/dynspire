@@ -85,4 +85,22 @@ impl RleEngine for RleState {
             report.runs,
         ))
     }
+
+    fn run_labels(&self, data: &[u8]) -> Result<Vec<String>, String> {
+        let compressed = rle_compress(data);
+        let labels = compressed
+            .chunks_exact(2)
+            .map(|pair| format!("{}×{}", pair[0], pair[1] as char))
+            .collect();
+        Ok(labels)
+    }
+
+    fn split_runs(&self, data: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+        let compressed = rle_compress(data);
+        let runs = compressed
+            .chunks_exact(2)
+            .map(|pair| vec![pair[1]; pair[0] as usize])
+            .collect();
+        Ok(runs)
+    }
 }
