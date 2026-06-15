@@ -24,6 +24,178 @@ from ._ffi import (
 )
 from ._schema import EnumValue, MethodInfo, SpierSchema, TypeInfo
 
+_SCALAR_KINDS = frozenset({IDL_UNIT, IDL_BOOL, IDL_U8, IDL_U32, IDL_U64})
+_UNSET = object()
+
+
+class FFIResource:
+    """Wraps a non-scalar spier return value with lazy access to Rust heap memory.
+
+    Data is read directly from Rust memory on demand -- no copy until the user
+    actually accesses the content (``str()``, ``bytes()``, indexing, etc.).
+    The Rust allocation is released via ``dynspire_free`` on ``close()`` or GC.
+
+    For ``String`` / ``Vec<u8>``: ``len()``, indexing, and iteration read
+    individual bytes from the Rust pointer without copying the full buffer.
+    For ``#[slot_struct]``: the opaque handle is exposed directly.
+    For other types: the full value is decoded on first access (``.value``)
+    and cached.
+    """
+
+    def __init__(self, type_index: int, slots: list[int], lib: ctypes.CDLL, schema: SpierSchema):
+        self._type_index = type_index
+        self._slots = slots
+        self._lib = lib
+        self._schema = schema
+        self._ti = schema.type_at(type_index)
+        self._closed = False
+        self._cached: Any = _UNSET
+
+    # ---- Lifecycle ----
+
+    @property
+    def value(self) -> Any:
+        if self._cached is not _UNSET:
+            return self._cached
+        if self._closed:
+            return None
+        r = SlotDecoder(self._slots)
+        r.read_u64()
+        val = decode_slot(r, self._ti, self._schema, self._lib)
+        self._cached = val
+        return val
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        slots = self._slots
+        self._slots = None
+        self._cached = None
+        if slots:
+            _free(self._lib, self._type_index, slots)
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    # ---- Internal slot helpers ----
+
+    def _is_byte_buffer(self) -> bool:
+        if self._ti.kind == IDL_STRING:
+            return True
+        if self._ti.kind == IDL_VEC and self._ti.child0 >= 0:
+            return self._schema.type_at(self._ti.child0).kind == IDL_U8
+        return False
+
+    def _is_vec_of_vec(self) -> bool:
+        if self._ti.kind != IDL_VEC or self._ti.child0 < 0:
+            return False
+        child = self._schema.type_at(self._ti.child0)
+        if child.kind == IDL_STRING:
+            return True
+        if child.kind == IDL_VEC and child.child0 >= 0:
+            return self._schema.type_at(child.child0).kind == IDL_U8
+        return False
+
+    def _read_vec_element(self, index: int) -> Any:
+        vec_size = get_vec_sizeof(self._lib)
+        elem_addr = self._slots[1] + index * vec_size
+        data = read_rust_vec_u8(self._lib, elem_addr)
+        child = self._schema.type_at(self._ti.child0)
+        if child.kind == IDL_STRING:
+            return data.decode("utf-8", errors="replace")
+        return data
+
+    # ---- Lazy methods for String / Vec<u8> / Vec<String> / Vec<Vec<u8>> ----
+
+    def __len__(self):
+        if not self._closed and (self._is_byte_buffer() or self._is_vec_of_vec()):
+            return self._slots[2]
+        return len(self.value)
+
+    def __getitem__(self, key):
+        if not self._closed and self._is_byte_buffer():
+            ptr = self._slots[1]
+            length = self._slots[2]
+            if isinstance(key, slice):
+                indices = range(*key.indices(length))
+                return bytes(ctypes.c_uint8.from_address(ptr + i).value for i in indices)
+            return ctypes.c_uint8.from_address(ptr + key).value
+        if not self._closed and self._is_vec_of_vec():
+            count = self._slots[2]
+            if isinstance(key, slice):
+                return [self._read_vec_element(i) for i in range(*key.indices(count))]
+            return self._read_vec_element(key)
+        return self.value[key]
+
+    def __iter__(self):
+        if not self._closed and self._is_byte_buffer():
+            return self._iter_bytes()
+        if not self._closed and self._is_vec_of_vec():
+            return self._iter_vec_elements()
+        return iter(self.value)
+
+    def _iter_bytes(self):
+        ptr = self._slots[1]
+        for i in range(self._slots[2]):
+            yield ctypes.c_uint8.from_address(ptr + i).value
+
+    def _iter_vec_elements(self):
+        count = self._slots[2]
+        for i in range(count):
+            yield self._read_vec_element(i)
+
+    def __str__(self):
+        if not self._closed and self._ti.kind == IDL_STRING:
+            return ctypes.string_at(self._slots[1], self._slots[2]).decode("utf-8", errors="replace")
+        return str(self.value)
+
+    def __bytes__(self):
+        if not self._closed and self._is_byte_buffer():
+            return ctypes.string_at(self._slots[1], self._slots[2])
+        return bytes(self.value)
+
+    # ---- Lazy methods for Struct (opaque handle) ----
+
+    def __int__(self):
+        if not self._closed and self._ti.kind == IDL_STRUCT:
+            return self._slots[1]
+        return int(self.value)
+
+    def __format__(self, spec):
+        if not self._closed and self._ti.kind == IDL_STRUCT:
+            return format(self._slots[1], spec)
+        return format(self.value, spec)
+
+    def __bool__(self):
+        if not self._closed and self._ti.kind == IDL_STRUCT:
+            return self._slots[1] != 0
+        return bool(self.value)
+
+    # ---- Generic passthrough ----
+
+    def __eq__(self, other):
+        if self._closed:
+            return False
+        v = self.value
+        if isinstance(other, FFIResource):
+            return v == other.value
+        return v == other
+
+    def __hash__(self):
+        return hash(self.value)
+
+    def __repr__(self):
+        if self._closed:
+            return "FFIResource(closed)"
+        return f"FFIResource({self._ti.kind_name})"
+
+    def __getattr__(self, name: str):
+        return getattr(self.value, name)
+
 
 class SlotBuilder:
     """Builds u64 slots for request encoding (caller -> spier)."""
@@ -99,6 +271,8 @@ def encode_enum(b: SlotBuilder, ti: TypeInfo, schema: SpierSchema, val: Any):
 
 
 def encode_slot(b: SlotBuilder, ti: TypeInfo, schema: SpierSchema, val: Any):
+    if isinstance(val, FFIResource):
+        val = val.value
     if ti.kind == IDL_BOOL:
         b.write_u64(1 if val else 0)
     elif ti.kind == IDL_U32:
@@ -151,6 +325,17 @@ def encode_slot(b: SlotBuilder, ti: TypeInfo, schema: SpierSchema, val: Any):
         raise ValueError(f"unsupported input type kind {ti.kind}")
 
 
+def _free(lib: ctypes.CDLL, type_index: int, slots: list[int]):
+    try:
+        fn = lib.dynspire_free
+        fn.argtypes = [ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint64), ctypes.c_size_t]
+        fn.restype = None
+        arr = (ctypes.c_uint64 * len(slots))(*slots)
+        fn(type_index, arr, len(slots))
+    except (AttributeError, OSError):
+        pass
+
+
 def decode_response(
     slots: list[int], schema: SpierSchema, method: MethodInfo, lib: ctypes.CDLL
 ) -> Any:
@@ -160,9 +345,12 @@ def decode_response(
     tag = r.read_u64()
     if tag == 1:
         err = r.read_owned_bytes().decode("utf-8", errors="replace")
+        _free(lib, method.return_type_idx, slots)
         raise RuntimeError(f"spier error: {err}")
     ti = schema.type_at(method.return_type_idx)
-    return decode_slot(r, ti, schema, lib)
+    if ti.kind in _SCALAR_KINDS:
+        return decode_slot(r, ti, schema, lib)
+    return FFIResource(method.return_type_idx, slots, lib, schema)
 
 
 def decode_slot(

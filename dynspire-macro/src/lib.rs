@@ -106,6 +106,7 @@ pub fn modulo_interface(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let mut type_table = TypeTableBuilder::new();
     let mut schema_methods: Vec<TokenStream2> = Vec::new();
+    let mut free_types: Vec<(syn::LitInt, Type)> = Vec::new();
 
     for method in method_refs.iter() {
         let method_name_str = method.sig.ident.to_string();
@@ -131,6 +132,8 @@ pub fn modulo_interface(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
         let ok_type = extract_ok_type(&return_type).unwrap_or_else(|| syn::parse_quote!(()));
         let ret_idx = type_table.add(&ok_type) as u32;
+        let ret_idx_lit = syn::LitInt::new(&format!("{ret_idx}"), proc_macro2::Span::call_site());
+        free_types.push((ret_idx_lit, ok_type.clone()));
 
         let pc = param_entries.len();
 
@@ -156,6 +159,9 @@ pub fn modulo_interface(attr: TokenStream, item: TokenStream) -> TokenStream {
     let type_nodes = type_table.nodes;
     let type_count = type_nodes.len();
     let method_count = schema_methods.len();
+
+    let free_idxs: Vec<&syn::LitInt> = free_types.iter().map(|(i, _)| i).collect();
+    let free_tys: Vec<&Type> = free_types.iter().map(|(_, t)| t).collect();
 
     // Add extra enums (not referenced by any method but exported via attribute)
     let mut enum_type_names = type_table.enum_type_names.clone();
@@ -237,6 +243,30 @@ pub fn modulo_interface(attr: TokenStream, item: TokenStream) -> TokenStream {
             hash: #idl_hash_lit,
             methods: tower::METHODS,
         };
+
+        #[no_mangle]
+        pub unsafe extern "C" fn dynspire_free(
+            type_index: u32,
+            slots: *const u64,
+            slot_count: usize,
+        ) {
+            if slots.is_null() || slot_count == 0 { return; }
+            let slice = std::slice::from_raw_parts(slots, slot_count);
+            let mut r = dynspire::slots::SlotReader::new(slice);
+            let tag = r.read_u64();
+            if tag == 1 {
+                let _: String = dynspire::slots::SlotReceive::from_slots(&mut r);
+                return;
+            }
+            match type_index {
+                #(
+                    #free_idxs => {
+                        let _: #free_tys = dynspire::slots::SlotReceive::from_slots(&mut r);
+                    }
+                )*
+                _ => {}
+            }
+        }
 
     };
     TokenStream::from(expanded)

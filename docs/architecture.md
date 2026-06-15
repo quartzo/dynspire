@@ -267,7 +267,7 @@ with lib.create_handle() as handle:
 The `SpierHandle` holds the schema internally. Positional args are bound by parameter order (skipping `OutVec` params). The adapter handles:
 
 - **Borrows** (`&[u8]`, `&str`): allocates ctypes byte arrays, keeps them alive during the call
-- **Owned returns** (`Vec<u8>`, `String`): reads `(ptr, len)` from slots, copies bytes
+- **Owned returns** (`Vec<u8>`, `String`, `#[slot_struct]`): reads `(ptr, len)` or opaque handle from slots, wraps in `FFIResource` for lifecycle management (see below)
 - **OutVec** (`&mut Vec<u8>`): creates a Rust `Vec` via `dynspire_vec_create()`, passes pointer, reads back via `dynspire_vec_view()`, frees via `dynspire_vec_free()`
 - **Result<T, String>**: reads tag slot, decodes Ok value or raises `RuntimeError` with the error string
 
@@ -280,6 +280,22 @@ with lib.create_handle() as handle:
 ```
 
 `SpierHandle.__del__` is a safety net — calls `destroy()` if the `with` block wasn't used. `destroy()` is idempotent (checks for null handle).
+
+### Return Value Lifecycle (`FFIResource`)
+
+Non-scalar return values from the spier carry heap allocations that must be released. All non-scalar returns are wrapped in `FFIResource`, which provides **lazy access** to the Rust heap memory — data is never copied until the user explicitly accesses it.
+
+**Lazy access by type:**
+
+- **`String` / `Vec<u8>`**: `len()` reads the length from slot metadata (no copy). Indexing and iteration read individual bytes directly from the Rust pointer. `str()` / `bytes()` copy the full buffer on demand.
+- **`#[slot_struct]`**: the opaque handle is exposed via `int()` directly from the slot (no decode). Can be passed to subsequent calls — `encode_slot` unwraps automatically.
+- **Other types** (`Vec<String>`, tuples, enums): decoded on first `.value` access and cached.
+
+**Mechanism:** Each spier exports a single unified `dynspire_free(type_index, slots, count)` function. It reconstructs the value via `SlotReceive::from_slots` and drops it — the Rust `Drop` cascade frees all nested heap allocations. Called on `close()` or garbage collection (`__del__`).
+
+**Error path:** When a spier returns `Err(String)`, the adapter calls `dynspire_free` to release the error string's heap allocation before raising `RuntimeError`.
+
+**Transparency:** `FFIResource` proxies dunder methods (`__len__`, `__iter__`, `__eq__`, `__str__`, `__format__`, `__getattr__`, etc.) with lazy semantics. Scalar returns (`u32`, `bool`, etc.) are returned as native Python values with no wrapping.
 
 ---
 
