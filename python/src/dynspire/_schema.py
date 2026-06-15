@@ -12,6 +12,7 @@ from ._ffi import (
     IdlMethod,
     IdlParam,
     IdlTypeNode,
+    StructDescriptor,
     read_cstring,
 )
 
@@ -101,6 +102,8 @@ class SpierSchema:
     types: list[TypeInfo]
     methods: list[MethodInfo]
     enums: list[EnumSchema] = field(default_factory=list)
+    struct_names: list[str] = field(default_factory=list)
+    free_fn: Any = None
     _method_map: dict[str, MethodInfo] = field(default_factory=dict, repr=False)
     _enum_map: dict[int, EnumSchema] = field(default_factory=dict, repr=False)
     _enum_name_map: dict[str, EnumSchema] = field(default_factory=dict, repr=False)
@@ -121,6 +124,9 @@ class SpierSchema:
             return "?"
         t = self.types[idx]
         name = KIND_NAMES.get(t.kind, f"?{t.kind}")
+        if t.kind == 14 and t.child0 >= 0:
+            sname = self.struct_names[t.child0] if t.child0 < len(self.struct_names) else "?"
+            return f"Struct<{sname}>"
         parts = []
         if t.child0 >= 0:
             parts.append(self.type_str(t.child0))
@@ -142,6 +148,14 @@ class SpierSchema:
 
     def enum_by_name(self, name: str) -> EnumSchema:
         return self._enum_name_map[name]
+
+    def struct_name_for_type(self, type_idx: int) -> str | None:
+        ti = self.type_at(type_idx)
+        if ti.kind != 14 or ti.child0 < 0:
+            return None
+        if ti.child0 >= len(self.struct_names):
+            return None
+        return self.struct_names[ti.child0]
 
 
 def read_schema_types(schema: DynSpireIdl) -> list[TypeInfo]:
@@ -199,9 +213,28 @@ def read_schema_enums(schema: DynSpireIdl) -> list[EnumSchema]:
     return result
 
 
+def read_schema_structs(schema: DynSpireIdl) -> list[str]:
+    result: list[str] = []
+    if schema.struct_count == 0:
+        return result
+    ptr_arr = (ctypes.c_void_p * schema.struct_count).from_address(schema.struct_table)
+    for i in range(schema.struct_count):
+        desc_ptr = ptr_arr[i]
+        if not desc_ptr:
+            result.append("")
+            continue
+        desc = StructDescriptor.from_address(desc_ptr)
+        result.append(read_cstring(desc.name, desc.name_len))
+    return result
+
+
 def read_schema(schema: DynSpireIdl) -> SpierSchema:
     types = read_schema_types(schema)
     methods = read_schema_methods(schema)
     enums = read_schema_enums(schema)
+    structs = read_schema_structs(schema)
     name = read_cstring(schema.name, schema.name_len) if schema.name_len > 0 else ""
-    return SpierSchema(name=name, hash=schema.hash, types=types, methods=methods, enums=enums)
+    return SpierSchema(
+        name=name, hash=schema.hash, types=types, methods=methods,
+        enums=enums, struct_names=structs, free_fn=schema.free_fn,
+    )

@@ -47,6 +47,17 @@ pub struct IdlMethod {
 
 unsafe impl Sync for IdlMethod {}
 
+pub type FreeFn = unsafe extern "C" fn(type_index: u32, slots: *const u64, slot_count: usize);
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct StructDescriptor {
+    pub name: *const u8,
+    pub name_len: usize,
+}
+
+unsafe impl Sync for StructDescriptor {}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct DynSpireIdl {
@@ -59,6 +70,9 @@ pub struct DynSpireIdl {
     pub method_count: usize,
     pub enum_table: *const *const EnumDescriptor,
     pub enum_count: usize,
+    pub struct_table: *const *const StructDescriptor,
+    pub struct_count: usize,
+    pub free_fn: FreeFn,
 }
 
 unsafe impl Sync for DynSpireIdl {}

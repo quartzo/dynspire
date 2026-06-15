@@ -81,6 +81,16 @@ class EnumDescriptorC(ctypes.Structure):
     ]
 
 
+FREE_FN = ctypes.CFUNCTYPE(None, ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint64), ctypes.c_size_t)
+
+
+class StructDescriptor(ctypes.Structure):
+    _fields_ = [
+        ("name", ctypes.c_void_p),
+        ("name_len", ctypes.c_size_t),
+    ]
+
+
 class DynSpireIdl(ctypes.Structure):
     _fields_ = [
         ("name", ctypes.c_void_p),
@@ -92,6 +102,9 @@ class DynSpireIdl(ctypes.Structure):
         ("method_count", ctypes.c_size_t),
         ("enum_table", ctypes.c_void_p),
         ("enum_count", ctypes.c_size_t),
+        ("struct_table", ctypes.c_void_p),
+        ("struct_count", ctypes.c_size_t),
+        ("free_fn", FREE_FN),
     ]
 
 

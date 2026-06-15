@@ -178,6 +178,19 @@ pub fn modulo_interface(attr: TokenStream, item: TokenStream) -> TokenStream {
         ))
         .collect();
 
+    let struct_type_names = &type_table.struct_type_names;
+    let struct_count = struct_type_names.len();
+    let struct_desc_idents: Vec<Ident> = struct_type_names.iter()
+        .map(|name| Ident::new(
+            &format!("__SLOT_STRUCT_DESCRIPTOR_{}", name),
+            proc_macro2::Span::call_site(),
+        ))
+        .collect();
+    let struct_name_lits: Vec<TokenStream2> = struct_type_names.iter()
+        .map(|name| format!("b\"{}\\0\"", name).parse::<TokenStream2>().unwrap())
+        .collect();
+    let struct_name_lens: Vec<usize> = struct_type_names.iter().map(|n| n.len()).collect();
+
     let expanded = quote! {
         #[allow(dead_code)]
         #item_trait
@@ -209,6 +222,14 @@ pub fn modulo_interface(attr: TokenStream, item: TokenStream) -> TokenStream {
             fn as_index(self) -> usize { self as usize }
         }
 
+        #(
+            #[doc(hidden)]
+            pub static #struct_desc_idents: dynspire::ffi::StructDescriptor = dynspire::ffi::StructDescriptor {
+                name: #struct_name_lits.as_ptr(),
+                name_len: #struct_name_lens,
+            };
+        )*
+
         pub mod tower {
             use super::*;
 
@@ -226,6 +247,10 @@ pub fn modulo_interface(attr: TokenStream, item: TokenStream) -> TokenStream {
                 #( &(super::#enum_desc_idents) ),*
             ];
 
+            pub static IDL_STRUCT_PTRS: &[&'static dynspire::ffi::StructDescriptor] = &[
+                #( &(super::#struct_desc_idents) ),*
+            ];
+
             pub static IDL_SCHEMA: dynspire::ffi::DynSpireIdl = dynspire::ffi::DynSpireIdl {
                 name: b"\0".as_ptr(),
                 name_len: 0,
@@ -236,6 +261,9 @@ pub fn modulo_interface(attr: TokenStream, item: TokenStream) -> TokenStream {
                 method_count: #method_count,
                 enum_table: IDL_ENUM_PTRS.as_ptr() as *const *const dynspire::ffi::EnumDescriptor,
                 enum_count: #enum_count,
+                struct_table: IDL_STRUCT_PTRS.as_ptr() as *const *const dynspire::ffi::StructDescriptor,
+                struct_count: #struct_count,
+                free_fn: super::dynspire_free,
             };
         }
 
@@ -244,7 +272,6 @@ pub fn modulo_interface(attr: TokenStream, item: TokenStream) -> TokenStream {
             methods: tower::METHODS,
         };
 
-        #[no_mangle]
         pub unsafe extern "C" fn dynspire_free(
             type_index: u32,
             slots: *const u64,
@@ -355,11 +382,12 @@ fn extract_method_params(sig: &syn::Signature) -> Vec<(Ident, Type)> {
 struct TypeTableBuilder {
     nodes: Vec<TokenStream2>,
     enum_type_names: Vec<String>,
+    struct_type_names: Vec<String>,
 }
 
 impl TypeTableBuilder {
     fn new() -> Self {
-        Self { nodes: Vec::new(), enum_type_names: Vec::new() }
+        Self { nodes: Vec::new(), enum_type_names: Vec::new(), struct_type_names: Vec::new() }
     }
 
     fn add(&mut self, ty: &Type) -> usize {
@@ -473,7 +501,7 @@ impl TypeTableBuilder {
                         }
                         self.add_unit()
                     }
-                    _ => self.add_struct(),
+                    _ => self.add_struct(seg.ident.to_string()),
                 }
             }
             Type::Reference(r) => {
@@ -548,10 +576,17 @@ impl TypeTableBuilder {
         idx
     }
 
-    fn add_struct(&mut self) -> usize {
+    fn add_struct(&mut self, name: String) -> usize {
+        let struct_idx = if let Some(pos) = self.struct_type_names.iter().position(|n| n == &name) {
+            pos
+        } else {
+            self.struct_type_names.push(name);
+            self.struct_type_names.len() - 1
+        };
         let idx = self.nodes.len();
+        let struct_idx_i32 = struct_idx as i32;
         self.nodes.push(quote! {
-            dynspire::ffi::IdlTypeNode { kind: dynspire::ffi::IDL_STRUCT, _pad: [0; 3], size: 0, child0: -1, child1: -1 }
+            dynspire::ffi::IdlTypeNode { kind: dynspire::ffi::IDL_STRUCT, _pad: [0; 3], size: 0, child0: #struct_idx_i32, child1: -1 }
         });
         idx
     }

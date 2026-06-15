@@ -73,7 +73,7 @@ class FFIResource:
         self._slots = None
         self._cached = None
         if slots:
-            _free(self._lib, self._type_index, slots)
+            _free(self._schema.free_fn, self._type_index, slots)
 
     def __del__(self):
         try:
@@ -271,6 +271,17 @@ def encode_enum(b: SlotBuilder, ti: TypeInfo, schema: SpierSchema, val: Any):
 
 
 def encode_slot(b: SlotBuilder, ti: TypeInfo, schema: SpierSchema, val: Any):
+    if ti.kind == IDL_STRUCT:
+        if not isinstance(val, FFIResource):
+            raise TypeError(f"struct parameter requires FFIResource, got {type(val).__name__}")
+        if val._ti.kind != IDL_STRUCT:
+            raise TypeError(f"expected struct, got {val._ti.kind_name}")
+        target_name = schema.struct_names[ti.child0] if ti.child0 < len(schema.struct_names) else None
+        source_name = val._schema.struct_names[val._ti.child0] if val._ti.child0 < len(val._schema.struct_names) else None
+        if target_name is not None and source_name is not None and target_name != source_name:
+            raise TypeError(f"struct type mismatch: expected {target_name}, got {source_name}")
+        b.write_u64(val.value)
+        return
     if isinstance(val, FFIResource):
         val = val.value
     if ti.kind == IDL_BOOL:
@@ -319,21 +330,15 @@ def encode_slot(b: SlotBuilder, ti: TypeInfo, schema: SpierSchema, val: Any):
         pass
     elif ti.kind == IDL_ENUM:
         encode_enum(b, ti, schema, val)
-    elif ti.kind == IDL_STRUCT:
-        b.write_u64(val)
     else:
         raise ValueError(f"unsupported input type kind {ti.kind}")
 
 
-def _free(lib: ctypes.CDLL, type_index: int, slots: list[int]):
-    try:
-        fn = lib.dynspire_free
-        fn.argtypes = [ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint64), ctypes.c_size_t]
-        fn.restype = None
-        arr = (ctypes.c_uint64 * len(slots))(*slots)
-        fn(type_index, arr, len(slots))
-    except (AttributeError, OSError):
-        pass
+def _free(free_fn: Any, type_index: int, slots: list[int]):
+    if free_fn is None:
+        return
+    arr = (ctypes.c_uint64 * len(slots))(*slots)
+    free_fn(type_index, arr, len(slots))
 
 
 def decode_response(
@@ -345,7 +350,7 @@ def decode_response(
     tag = r.read_u64()
     if tag == 1:
         err = r.read_owned_bytes().decode("utf-8", errors="replace")
-        _free(lib, method.return_type_idx, slots)
+        _free(schema.free_fn, method.return_type_idx, slots)
         raise RuntimeError(f"spier error: {err}")
     ti = schema.type_at(method.return_type_idx)
     if ti.kind in _SCALAR_KINDS:
