@@ -82,6 +82,7 @@ demo/
   rle-spier/     cdylib implementation (loaded at runtime)
   rle-host/      Rust host binary
   rle_client.py  Python host (ctypes, schema reflection)
+  rle_client2.py Bug fix showcase (call_with_outs, negative index, scalar Option)
 ```
 
 ```bash
@@ -94,6 +95,7 @@ cargo run -p rle-host
 # Run Python host
 pip install -e python/
 python3 demo/rle_client.py
+python3 demo/rle_client2.py
 ```
 
 Output:
@@ -106,7 +108,7 @@ decompress()
   -> "AAAABBBCCCCDDDDDEEEEFFFFFFGGG" (29 bytes) [round-trip OK]
 
 compress_into(&mut Vec<u8>)
-  caller buffer after : [04 41 03 42 ...] (14 bytes) [matches compress]
+  out buffer : [04 41 03 42 ...] (14 bytes) [matches compress]
 
 stats()
   original  : 29 bytes
@@ -151,7 +153,7 @@ For the deep dive, see [docs/architecture.md](docs/architecture.md).
 The Python adapter loads any DynSpire `.so` and discovers its full interface at runtime:
 
 ```python
-from dynspire_ctypes import load_spier
+from dynspire import load_spier
 
 lib = load_spier("rle_spier", lib_dir="target/debug")
 

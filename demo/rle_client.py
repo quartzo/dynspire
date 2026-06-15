@@ -49,7 +49,8 @@ def main():
         )
         print()
 
-        result = handle.call("compress_into", input_data)
+        _, outs = handle.call_with_outs("compress_into", input_data)
+        result = outs[0]
         ok = result == compressed
         print("compress_into(&mut Vec<u8>)")
         print("  spier wrote into a Rust Vec created by dynspire_vec_create()")

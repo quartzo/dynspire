@@ -103,4 +103,13 @@ impl RleEngine for RleState {
             .collect();
         Ok(runs)
     }
+
+    fn compress_into_checked(&self, data: &[u8], out: &mut Vec<u8>) -> Result<bool, String> {
+        out.extend_from_slice(&rle_compress(data));
+        Ok(!out.is_empty())
+    }
+
+    fn first_byte(&self, data: &[u8]) -> Result<Option<u8>, String> {
+        Ok(data.first().copied())
+    }
 }

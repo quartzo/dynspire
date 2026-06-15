@@ -19,4 +19,6 @@ pub trait RleEngine {
     fn report_summary(&self, report: CompressionReport) -> Result<String, String>;
     fn run_labels(&self, data: &[u8]) -> Result<Vec<String>, String>;
     fn split_runs(&self, data: &[u8]) -> Result<Vec<Vec<u8>>, String>;
+    fn compress_into_checked(&self, data: &[u8], out: &mut Vec<u8>) -> Result<bool, String>;
+    fn first_byte(&self, data: &[u8]) -> Result<Option<u8>, String>;
 }

@@ -28,6 +28,16 @@ _SCALAR_KINDS = frozenset({IDL_UNIT, IDL_BOOL, IDL_U8, IDL_U32, IDL_U64})
 _UNSET = object()
 
 
+def _is_scalar_type(ti: TypeInfo, schema: SpierSchema) -> bool:
+    """Check if a type has no heap allocation and can be eagerly decoded."""
+    if ti.kind in _SCALAR_KINDS:
+        return True
+    if ti.kind == IDL_OPTION and ti.child0 >= 0:
+        child = schema.type_at(ti.child0)
+        return child.kind in _SCALAR_KINDS
+    return False
+
+
 class FFIResource:
     """Wraps a non-scalar spier return value with lazy access to Rust heap memory.
 
@@ -123,11 +133,15 @@ class FFIResource:
             if isinstance(key, slice):
                 indices = range(*key.indices(length))
                 return bytes(ctypes.c_uint8.from_address(ptr + i).value for i in indices)
+            if isinstance(key, int) and key < 0:
+                key += length
             return ctypes.c_uint8.from_address(ptr + key).value
         if not self._closed and self._is_vec_of_vec():
             count = self._slots[2]
             if isinstance(key, slice):
                 return [self._read_vec_element(i) for i in range(*key.indices(count))]
+            if isinstance(key, int) and key < 0:
+                key += count
             return self._read_vec_element(key)
         return self.value[key]
 
@@ -353,7 +367,7 @@ def decode_response(
         _free(schema.free_fn, method.return_type_idx, slots)
         raise RuntimeError(f"spier error: {err}")
     ti = schema.type_at(method.return_type_idx)
-    if ti.kind in _SCALAR_KINDS:
+    if _is_scalar_type(ti, schema):
         return decode_slot(r, ti, schema, lib)
     return FFIResource(method.return_type_idx, slots, lib, schema)
 

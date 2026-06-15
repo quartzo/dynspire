@@ -4,8 +4,8 @@ import ctypes
 import os
 from typing import Any
 
-from ._ffi import IDL_OUT_VEC, IDL_UNIT, MAX_OUT_SLOTS, DynSpireIdl, VecView, serialize_kvmap
-from ._schema import MethodInfo, SpierSchema, read_schema
+from ._ffi import IDL_OUT_VEC, MAX_OUT_SLOTS, DynSpireIdl, VecView, serialize_kvmap
+from ._schema import SpierSchema, read_schema
 from ._slots import SlotBuilder, decode_response, encode_request, encode_slot
 
 
@@ -51,65 +51,76 @@ class SpierHandle:
         schema = self._schema
         m = schema.method(method_name)
 
+        has_out_vec = any(
+            schema.type_at(p.type_idx).kind == IDL_OUT_VEC for p in m.params
+        )
+        if has_out_vec:
+            raise ValueError(
+                f"{method_name} has out-vec params; use call_with_outs() instead"
+            )
+
         if len(args) == 1 and isinstance(args[0], dict):
             args_dict = args[0]
         elif len(args) == 0:
             args_dict = {}
         else:
-            input_params = [
-                p for p in m.params
-                if schema.type_at(p.type_idx).kind != IDL_OUT_VEC
-            ]
+            input_params = m.params
             if len(args) != len(input_params):
                 raise ValueError(
                     f"{method_name} expects {len(input_params)} args, got {len(args)}"
                 )
             args_dict = {p.name: v for p, v in zip(input_params, args)}
 
-        has_out_vec = any(
-            schema.type_at(p.type_idx).kind == IDL_OUT_VEC for p in m.params
-        )
-
-        if has_out_vec:
-            return self._call_out_vec(m, args_dict)
-
         in_slots, keepalive = encode_request(schema, m, args_dict)
         resp_slots = self.dispatch(method_name, in_slots)
         del keepalive
         return decode_response(resp_slots, schema, m, self._lib)
 
-    def _call_out_vec(self, method: MethodInfo, args: dict[str, Any]) -> Any:
+    def call_with_outs(self, method_name: str, *args: Any) -> tuple[Any, list[bytes]]:
         schema = self._schema
         lib = self._lib
+        m = schema.method(method_name)
+
+        input_params = [
+            p for p in m.params
+            if schema.type_at(p.type_idx).kind != IDL_OUT_VEC
+        ]
+        if len(args) == 1 and isinstance(args[0], dict):
+            args_dict = args[0]
+        elif len(args) == 0:
+            args_dict = {}
+        else:
+            if len(args) != len(input_params):
+                raise ValueError(
+                    f"{method_name} expects {len(input_params)} input args, got {len(args)}"
+                )
+            args_dict = {p.name: v for p, v in zip(input_params, args)}
 
         vec_ptrs: list[int] = []
         b = SlotBuilder()
-        for param in method.params:
+        for param in m.params:
             ti = schema.type_at(param.type_idx)
             if ti.kind == IDL_OUT_VEC:
                 vp = lib.dynspire_vec_create()
                 vec_ptrs.append(vp)
                 b.write_u64(vp)
             else:
-                val = args.get(param.name)
-                encode_slot(b, ti, schema, val)
+                encode_slot(b, ti, schema, args_dict[param.name])
 
-        resp_slots = self.dispatch(method.name, b.slots())
+        resp_slots = self.dispatch(method_name, b.slots())
 
         try:
-            ret_val = decode_response(resp_slots, schema, method, lib)
+            ret_val = decode_response(resp_slots, schema, m, lib)
 
-            vp = vec_ptrs[0]
-            view = lib.dynspire_vec_view(vp)
-            if view.ptr and view.len > 0:
-                out_data = bytes((ctypes.c_uint8 * view.len).from_address(view.ptr))
-            else:
-                out_data = b""
+            out_data: list[bytes] = []
+            for vp in vec_ptrs:
+                view = lib.dynspire_vec_view(vp)
+                if view.ptr and view.len > 0:
+                    out_data.append(bytes((ctypes.c_uint8 * view.len).from_address(view.ptr)))
+                else:
+                    out_data.append(b"")
 
-            ret_ti = schema.type_at(method.return_type_idx)
-            if ret_ti.kind == IDL_UNIT:
-                return out_data
-            return ret_val
+            return ret_val, out_data
         finally:
             for vp in vec_ptrs:
                 lib.dynspire_vec_free(vp)

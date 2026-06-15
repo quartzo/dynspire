@@ -238,7 +238,7 @@ The `SpierOp` trait ensures `call()` only accepts the generated Op enum — raw 
 
 ## Python ctypes Adapter
 
-The Python adapter (`python/dynspire_ctypes.py`) provides the same capabilities as the Rust tower client, entirely through `ctypes`:
+The Python adapter (package `dynspire` under `python/src/dynspire/`) provides the same capabilities as the Rust tower client, entirely through `ctypes`:
 
 ### Schema Reflection
 
@@ -262,9 +262,13 @@ with lib.create_handle() as handle:
 
     # Named args (explicit)
     compressed = handle.call("compress", {"data": input_data})
+
+    # Out-vec methods require call_with_outs
+    ret, outs = handle.call_with_outs("compress_into", input_data)
+    # ret = return value (None for Unit), outs = list[bytes] per &mut Vec param
 ```
 
-The `SpierHandle` holds the schema internally. Positional args are bound by parameter order (skipping `OutVec` params). The adapter handles:
+`call()` raises `ValueError` if the method has `&mut Vec<u8>` (OutVec) parameters — those require `call_with_outs()`, which returns `(ret_val, list[bytes])`. Positional args are bound by parameter order. The adapter handles:
 
 - **Borrows** (`&[u8]`, `&str`): allocates ctypes byte arrays, keeps them alive during the call
 - **Owned returns** (`Vec<u8>`, `String`, `#[slot_struct]`): reads `(ptr, len)` or opaque handle from slots, wraps in `FFIResource` for lifecycle management (see below)
@@ -295,7 +299,7 @@ Non-scalar return values from the spier carry heap allocations that must be rele
 
 **Error path:** When a spier returns `Err(String)`, the adapter calls `dynspire_free` to release the error string's heap allocation before raising `RuntimeError`.
 
-**Transparency:** `FFIResource` proxies dunder methods (`__len__`, `__iter__`, `__eq__`, `__str__`, `__format__`, `__getattr__`, etc.) with lazy semantics. Scalar returns (`u32`, `bool`, etc.) are returned as native Python values with no wrapping.
+**Transparency:** `FFIResource` proxies dunder methods (`__len__`, `__iter__`, `__eq__`, `__str__`, `__format__`, `__getattr__`, etc.) with lazy semantics. Scalar returns (`u32`, `bool`, etc.) and scalar `Option<T>` (e.g. `Option<u64>`) are returned as native Python values with no wrapping; heap-backed options (`Option<String>`) remain wrapped in `FFIResource`.
 
 ---
 
