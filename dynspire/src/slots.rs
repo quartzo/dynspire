@@ -75,9 +75,9 @@ impl<'a> SlotReader<'a> {
 /// Encodes a value into slots for passing as a method parameter (caller → spier).
 ///
 /// You should not implement this manually. Built-in impls cover all conventional
-/// types (scalars, `&[u8]`, `&str`, `String`, `Vec<u8>`, `&mut Vec<u8>`, tuples,
-/// `Option<T>`, `Result<T,E>`). For custom types, use `#[slot_struct]` or
-/// `#[slot_enum]` — they generate all four slot traits automatically.
+/// types (scalars, `&[u8]`, `&str`, `String`, `Vec<T: Clone>`, `&mut Vec<u8>`,
+/// tuples, `Option<T>`, `Result<T,E>`). For custom types, use `#[slot_struct]`
+/// or `#[slot_enum]` — they generate all four slot traits automatically.
 pub trait SlotEncode {
     fn encode(&self, w: &mut SlotWriter);
 }
@@ -321,15 +321,15 @@ impl<'a> SlotDecode<'a> for String {
     }
 }
 
-impl SlotEncode for Vec<u8> {
+impl<T: Clone> SlotEncode for Vec<T> {
     fn encode(&self, w: &mut SlotWriter) {
         w.write_u64(self.as_ptr() as u64);
         w.write_u64(self.len() as u64);
     }
 }
-impl<'a> SlotDecode<'a> for Vec<u8> {
+impl<'a, T: Clone> SlotDecode<'a> for Vec<T> {
     unsafe fn decode(r: &mut SlotReader<'a>) -> Self {
-        let ptr = r.read_u64() as *const u8;
+        let ptr = r.read_u64() as *const T;
         let len = r.read_u64() as usize;
         if ptr.is_null() || len == 0 {
             Vec::new()
@@ -543,5 +543,58 @@ mod tests {
     fn test_vec_u8_output_roundtrip() {
         let v = vec![1u8, 2, 3, 4, 5];
         assert_eq!(roundtrip_output(v.clone()), v);
+    }
+
+    #[test]
+    fn test_vec_string_input_roundtrip() {
+        let v = vec!["hello".to_string(), "world".to_string()];
+        assert_eq!(roundtrip_input(&v), v);
+
+        let empty: Vec<String> = vec![];
+        assert_eq!(roundtrip_input(&empty), empty);
+    }
+
+    #[test]
+    fn test_vec_string_output_roundtrip() {
+        let v = vec!["hello".to_string(), "world".to_string()];
+        assert_eq!(roundtrip_output(v.clone()), v);
+    }
+
+    #[test]
+    fn test_vec_vec_u8_input_roundtrip() {
+        let v = vec![vec![1u8, 2], vec![3, 4, 5], vec![]];
+        assert_eq!(roundtrip_input(&v), v);
+    }
+
+    #[test]
+    fn test_vec_vec_u8_output_roundtrip() {
+        let v = vec![vec![1u8, 2], vec![3, 4, 5], vec![]];
+        assert_eq!(roundtrip_output(v.clone()), v);
+    }
+
+    #[derive(Clone, PartialEq, Debug)]
+    struct Point {
+        x: i64,
+        y: i64,
+    }
+
+    #[test]
+    fn test_vec_struct_input_roundtrip() {
+        let v = vec![Point { x: 1, y: 2 }, Point { x: -3, y: 0 }];
+        assert_eq!(roundtrip_input(&v), v);
+    }
+
+    #[test]
+    fn test_vec_struct_output_roundtrip() {
+        let v = vec![Point { x: 1, y: 2 }, Point { x: -3, y: 0 }];
+        assert_eq!(roundtrip_output(v.clone()), v);
+    }
+
+    #[test]
+    fn test_vec_input_consumes_two_slots() {
+        let v = vec![1u32, 2, 3, 4, 5];
+        let mut w = SlotWriter::new();
+        v.encode(&mut w);
+        assert_eq!(w.len(), 2, "Vec<T> input must consume exactly 2 slots (ptr, len)");
     }
 }

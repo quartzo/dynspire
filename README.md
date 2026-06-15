@@ -40,7 +40,7 @@ with load_spier("rle_spier", lib_dir="target/debug").create_handle() as h:
 ## Features
 
 - **Self-describing** — spiers export their full IDL schema (methods, types, enums) via a C ABI. Hosts discover everything at runtime.
-- **Zero-copy FFI** — borrows (`&[u8]`, `&str`) and mutable out-params (`&mut Vec<u8>`) pass through raw pointers. No serialization overhead.
+- **Zero-copy FFI** — borrows (`&[u8]`, `&str`) and mutable out-params (`&mut Vec<u8>`) pass through raw pointers. No serialization overhead. `Vec<T: Clone>` input works for any element type (Rust→Rust).
 - **Type-safe dispatch** — Rust hosts use generated Op enums. No magic numbers.
 - **IDL hash verification** — incompatible plugins are rejected at load time.
 - **Python without codegen** — `ctypes` reads the IDL schema from the `.so` directly. No stub generation, no `bindgen`, no C headers.

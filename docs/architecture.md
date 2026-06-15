@@ -96,7 +96,8 @@ pub trait SlotReceive: Sized {
 | `[u8; 16]` | 2 | Two `u64` (little-endian halves). |
 | `&str`, `&[u8]`, `String`, `Vec<u8>` | 2 | `(ptr, len)` — zero-copy borrow for refs, clone for owned. |
 | `&mut Vec<u8>` | 1 | Raw pointer to the `Vec` struct. Spier writes directly into the caller's allocation. |
-| `Vec<T>` (return) | 2 | `(ptr, len)` with ownership transfer via `Box::into_raw` / `Box::from_raw`. |
+| `Vec<T: Clone>` (input) | 2 | `(ptr, len)` borrow — spier clones elements from caller's memory. Works for any `T: Clone` including `Vec<String>`, `Vec<Vec<u8>>`, nested Vecs. Rust→Rust only; Python cannot construct Rust memory layouts. |
+| `Vec<T>` (output) | 2 | `(ptr, len)` with ownership transfer via `Box::into_raw` / `Box::from_raw`. |
 | `Option<T>` | 1 + T | Tag (0=None, 1=Some) followed by T's slots. |
 | `(A, B)` | A + B | Concatenation of A's and B's slots. |
 | `Result<T, E>` | 1 + T or E | Tag (0=Ok, 1=Err) followed by the variant's slots. |
@@ -108,6 +109,7 @@ pub trait SlotReceive: Sized {
 - **Borrows are zero-copy**: `&[u8]` passes `(raw_ptr, len)` — the spier reads the host's memory directly. No copy, no allocation.
 - **Out-params via `&mut Vec<u8>`**: the host passes a raw pointer to its `Vec`. The spier pushes data into it. Changes are visible to the host immediately. This is the `IDL_OUT_VEC` pattern.
 - **Ownership transfer on returns**: `Vec<T>` is moved across the boundary via `Box::into_raw` / `forget` on the spier side, `Box::from_raw` on the host side. No copy.
+- **`Vec<T: Clone>` input**: the caller sends `(ptr, len)` pointing to its own heap memory. The spier clones elements via `slice::from_raw_parts(ptr, len).to_vec()`. Elements are never individually slot-encoded — always 2 slots regardless of count or element complexity. Rust→Rust only; Python callers serialize complex Vecs to `&[u8]`.
 - **`Result<T, String>` is universal**: every dispatch method returns `Result<T, String>`. The tag slot (0/1) distinguishes Ok from Err. The host's `call()` returns `Result<R, String>` — the outer layer is transport errors, the inner is the spier's application error.
 
 ---
