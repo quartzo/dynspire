@@ -2,6 +2,8 @@
 
 A Rust plugin framework for loading native `.so` libraries at runtime — with self-describing IDL schemas, zero-copy FFI, and Python bindings with no code generation.
 
+> **In-process by design.** A spier is a `.so` loaded into the host via `dlopen` — same process, same address space. Arguments and return values cross the boundary through a flat `u64[]` slot convention over a C ABI: borrows and owned values pass by raw pointer, and `#[slot_struct]` hands over a boxed pointer (1 slot) rather than a serialized copy, so live objects cross freely.
+
 ## Why?
 
 You wrote a Rust library. You want to load it at runtime as a plugin — discover its methods, call them, and get typed results back. Without recompiling. Without stubs. Without a build step.

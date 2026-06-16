@@ -18,6 +18,12 @@ This document covers the internals of the DynSpire plugin framework: the slot sy
 
 DynSpire is a plugin architecture with three roles:
 
+> **Read this first — DynSpire is an in-process plugin ABI, not an RPC framework.** A spier is a `cdylib` loaded into the host via `dlopen`; host and spier run in **the same process and the same address space**. Crossing the boundary means a **C ABI call with a flat `u64[]` slot convention** — there is no network, no IPC, no wire format. Consequences that follow from this and *do not* hold under an RPC mental model:
+>
+> - **Opaque pointers are valid across the boundary.** `#[slot_struct]` passes `Box::into_raw` → 1 slot (the raw address); the receiver does `Box::from_raw` or dereferences directly. The struct is **not serialized** — it stays live, with whatever state machine, lock, or inner reference it holds. Both sides alias the same memory.
+> - **"IDL" / "schema" = in-process ABI contract + runtime type table**, exposed via `dynspire_idl_schema()`. Not a serialization descriptor, not a protobuf schema. The IDL hash gates **binary/link compatibility** between two `.so`s compiled against the same trait — not message-level versioning.
+> - **The boundary is compile/link, not process.** Borrows (`&[u8]`, `&str`), out-params (`&mut Vec<u8>`), and ownership-transfer (`Vec<T>` via `Box::into_raw`) are all sound precisely because caller and callee share one heap. None of this is possible across a process boundary; all of it is routine here.
+
 | Role | Who | What |
 |------|-----|------|
 | **IDL** | Shared crate | Defines a trait interface. The `#[modulo_interface]` macro generates an Op enum, IDL hash, type table, and method descriptors. |
