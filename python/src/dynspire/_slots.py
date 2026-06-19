@@ -226,7 +226,7 @@ class SlotBuilder:
             self.write_u64(0)
             self.write_u64(0)
             return
-        arr = (ctypes.c_uint8 * len(data))(*data)
+        arr = (ctypes.c_uint8 * len(data)).from_buffer_copy(data)
         self._keepalive.append(arr)
         self.write_u64(ctypes.addressof(arr))
         self.write_u64(len(data))

@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 
 MAX_OUT_SLOTS = 8
+MAX_IN_SLOTS = 16
 
 IDL_UNIT = 0
 IDL_U8 = 1

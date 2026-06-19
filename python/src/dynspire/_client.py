@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import ctypes
 import os
+import threading
 from typing import Any
 
-from ._ffi import IDL_OUT_VEC, MAX_OUT_SLOTS, DynSpireIdl, VecView, serialize_kvmap
+from ._ffi import IDL_OUT_VEC, MAX_IN_SLOTS, MAX_OUT_SLOTS, DynSpireIdl, VecView, serialize_kvmap
 from ._schema import SpierSchema, read_schema
 from ._slots import SlotBuilder, decode_response, encode_request, encode_slot
 
@@ -14,6 +15,15 @@ class SpierHandle:
         self._lib = lib
         self._handle = ctypes.c_void_p(handle)
         self._schema = schema
+        self._dispatch_cache: dict[str, Any] = {}
+        self._local = threading.local()
+
+    def _buffers(self) -> tuple[Any, Any]:
+        in_buf = getattr(self._local, "in_slots", None)
+        if in_buf is None:
+            self._local.in_slots = (ctypes.c_uint64 * MAX_IN_SLOTS)()
+            self._local.out_slots = (ctypes.c_uint64 * MAX_OUT_SLOTS)()
+        return self._local.in_slots, self._local.out_slots
 
     def __enter__(self):
         return self
@@ -27,25 +37,40 @@ class SpierHandle:
         except Exception:
             pass
 
+    def _dispatch_fn(self, method_name: str) -> Any:
+        fn = self._dispatch_cache.get(method_name)
+        if fn is None:
+            fn = getattr(self._lib, f"dynspire_dispatch_{method_name}")
+            fn.restype = ctypes.c_uint8
+            fn.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_uint64), ctypes.c_size_t,
+                ctypes.POINTER(ctypes.c_uint64), ctypes.c_size_t,
+            ]
+            self._dispatch_cache[method_name] = fn
+        return fn
+
     def dispatch(self, method_name: str, in_slots: list[int] | None = None) -> list[int]:
-        fn_name = f"dynspire_dispatch_{method_name}"
-        fn = getattr(self._lib, fn_name)
-        fn.restype = ctypes.c_uint8
-        fn.argtypes = [
-            ctypes.c_void_p,
-            ctypes.POINTER(ctypes.c_uint64), ctypes.c_size_t,
-            ctypes.POINTER(ctypes.c_uint64), ctypes.c_size_t,
-        ]
+        fn = self._dispatch_fn(method_name)
+        in_buf, out_buf = self._buffers()
 
-        in_arr = (ctypes.c_uint64 * len(in_slots))(*in_slots) if in_slots else None
-        in_count = len(in_slots) if in_slots else 0
-        out_arr = (ctypes.c_uint64 * MAX_OUT_SLOTS)()
+        if in_slots:
+            n = len(in_slots)
+            if n <= MAX_IN_SLOTS:
+                for i, v in enumerate(in_slots):
+                    in_buf[i] = v
+                in_arr = in_buf
+            else:
+                in_arr = (ctypes.c_uint64 * n)(*in_slots)
+        else:
+            n = 0
+            in_arr = None
 
-        ret = fn(self._handle, in_arr, in_count, out_arr, MAX_OUT_SLOTS)
+        ret = fn(self._handle, in_arr, n, out_buf, MAX_OUT_SLOTS)
         if ret != 0:
             raise RuntimeError(f"dispatch transport error (code {ret})")
 
-        return list(out_arr)
+        return list(out_buf)
 
     def call(self, method_name: str, *args: Any) -> Any:
         schema = self._schema
