@@ -869,18 +869,24 @@ impl SpierHandle {
             encode_value(py, &mut w, p.type_idx, &self.data, &arg, &mut keepalive)?;
         }
 
-        // Dispatch. GIL is held: input borrows into Python memory are safe.
+        // Dispatch with GIL released so other Python threads can run while
+        // the spier executes (e.g. an HTTP server it calls into). Safe because:
+        // - input borrows alias Python buffers kept alive by `args` on the stack
+        // - CPython guarantees stable buffer addresses for alive objects
+        // - keepalive data is owned Rust memory (no GIL dependency)
         let in_slots = w.as_slice();
         let mut out = [0u64; MAX_OUT_SLOTS];
-        let ret = unsafe {
-            (self.dispatch[idx])(
-                self.handle,
+        let dispatch_fn = self.dispatch[idx];
+        let handle = self.handle as usize;
+        let ret = py.detach(|| unsafe {
+            (dispatch_fn)(
+                handle as *mut c_void,
                 in_slots.as_ptr(),
                 in_slots.len(),
                 out.as_mut_ptr(),
                 MAX_OUT_SLOTS,
             )
-        };
+        });
         drop(keepalive);
         if ret != 0 {
             return Err(PyRuntimeError::new_err(format!(
@@ -944,20 +950,22 @@ impl SpierHandle {
                 encode_value(py, &mut w, p.type_idx, &self.data, &arg, &mut keepalive)?;
             }
         }
-        drop(keepalive);
 
-        // Dispatch (GIL held: input borrows into Python memory are safe).
+        // Dispatch with GIL released (see invoke_plain for safety rationale).
         let in_slots = w.as_slice();
         let mut out = [0u64; MAX_OUT_SLOTS];
-        let ret = unsafe {
-            (self.dispatch[idx])(
-                self.handle,
+        let dispatch_fn = self.dispatch[idx];
+        let handle = self.handle as usize;
+        let ret = py.detach(|| unsafe {
+            (dispatch_fn)(
+                handle as *mut c_void,
                 in_slots.as_ptr(),
                 in_slots.len(),
                 out.as_mut_ptr(),
                 MAX_OUT_SLOTS,
             )
-        };
+        });
+        drop(keepalive);
         if ret != 0 {
             return Err(PyRuntimeError::new_err(format!(
                 "dispatch transport error (code {ret})"
