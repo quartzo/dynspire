@@ -1301,15 +1301,18 @@ fn encode_value<'py>(
             }
         }
         IDL_STRUCT => {
-            // Pass-through of an opaque handle returned earlier.
-            let expected_id = struct_id_at(data, type_idx);
+            // Pass-through of an opaque handle returned earlier. The handle
+            // may come from a different spier (cross-spier struct passing),
+            // so compare by struct NAME resolved from each side's own type
+            // table, not by index (indices are spier-local).
+            let expected_name = struct_name_at(data, type_idx);
             if let Ok(h) = arg.extract::<PyRef<'_, OpaqueHandle>>() {
-                let actual_id = struct_id_at(data, h.type_idx);
-                if actual_id != expected_id {
+                let actual_name = struct_name_at(&h.data, h.type_idx);
+                if actual_name != expected_name {
                     return Err(PyTypeError::new_err(format!(
                         "expected {}, got {}",
-                        struct_name_at(data, type_idx),
-                        struct_name_at(data, h.type_idx),
+                        expected_name,
+                        actual_name,
                     )));
                 }
                 w.write_u64(h.ptr);
@@ -1317,7 +1320,7 @@ fn encode_value<'py>(
             } else {
                 Err(PyTypeError::new_err(format!(
                     "expected {} (OpaqueHandle), got {}",
-                    struct_name_at(data, type_idx),
+                    expected_name,
                     arg.get_type().name()?,
                 )))
             }
