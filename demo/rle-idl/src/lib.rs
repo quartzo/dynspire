@@ -31,4 +31,5 @@ pub trait RleEngine {
     fn first_byte(&self, data: &[u8]) -> Result<Option<u8>, String>;
     fn classify(&self, data: &[u8]) -> Result<Tone, String>;
     fn describe_tone(&self, tone: Tone) -> Result<String, String>;
+    fn delay(&self, ms: u64) -> Result<(), String>;
 }

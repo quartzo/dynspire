@@ -133,4 +133,9 @@ impl RleEngine for RleState {
             Tone::Loud(v) => format!("loud({v})"),
         })
     }
+
+    fn delay(&self, ms: u64) -> Result<(), String> {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+        Ok(())
+    }
 }

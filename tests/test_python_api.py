@@ -55,7 +55,7 @@ class TestSchemaReflection:
 
     def test_methods_returns_objects(self, schema):
         methods = schema.methods
-        assert len(methods) == 12
+        assert len(methods) == 13
         names = [m.name for m in methods]
         assert "compress" in names
         assert "classify" in names
@@ -405,3 +405,41 @@ class TestResolvedTypeStrings:
         m = schema.method("compress")
         sig = schema.method_sig(m)
         assert m.params[0].type_str in sig
+
+
+# ---------------------------------------------------------------------------
+# GIL release during dispatch
+# ---------------------------------------------------------------------------
+
+class TestGilRelease:
+    def test_gil_released_during_dispatch(self, lib):
+        """Without py.detach(), a background Python thread can't acquire the
+        GIL during the Rust sleep — it only runs after dispatch returns.
+
+        With detach, the thread runs during the 300ms delay window.
+        """
+        import threading
+        import time
+
+        ran_at = [None]
+
+        def background():
+            ran_at[0] = time.perf_counter()
+
+        start = time.perf_counter()
+        t = threading.Thread(target=background, daemon=True)
+        t.start()
+
+        with lib.create_handle() as h:
+            h.delay(300)
+
+        t.join(timeout=5)
+        assert ran_at[0] is not None
+        bg_delay_ms = (ran_at[0] - start) * 1000
+        assert bg_delay_ms < 250, (
+            f"Background thread ran {bg_delay_ms:.0f}ms after start — "
+            f"GIL was not released during dispatch"
+        )
+
+    def test_delay_returns_normally(self, handle):
+        assert handle.delay(1) is None
