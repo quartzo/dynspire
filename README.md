@@ -161,9 +161,29 @@ from dynspire import load_spier
 lib = load_spier("rle_spier", lib_dir="target/debug")
 schema = lib.schema()
 
-# Schema reflection — methods, types, params, all from the .so
-for m in schema.methods:
-    print(schema.method_sig(m))
+# Schema reflection
+for m in schema.methods:            # list[SpierMethod]
+    print(schema.method_sig(m))     # "compress(data: Slice<U8>) -> Result<Vec<U8>, String>"
+
+# Introspect a single method
+m = schema.method("compress")       # SpierMethod
+#   m.name          -> "compress"
+#   m.params        -> [SpierParam(name="data", type_idx=5)]
+#   m.return_type   -> 3  (type-table index)
+#   m.index         -> 0
+
+# Type introspection
+ti = schema.type_at(m.params[0].type_idx)   # SpierTypeInfo
+#   ti.kind_name    -> "Slice"
+
+# Enum introspection + value construction
+tone_schema = schema.enum_by_name("Tone")   # SpierEnumSchema
+#   tone_schema.variant_names -> ["Quiet", "Normal", "Loud"]
+Tone = tone_schema.create_enum_class()      # SpierEnumClass
+loud = Tone.Loud(71)                         # SpierEnumValue("Loud", (71,))
+
+# lib.idl_hash() == schema.hash
+assert lib.idl_hash() == schema.hash
 
 # Call via attribute access with native Python types
 with lib.create_handle() as h:
@@ -172,7 +192,51 @@ with lib.create_handle() as h:
 
     # Out-vec methods (&mut Vec<u8>) auto-return (ret_val, list[bytes])
     ok, outs = h.compress_into_checked(b"AAAABBBBCCCC")
+
+    # Dict args and kwargs also supported
+    h.call("compress", {"data": b"AAAA"})
+    h.compress(data=b"AAAA")
 ```
+
+### Calling styles
+
+All four are equivalent — use whichever reads best:
+
+| Style | Example |
+|-------|---------|
+| Attribute (preferred) | `h.compress(data)` |
+| Attribute + kwargs | `h.compress(data=data)` |
+| `call` escape hatch | `h.call("compress", data)` |
+| Dict args | `h.call("compress", {"data": data})` |
+
+### Schema API reference
+
+| Object | Property/Method | Returns |
+|--------|----------------|---------|
+| `SpierLib` | `.schema()` | `SpierSchema` |
+| | `.idl_hash()` | `int` |
+| | `.create_handle(config=None)` | `SpierHandle` |
+| `SpierSchema` | `.name` | `str` |
+| | `.hash` | `int` |
+| | `.methods` | `list[SpierMethod]` |
+| | `.method(name)` | `SpierMethod` |
+| | `.method_sig(name_or_method)` | `str` |
+| | `.type_at(type_idx)` | `SpierTypeInfo` |
+| | `.enum_by_name(name)` | `SpierEnumSchema` |
+| `SpierMethod` | `.name` | `str` |
+| | `.index` | `int` |
+| | `.params` | `list[SpierParam]` |
+| | `.return_type` | `int` (type-table index) |
+| `SpierParam` | `.name` | `str` |
+| | `.type_idx` | `int` |
+| `SpierTypeInfo` | `.kind_name` | `str` (`"Slice"`, `"U64"`, `"Enum"`, ...) |
+| `SpierEnumSchema` | `.name` | `str` |
+| | `.variant_names` | `list[str]` |
+| | `.create_enum_class()` | `SpierEnumClass` |
+| `SpierEnumClass` | `.VariantName(payload)` | `SpierEnumValue` (factory per variant) |
+| `SpierEnumValue` | `.variant` | `str` |
+| | `.fields` | `tuple` |
+| | supports `==` (by variant name) | |
 
 `h.compress(data)` is sugar for `h.call("compress", data)`. The bound method
 holds a reference to the handle, so `f = h.compress; del h; f(data)` is safe.

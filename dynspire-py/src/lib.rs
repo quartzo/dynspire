@@ -263,6 +263,11 @@ impl SpierLib {
         }
     }
 
+    /// Returns the IDL hash (same as schema.hash).
+    fn idl_hash(&self) -> u64 {
+        self.data.hash
+    }
+
     /// Creates a client handle, optionally passing a `dict[str, str]` config.
     #[pyo3(signature = (config=None))]
     fn create_handle(&self, config: Option<&Bound<'_, PyAny>>) -> PyResult<SpierHandle> {
@@ -411,6 +416,121 @@ fn struct_id_at(data: &SchemaData, idx: u32) -> Option<i32> {
         .map(|t| t.child0)
 }
 
+// === Rich schema objects for introspection ===
+
+#[derive(Clone)]
+#[pyclass(name = "SpierParam")]
+struct SpierParam {
+    #[pyo3(get)]
+    name: String,
+    #[pyo3(get)]
+    type_idx: u32,
+}
+
+#[pyclass(name = "SpierMethod")]
+struct SpierMethod {
+    #[pyo3(get)]
+    name: String,
+    #[pyo3(get)]
+    params: Vec<SpierParam>,
+    #[pyo3(get)]
+    return_type: u32,
+    #[pyo3(get)]
+    index: usize,
+}
+
+impl SpierMethod {
+    fn from_info(idx: usize, m: &MethodInfo) -> Self {
+        SpierMethod {
+            name: m.name.clone(),
+            params: m.params.iter().map(|p| SpierParam {
+                name: p.name.clone(),
+                type_idx: p.type_idx,
+            }).collect(),
+            return_type: m.return_type_idx,
+            index: idx,
+        }
+    }
+}
+
+#[pyclass(name = "SpierTypeInfo")]
+struct SpierTypeInfo {
+    kind: u8,
+    #[pyo3(get)]
+    type_idx: u32,
+}
+
+#[pymethods]
+impl SpierTypeInfo {
+    #[getter]
+    fn kind_name(&self) -> &'static str {
+        kind_name(self.kind)
+    }
+}
+
+/// A factory callable: `EnumClass.variant_name(payload)` → SpierEnumValue.
+#[pyclass(name = "EnumVariantFactory")]
+struct EnumVariantFactory {
+    variant: String,
+}
+
+#[pymethods]
+impl EnumVariantFactory {
+    #[pyo3(signature = (*args))]
+    fn __call__(&self, args: &Bound<'_, PyTuple>) -> SpierEnumValue {
+        SpierEnumValue {
+            variant: self.variant.clone(),
+            fields: args.as_unbound().clone_ref(args.py()),
+        }
+    }
+}
+
+/// An enum namespace returned by `create_enum_class()`.
+/// `cls.variant_name(payload)` creates a SpierEnumValue.
+#[pyclass(name = "SpierEnumClass")]
+struct SpierEnumClass {
+    variants: Vec<String>,
+}
+
+#[pymethods]
+impl SpierEnumClass {
+    fn __getattr__(&self, _py: Python<'_>, name: &str) -> PyResult<EnumVariantFactory> {
+        if self.variants.iter().any(|v| v == name) {
+            Ok(EnumVariantFactory { variant: name.to_string() })
+        } else {
+            Err(PyAttributeError::new_err(format!("enum has no variant {:?}", name)))
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!("<SpierEnumClass [{}]>", self.variants.join(", "))
+    }
+}
+
+/// Enum schema descriptor returned by `schema.enum_by_name(name)`.
+#[pyclass(name = "SpierEnumSchema")]
+struct SpierEnumSchema {
+    #[pyo3(get)]
+    name: String,
+    variants: Vec<String>,
+}
+
+#[pymethods]
+impl SpierEnumSchema {
+    #[getter]
+    fn variant_names(&self) -> Vec<String> {
+        self.variants.clone()
+    }
+
+    fn create_enum_class(&self) -> SpierEnumClass {
+        SpierEnumClass { variants: self.variants.clone() }
+    }
+
+    fn __repr__(&self) -> String {
+        format!("<SpierEnumSchema {:?} [{}]>", self.name, self.variants.join(", "))
+    }
+}
+
 #[pymethods]
 impl SpierSchema {
     #[getter]
@@ -423,13 +543,48 @@ impl SpierSchema {
         self.data.hash
     }
 
-    /// Method names in declaration order.
+    /// Methods in declaration order (as SpierMethod objects with .name, .params, etc.).
     #[getter]
-    fn methods(&self) -> Vec<String> {
-        self.data.methods.iter().map(|m| m.name.clone()).collect()
+    fn methods(&self) -> Vec<SpierMethod> {
+        self.data.methods.iter().enumerate()
+            .map(|(i, m)| SpierMethod::from_info(i, m))
+            .collect()
     }
 
-    fn method_sig(&self, name: &str) -> PyResult<String> {
+    /// Returns the SpierMethod for a given name.
+    fn method(&self, name: &str) -> PyResult<SpierMethod> {
+        self.data.methods.iter().enumerate()
+            .find(|(_, m)| m.name == name)
+            .map(|(i, m)| SpierMethod::from_info(i, m))
+            .ok_or_else(|| PyValueError::new_err(format!("unknown method: {name}")))
+    }
+
+    /// Returns type info at a given type-table index.
+    fn type_at(&self, type_idx: u32) -> PyResult<SpierTypeInfo> {
+        self.data.types.get(type_idx as usize)
+            .map(|t| SpierTypeInfo { kind: t.kind, type_idx })
+            .ok_or_else(|| PyValueError::new_err(format!("type index {type_idx} out of range")))
+    }
+
+    /// Returns the enum schema by name.
+    fn enum_by_name(&self, name: &str) -> PyResult<SpierEnumSchema> {
+        self.data.enums.iter()
+            .find(|e| e.name == name)
+            .map(|e| SpierEnumSchema {
+                name: e.name.clone(),
+                variants: e.variants.iter().map(|v| v.name.clone()).collect(),
+            })
+            .ok_or_else(|| PyValueError::new_err(format!("unknown enum: {name}")))
+    }
+
+    fn method_sig(&self, name_or_method: &Bound<'_, PyAny>) -> PyResult<String> {
+        let name = if let Ok(s) = name_or_method.extract::<String>() {
+            s
+        } else if let Ok(m) = name_or_method.extract::<PyRef<'_, SpierMethod>>() {
+            m.name.clone()
+        } else {
+            return Err(PyTypeError::new_err("expected method name (str) or SpierMethod"));
+        };
         let m = self
             .data
             .methods
@@ -963,6 +1118,20 @@ impl SpierEnumValue {
             self.fields.bind(py).repr()?
         ))
     }
+
+    fn __eq__(&self, other: &Bound<'_, PyAny>) -> bool {
+        other.extract::<PyRef<'_, SpierEnumValue>>()
+            .map(|o| self.variant == o.variant)
+            .unwrap_or(false)
+    }
+
+    fn __hash__(&self) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        self.variant.hash(&mut h);
+        h.finish()
+    }
 }
 
 // === Dynamic encoder (Python arg -> slots) ===
@@ -1284,6 +1453,12 @@ fn dynspire(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(load_spier, m)?)?;
     m.add_class::<SpierLib>()?;
     m.add_class::<SpierSchema>()?;
+    m.add_class::<SpierMethod>()?;
+    m.add_class::<SpierParam>()?;
+    m.add_class::<SpierTypeInfo>()?;
+    m.add_class::<SpierEnumSchema>()?;
+    m.add_class::<SpierEnumClass>()?;
+    m.add_class::<EnumVariantFactory>()?;
     m.add_class::<SpierHandle>()?;
     m.add_class::<BoundMethod>()?;
     m.add_class::<OpaqueHandle>()?;

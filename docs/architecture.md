@@ -252,12 +252,22 @@ The Python adapter (crate `dynspire-py`, package `dynspire`) is a compiled PyO3 
 lib = load_spier("rle_spier", lib_dir="target/debug")
 schema = lib.schema()
 
+# Methods — returns SpierMethod objects with .name, .params, .return_type, .index
 for m in schema.methods:
     print(schema.method_sig(m))
     # compress(data: Slice<U8>) -> Result<Vec<U8>, String>
+
+# Detailed introspection
+m = schema.method("eavt_save")       # SpierMethod
+p = m.params[0]                      # SpierParam (.name, .type_idx)
+ti = schema.type_at(p.type_idx)      # SpierTypeInfo (.kind_name)
+enum = schema.enum_by_name("Value")  # SpierEnumSchema (.name, .variant_names)
+EnumCls = enum.create_enum_class()   # SpierEnumClass — VariantName(payload) → SpierEnumValue
+
+assert lib.idl_hash() == schema.hash
 ```
 
-The engine reads the `DynSpireIdl` C struct via `libloading`, walking the type table and method table to build an in-memory `SchemaData` (method descriptors, type nodes, enum descriptors).
+The engine reads the `DynSpireIdl` C struct via `libloading`, walking the type table and method table to build an in-memory `SchemaData` (method descriptors, type nodes, enum descriptors). All schema objects (`SpierMethod`, `SpierParam`, `SpierTypeInfo`, `SpierEnumSchema`) are lightweight snapshots constructed on demand from this shared `Arc<SchemaData>`.
 
 ### Calling Convention
 

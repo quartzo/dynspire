@@ -6,6 +6,10 @@ dependencies = ["dynspire"]
 
 [tool.uv]
 package = false
+dev-dependencies = ["pytest"]
 
 [tool.uv.sources]
 dynspire = { path = "dynspire-py", editable = true }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
