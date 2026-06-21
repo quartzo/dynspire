@@ -62,6 +62,7 @@ struct SchemaData {
     types: Vec<TypeNode>,
     methods: Vec<MethodInfo>,
     struct_names: Vec<String>,
+    enums: Vec<EnumInfo>,
     free_fn: Option<FreeFn>,
     /// Keeps the spier `.so` mapped. Cloned into every handle/opaque value so
     /// that their function pointers stay valid for as long as they live — the
@@ -70,6 +71,19 @@ struct SchemaData {
     #[allow(dead_code)]
     lib: Arc<libloading::Library>,
     // enums omitted from this skeleton — port read_schema_enums when needed.
+}
+
+/// A parsed `#[slot_enum]`: its name and variants (each variant's field types
+/// resolved to GLOBAL type-table indices, so field decode recurses normally).
+struct EnumInfo {
+    name: String,
+    variants: Vec<VariantInfo>,
+}
+
+struct VariantInfo {
+    name: String,
+    disc: u32,
+    field_type_idxs: Vec<u32>,
 }
 
 unsafe fn read_name(ptr: *const u8, len: usize) -> String {
@@ -111,7 +125,7 @@ unsafe fn parse_method(m: &IdlMethod) -> MethodInfo {
 }
 
 unsafe fn parse_schema(raw: &DynSpireIdl, name: String, lib: Arc<libloading::Library>) -> Arc<SchemaData> {
-    let types: Vec<TypeNode> = std::slice::from_raw_parts(raw.type_table, raw.type_count)
+    let mut types: Vec<TypeNode> = std::slice::from_raw_parts(raw.type_table, raw.type_count)
         .iter()
         .map(|t| TypeNode {
             kind: t.kind,
@@ -138,6 +152,61 @@ unsafe fn parse_schema(raw: &DynSpireIdl, name: String, lib: Arc<libloading::Lib
         })
         .collect();
 
+    // Parse each enum descriptor. Every enum carries its own mini type-table
+    // for its variant field types; we merge those nodes into the global `types`
+    // (remapping child indices) so field decode recurses through the normal
+    // type table, and variant field indices become global.
+    let mut enums: Vec<EnumInfo> = Vec::new();
+    for i in 0..raw.enum_count {
+        let ed_ptr = *raw.enum_table.add(i);
+        if ed_ptr.is_null() {
+            continue;
+        }
+        let ed = &*ed_ptr;
+        let base = types.len() as i32;
+        let enum_tt = std::slice::from_raw_parts(ed.type_table, ed.type_count);
+        for node in enum_tt {
+            types.push(TypeNode {
+                kind: node.kind,
+                _size: node.size,
+                child0: if node.child0 >= 0 { node.child0 + base } else { node.child0 },
+                child1: if node.child1 >= 0 { node.child1 + base } else { node.child1 },
+            });
+        }
+
+        let ft_flat = if ed.field_type_count > 0 {
+            std::slice::from_raw_parts(ed.field_types, ed.field_type_count)
+        } else {
+            &[][..]
+        };
+        let varr = if ed.variant_count > 0 {
+            std::slice::from_raw_parts(ed.variants, ed.variant_count)
+        } else {
+            &[][..]
+        };
+
+        let mut variants = Vec::with_capacity(varr.len());
+        for v in varr {
+            let start = v.field_type_offset as usize;
+            let count = v.field_count as usize;
+            let field_type_idxs: Vec<u32> = ft_flat
+                .get(start..start + count)
+                .unwrap_or(&[])
+                .iter()
+                .map(|&local| (base + local as i32) as u32)
+                .collect();
+            variants.push(VariantInfo {
+                name: read_name(v.name, v.name_len),
+                disc: v.disc,
+                field_type_idxs,
+            });
+        }
+        enums.push(EnumInfo {
+            name: read_name(ed.name, ed.name_len),
+            variants,
+        });
+    }
+
     let free_fn = if raw.free_fn as usize == 0 {
         None
     } else {
@@ -150,6 +219,7 @@ unsafe fn parse_schema(raw: &DynSpireIdl, name: String, lib: Arc<libloading::Lib
         types,
         methods,
         struct_names,
+        enums,
         free_fn,
         lib,
     })
@@ -476,7 +546,7 @@ impl SpierHandle {
         let mut w = SlotWriter::new();
         let mut keepalive: Vec<Box<dyn std::any::Any + Send>> = Vec::new();
         for (p, arg) in method.params.iter().zip(args.iter()) {
-            encode_value(&mut w, p.type_idx, &self.data, &arg, &mut keepalive)?;
+            encode_value(py, &mut w, p.type_idx, &self.data, &arg, &mut keepalive)?;
         }
 
         // Dispatch. GIL is held: input borrows into Python memory are safe.
@@ -554,7 +624,7 @@ impl SpierHandle {
                 let arg = arg_iter
                     .next()
                     .expect("input arg count was validated above");
-                encode_value(&mut w, p.type_idx, &self.data, &arg, &mut keepalive)?;
+                encode_value(py, &mut w, p.type_idx, &self.data, &arg, &mut keepalive)?;
             }
         }
         drop(keepalive);
@@ -690,9 +760,51 @@ impl Drop for OpaqueHandle {
     }
 }
 
+// === SpierEnumValue: a #[slot_enum] value (variant name + payload fields) ===
+
+/// A `#[slot_enum]` value returned by a spier, or built to pass one back as an
+/// input. `variant` is the variant name; `fields` is the tuple of payload slots
+/// (empty for unit variants). Mirrors the ctypes `EnumValue`.
+#[pyclass(name = "SpierEnumValue")]
+struct SpierEnumValue {
+    variant: String,
+    fields: Py<PyTuple>,
+}
+
+#[pymethods]
+impl SpierEnumValue {
+    #[new]
+    #[pyo3(signature = (variant, *fields))]
+    fn new(variant: String, fields: &Bound<'_, PyTuple>) -> Self {
+        Self {
+            variant,
+            fields: fields.as_unbound().clone_ref(fields.py()),
+        }
+    }
+
+    #[getter]
+    fn variant(&self) -> &str {
+        &self.variant
+    }
+
+    #[getter]
+    fn fields(&self, py: Python<'_>) -> Py<PyTuple> {
+        self.fields.clone_ref(py)
+    }
+
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        Ok(format!(
+            "SpierEnumValue({:?}, {})",
+            self.variant,
+            self.fields.bind(py).repr()?
+        ))
+    }
+}
+
 // === Dynamic encoder (Python arg -> slots) ===
 
 fn encode_value<'py>(
+    py: Python<'py>,
     w: &mut SlotWriter,
     type_idx: u32,
     data: &SchemaData,
@@ -773,7 +885,35 @@ fn encode_value<'py>(
             w.write_u64(ptr);
             Ok(())
         }
-        // TODO: IDL_ARRAY, IDL_OPTION, IDL_TUPLE, IDL_ENUM inputs.
+        IDL_ENUM => {
+            let ev = arg.extract::<PyRef<'_, SpierEnumValue>>()?;
+            let ei = data.enums
+                .get(t.child0 as usize)
+                .ok_or_else(|| PyValueError::new_err(format!("enum index {} out of range", t.child0)))?;
+            let variant = ei
+                .variants
+                .iter()
+                .find(|v| v.name == ev.variant)
+                .ok_or_else(|| {
+                    PyValueError::new_err(format!("enum {} has no variant {:?}", ei.name, ev.variant))
+                })?;
+            w.write_u64(variant.disc as u64);
+            let fields = ev.fields.bind(py);
+            if fields.len() != variant.field_type_idxs.len() {
+                return Err(PyValueError::new_err(format!(
+                    "variant {:?} expects {} field(s), got {}",
+                    ev.variant,
+                    variant.field_type_idxs.len(),
+                    fields.len()
+                )));
+            }
+            for (i, &ft_idx) in variant.field_type_idxs.iter().enumerate() {
+                let f = fields.get_item(i)?;
+                encode_value(py, w, ft_idx, data, &f, keepalive)?;
+            }
+            Ok(())
+        }
+        // TODO: IDL_ARRAY, IDL_OPTION, IDL_TUPLE inputs.
         _ => Err(PyValueError::new_err(format!(
             "unsupported input type kind {}",
             t.kind
@@ -882,7 +1022,30 @@ fn decode_value<'py>(
             };
             Ok(Bound::new(py, obj)?.into_any())
         }
-        // TODO: IDL_ARRAY, IDL_ENUM returns.
+        IDL_ENUM => {
+            let ei = data.enums
+                .get(t.child0 as usize)
+                .ok_or_else(|| PyValueError::new_err(format!("enum index {} out of range", t.child0)))?;
+            let disc = r.read_u64() as u32;
+            let variant = ei
+                .variants
+                .iter()
+                .find(|v| v.disc == disc)
+                .ok_or_else(|| {
+                    PyValueError::new_err(format!("enum {} unknown discriminant {}", ei.name, disc))
+                })?;
+            let mut fields: Vec<Bound<'py, PyAny>> = Vec::new();
+            for &ft_idx in &variant.field_type_idxs {
+                fields.push(decode_value(r, ft_idx, data, py)?);
+            }
+            let tup = PyTuple::new(py, fields)?;
+            let obj = SpierEnumValue {
+                variant: variant.name.clone(),
+                fields: tup.unbind(),
+            };
+            Ok(Bound::new(py, obj)?.into_any())
+        }
+        // TODO: IDL_ARRAY returns.
         _ => Err(PyValueError::new_err(format!(
             "unsupported return type kind {}",
             t.kind
@@ -947,5 +1110,6 @@ fn dynspire(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<SpierSchema>()?;
     m.add_class::<SpierHandle>()?;
     m.add_class::<OpaqueHandle>()?;
+    m.add_class::<SpierEnumValue>()?;
     Ok(())
 }

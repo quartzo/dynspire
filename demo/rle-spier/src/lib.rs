@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use dynspire_macro::{spier_dispatch, spier_storage};
-use rle_idl::{CompressionReport, RleEngine};
+use rle_idl::{CompressionReport, RleEngine, Tone};
 
 pub struct RleState;
 
@@ -111,5 +111,26 @@ impl RleEngine for RleState {
 
     fn first_byte(&self, data: &[u8]) -> Result<Option<u8>, String> {
         Ok(data.first().copied())
+    }
+
+    fn classify(&self, data: &[u8]) -> Result<Tone, String> {
+        if data.is_empty() {
+            Ok(Tone::Quiet)
+        } else {
+            let max = *data.iter().max().unwrap();
+            if max < 64 {
+                Ok(Tone::Normal)
+            } else {
+                Ok(Tone::Loud(max))
+            }
+        }
+    }
+
+    fn describe_tone(&self, tone: Tone) -> Result<String, String> {
+        Ok(match tone {
+            Tone::Quiet => "silence".to_string(),
+            Tone::Normal => "audible".to_string(),
+            Tone::Loud(v) => format!("loud({v})"),
+        })
     }
 }

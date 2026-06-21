@@ -105,6 +105,10 @@ pub fn modulo_interface(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 
     let mut type_table = TypeTableBuilder::new();
+    // Types declared via `enums(...)` are known up front, so the type builder
+    // emits IDL_ENUM (not the default IDL_STRUCT) when it meets them in a
+    // method signature.
+    type_table.enum_type_names = extra_enums.clone();
     let mut schema_methods: Vec<TokenStream2> = Vec::new();
     let mut free_types: Vec<(syn::LitInt, Type)> = Vec::new();
 
@@ -501,7 +505,14 @@ impl TypeTableBuilder {
                         }
                         self.add_unit()
                     }
-                    _ => self.add_struct(seg.ident.to_string()),
+                    _ => {
+                        let name = seg.ident.to_string();
+                        if self.enum_type_names.contains(&name) {
+                            self.add_enum(name)
+                        } else {
+                            self.add_struct(name)
+                        }
+                    }
                 }
             }
             Type::Reference(r) => {
@@ -572,6 +583,21 @@ impl TypeTableBuilder {
         let idx = self.nodes.len();
         self.nodes.push(quote! {
             dynspire::ffi::IdlTypeNode { kind: dynspire::ffi::IDL_UNIT, _pad: [0; 3], size: 0, child0: -1, child1: -1 }
+        });
+        idx
+    }
+
+    fn add_enum(&mut self, name: String) -> usize {
+        let enum_idx = if let Some(pos) = self.enum_type_names.iter().position(|n| n == &name) {
+            pos
+        } else {
+            self.enum_type_names.push(name);
+            self.enum_type_names.len() - 1
+        };
+        let idx = self.nodes.len();
+        let enum_idx_i32 = enum_idx as i32;
+        self.nodes.push(quote! {
+            dynspire::ffi::IdlTypeNode { kind: dynspire::ffi::IDL_ENUM, _pad: [0; 3], size: 0, child0: #enum_idx_i32, child1: -1 }
         });
         idx
     }
