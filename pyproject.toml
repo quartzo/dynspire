@@ -1,0 +1,11 @@
+[project]
+name = "dynspire-dev"
+version = "0"
+requires-python = ">=3.8"
+dependencies = ["dynspire"]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+dynspire = { path = "dynspire-py", editable = true }

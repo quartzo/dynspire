@@ -95,9 +95,8 @@ cargo build
 cargo run -p rle-host
 
 # Run Python host
-pip install -e dynspire-py/
-python3 demo/rle_client.py
-python3 demo/rle_client2.py
+uv run python demo/rle_client.py
+uv run python demo/rle_client2.py
 ```
 
 Output:
@@ -121,6 +120,7 @@ stats()
 ## Project Layout
 
 ```
+pyproject.toml     uv project root (declares dynspire-py as local dependency)
 dynspire/          Core: arena FFI, slot system, tower client
 dynspire-macro/    Proc macros: #[modulo_interface], #[spier_dispatch], #[spier_storage], #[slot_enum], #[slot_struct]
 dynspire-libs/     Library discovery helpers
