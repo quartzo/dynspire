@@ -70,7 +70,6 @@ struct SchemaData {
     /// `dynspire_free` drops) is gone.
     #[allow(dead_code)]
     lib: Arc<libloading::Library>,
-    // enums omitted from this skeleton — port read_schema_enums when needed.
 }
 
 /// A parsed `#[slot_enum]`: its name and variants (each variant's field types
@@ -407,6 +406,19 @@ fn struct_name_at(data: &SchemaData, idx: u32) -> String {
         .unwrap_or_else(|| "OpaqueValue".into())
 }
 
+fn build_enum_schema(data: &SchemaData, e: &EnumInfo) -> SpierEnumSchema {
+    SpierEnumSchema {
+        name: e.name.clone(),
+        variants: e.variants.iter().map(|v| SpierEnumVariant {
+            name: v.name.clone(),
+            disc: v.disc,
+            field_types: v.field_type_idxs.iter()
+                .map(|&idx| schema_type_str(data, idx))
+                .collect(),
+        }).collect(),
+    }
+}
+
 /// Returns the struct's stable index (`child0` into `struct_names`) if this
 /// type node is a struct, or `None` otherwise. Used for O(1) type-identity
 /// comparison without string allocation.
@@ -419,12 +431,14 @@ fn struct_id_at(data: &SchemaData, idx: u32) -> Option<i32> {
 // === Rich schema objects for introspection ===
 
 #[derive(Clone)]
-#[pyclass(name = "SpierParam")]
+#[pyclass(name = "SpierParam", skip_from_py_object)]
 struct SpierParam {
     #[pyo3(get)]
     name: String,
     #[pyo3(get)]
     type_idx: u32,
+    #[pyo3(get)]
+    type_str: String,
 }
 
 #[pyclass(name = "SpierMethod")]
@@ -436,18 +450,22 @@ struct SpierMethod {
     #[pyo3(get)]
     return_type: u32,
     #[pyo3(get)]
+    return_type_str: String,
+    #[pyo3(get)]
     index: usize,
 }
 
 impl SpierMethod {
-    fn from_info(idx: usize, m: &MethodInfo) -> Self {
+    fn from_info(idx: usize, m: &MethodInfo, data: &SchemaData) -> Self {
         SpierMethod {
             name: m.name.clone(),
             params: m.params.iter().map(|p| SpierParam {
                 name: p.name.clone(),
                 type_idx: p.type_idx,
+                type_str: schema_type_str(data, p.type_idx),
             }).collect(),
             return_type: m.return_type_idx,
+            return_type_str: schema_type_str(data, m.return_type_idx),
             index: idx,
         }
     }
@@ -456,15 +474,35 @@ impl SpierMethod {
 #[pyclass(name = "SpierTypeInfo")]
 struct SpierTypeInfo {
     kind: u8,
+    child0: i32,
+    child1: i32,
     #[pyo3(get)]
     type_idx: u32,
 }
 
 #[pymethods]
 impl SpierTypeInfo {
+    /// Raw IDL kind byte (1=Unit, 2=U8, 3=U32, 4=U64, 15=F32, 16=F64, …).
+    #[getter]
+    fn kind(&self) -> u8 {
+        self.kind
+    }
+
     #[getter]
     fn kind_name(&self) -> &'static str {
         kind_name(self.kind)
+    }
+
+    /// First child index into the type table (-1 if absent).
+    #[getter]
+    fn child0(&self) -> i32 {
+        self.child0
+    }
+
+    /// Second child index into the type table (-1 if absent).
+    #[getter]
+    fn child1(&self) -> i32 {
+        self.child1
     }
 }
 
@@ -507,27 +545,57 @@ impl SpierEnumClass {
     }
 }
 
+/// A variant of an enum: name, discriminant, and resolved field type strings.
+#[derive(Clone)]
+#[pyclass(name = "SpierEnumVariant", skip_from_py_object)]
+struct SpierEnumVariant {
+    #[pyo3(get)]
+    name: String,
+    #[pyo3(get)]
+    disc: u32,
+    #[pyo3(get)]
+    field_types: Vec<String>,
+}
+
+#[pymethods]
+impl SpierEnumVariant {
+    fn __repr__(&self) -> String {
+        if self.field_types.is_empty() {
+            format!("{:?} (disc={})", self.name, self.disc)
+        } else {
+            format!("{:?}({}) (disc={})", self.name, self.field_types.join(", "), self.disc)
+        }
+    }
+}
+
 /// Enum schema descriptor returned by `schema.enum_by_name(name)`.
 #[pyclass(name = "SpierEnumSchema")]
 struct SpierEnumSchema {
     #[pyo3(get)]
     name: String,
-    variants: Vec<String>,
+    variants: Vec<SpierEnumVariant>,
 }
 
 #[pymethods]
 impl SpierEnumSchema {
+    /// Variant names (convenience for simple iteration).
     #[getter]
     fn variant_names(&self) -> Vec<String> {
+        self.variants.iter().map(|v| v.name.clone()).collect()
+    }
+
+    /// Full variant objects with discriminant and field types.
+    #[getter]
+    fn variants(&self) -> Vec<SpierEnumVariant> {
         self.variants.clone()
     }
 
     fn create_enum_class(&self) -> SpierEnumClass {
-        SpierEnumClass { variants: self.variants.clone() }
+        SpierEnumClass { variants: self.variants.iter().map(|v| v.name.clone()).collect() }
     }
 
     fn __repr__(&self) -> String {
-        format!("<SpierEnumSchema {:?} [{}]>", self.name, self.variants.join(", "))
+        format!("<SpierEnumSchema {:?} [{}]>", self.name, self.variants.iter().map(|v| v.name.as_str()).collect::<Vec<_>>().join(", "))
     }
 }
 
@@ -547,7 +615,7 @@ impl SpierSchema {
     #[getter]
     fn methods(&self) -> Vec<SpierMethod> {
         self.data.methods.iter().enumerate()
-            .map(|(i, m)| SpierMethod::from_info(i, m))
+            .map(|(i, m)| SpierMethod::from_info(i, m, &self.data))
             .collect()
     }
 
@@ -555,14 +623,14 @@ impl SpierSchema {
     fn method(&self, name: &str) -> PyResult<SpierMethod> {
         self.data.methods.iter().enumerate()
             .find(|(_, m)| m.name == name)
-            .map(|(i, m)| SpierMethod::from_info(i, m))
+            .map(|(i, m)| SpierMethod::from_info(i, m, &self.data))
             .ok_or_else(|| PyValueError::new_err(format!("unknown method: {name}")))
     }
 
     /// Returns type info at a given type-table index.
     fn type_at(&self, type_idx: u32) -> PyResult<SpierTypeInfo> {
         self.data.types.get(type_idx as usize)
-            .map(|t| SpierTypeInfo { kind: t.kind, type_idx })
+            .map(|t| SpierTypeInfo { kind: t.kind, child0: t.child0, child1: t.child1, type_idx })
             .ok_or_else(|| PyValueError::new_err(format!("type index {type_idx} out of range")))
     }
 
@@ -570,11 +638,22 @@ impl SpierSchema {
     fn enum_by_name(&self, name: &str) -> PyResult<SpierEnumSchema> {
         self.data.enums.iter()
             .find(|e| e.name == name)
-            .map(|e| SpierEnumSchema {
-                name: e.name.clone(),
-                variants: e.variants.iter().map(|v| v.name.clone()).collect(),
-            })
+            .map(|e| build_enum_schema(&self.data, e))
             .ok_or_else(|| PyValueError::new_err(format!("unknown enum: {name}")))
+    }
+
+    /// All enum schemas in declaration order.
+    #[getter]
+    fn enums(&self) -> Vec<SpierEnumSchema> {
+        self.data.enums.iter()
+            .map(|e| build_enum_schema(&self.data, e))
+            .collect()
+    }
+
+    /// All struct names registered in the schema.
+    #[getter]
+    fn structs(&self) -> Vec<String> {
+        self.data.struct_names.clone()
     }
 
     fn method_sig(&self, name_or_method: &Bound<'_, PyAny>) -> PyResult<String> {
@@ -1200,6 +1279,9 @@ fn encode_value<'py>(
                 IDL_VEC if data.types[child.child0 as usize].kind == IDL_U8 => {
                     encode_vec_vec_u8_input(w, arg, keepalive)
                 }
+                IDL_STRING => {
+                    encode_vec_string_input(w, arg, keepalive)
+                }
                 _ => Err(PyValueError::new_err(format!(
                     "unsupported Vec element kind {}",
                     child.kind
@@ -1256,7 +1338,33 @@ fn encode_value<'py>(
             }
             Ok(())
         }
-        // TODO: IDL_ARRAY, IDL_OPTION, IDL_TUPLE inputs.
+        IDL_OPTION => {
+            if arg.is_none() {
+                w.write_u64(0);
+                Ok(())
+            } else {
+                w.write_u64(1);
+                encode_value(py, w, t.child0 as u32, data, arg, keepalive)
+            }
+        }
+        IDL_TUPLE => {
+            let mut field_idxs = Vec::new();
+            if t.child0 >= 0 { field_idxs.push(t.child0 as u32); }
+            if t.child1 >= 0 { field_idxs.push(t.child1 as u32); }
+            let elems: Vec<Bound<'_, PyAny>> = arg.try_iter()?.collect::<PyResult<Vec<_>>>()?;
+            if elems.len() != field_idxs.len() {
+                return Err(PyValueError::new_err(format!(
+                    "tuple expects {} elements, got {}",
+                    field_idxs.len(),
+                    elems.len()
+                )));
+            }
+            for (i, &ft_idx) in field_idxs.iter().enumerate() {
+                encode_value(py, w, ft_idx, data, &elems[i], keepalive)?;
+            }
+            Ok(())
+        }
+        // TODO: IDL_ARRAY inputs (fixed-size [T; N]).
         _ => Err(PyValueError::new_err(format!(
             "unsupported input type kind {}",
             t.kind
@@ -1279,6 +1387,25 @@ fn encode_vec_vec_u8_input(
     }
     let len = owned.len();
     let boxed: Box<[Vec<u8>]> = owned.into_boxed_slice();
+    let ptr = boxed.as_ptr() as u64;
+    keepalive.push(Box::new(boxed));
+    w.write_u64(ptr);
+    w.write_u64(len as u64);
+    Ok(())
+}
+
+/// Encodes a `Vec<String>` input — same pattern as Vec<Vec<u8>>.
+fn encode_vec_string_input(
+    w: &mut SlotWriter,
+    arg: &Bound<'_, PyAny>,
+    keepalive: &mut Vec<Box<dyn std::any::Any + Send>>,
+) -> PyResult<()> {
+    let mut owned: Vec<String> = Vec::new();
+    for item in arg.try_iter()? {
+        owned.push(item?.extract::<String>()?);
+    }
+    let len = owned.len();
+    let boxed: Box<[String]> = owned.into_boxed_slice();
     let ptr = boxed.as_ptr() as u64;
     keepalive.push(Box::new(boxed));
     w.write_u64(ptr);
@@ -1457,6 +1584,7 @@ fn dynspire(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<SpierParam>()?;
     m.add_class::<SpierTypeInfo>()?;
     m.add_class::<SpierEnumSchema>()?;
+    m.add_class::<SpierEnumVariant>()?;
     m.add_class::<SpierEnumClass>()?;
     m.add_class::<EnumVariantFactory>()?;
     m.add_class::<SpierHandle>()?;

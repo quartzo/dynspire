@@ -307,3 +307,101 @@ class TestLifecycle:
         h = lib.create_handle()
         assert "SpierHandle" in repr(h)
         h.destroy()
+
+
+# ---------------------------------------------------------------------------
+# Schema enumeration (.enums, .structs)
+# ---------------------------------------------------------------------------
+
+class TestSchemaEnumeration:
+    def test_enums_list(self, schema):
+        enums = schema.enums
+        assert len(enums) == 1
+        assert enums[0].name == "Tone"
+
+    def test_structs_list(self, schema):
+        structs = schema.structs
+        assert "CompressionReport" in structs
+
+    def test_enums_iterable(self, schema):
+        names = [e.name for e in schema.enums]
+        assert "Tone" in names
+
+
+# ---------------------------------------------------------------------------
+# SpierEnumVariant: discriminants + field types
+# ---------------------------------------------------------------------------
+
+class TestEnumVariantInfo:
+    def test_variants_have_disc(self, schema):
+        e = schema.enum_by_name("Tone")
+        for v in e.variants:
+            assert isinstance(v.disc, int)
+
+    def test_variant_names_match(self, schema):
+        e = schema.enum_by_name("Tone")
+        names = [v.name for v in e.variants]
+        assert names == ["Quiet", "Normal", "Loud"]
+
+    def test_variant_field_types_empty_for_unit(self, schema):
+        e = schema.enum_by_name("Tone")
+        for v in e.variants:
+            assert isinstance(v.field_types, list)
+
+    def test_variant_repr(self, schema):
+        e = schema.enum_by_name("Tone")
+        r = repr(e.variants[0])
+        assert "Quiet" in r
+        assert "disc=" in r
+
+
+# ---------------------------------------------------------------------------
+# SpierTypeInfo: kind (numeric), child0, child1
+# ---------------------------------------------------------------------------
+
+class TestTypeInfoNavigation:
+    def test_kind_numeric(self, schema):
+        m = schema.method("compress")
+        ti = schema.type_at(m.params[0].type_idx)
+        assert isinstance(ti.kind, int)
+        assert ti.kind > 0
+
+    def test_child_indices(self, schema):
+        m = schema.method("compress")
+        ti = schema.type_at(m.params[0].type_idx)
+        # Slice<U8> — child0 should point to the U8 node
+        assert ti.child0 >= 0
+
+    def test_kind_matches_kind_name(self, schema):
+        m = schema.method("compress")
+        ti = schema.type_at(m.params[0].type_idx)
+        assert ti.kind_name == "Slice"
+        # IDL_SLICE constant
+        assert ti.kind == 5
+
+    def test_return_type_has_child(self, schema):
+        # compress returns Result<Vec<U8>, String> → the outer type is Result (encoded as Vec)
+        m = schema.method("stats")
+        ti = schema.type_at(m.return_type)
+        # stats returns Tuple<U64, U64> → should have two children
+        assert ti.child0 >= 0
+        assert ti.child1 >= 0
+
+
+# ---------------------------------------------------------------------------
+# Resolved type strings on SpierParam and SpierMethod
+# ---------------------------------------------------------------------------
+
+class TestResolvedTypeStrings:
+    def test_param_type_str(self, schema):
+        m = schema.method("compress")
+        assert m.params[0].type_str == "Slice<U8>"
+
+    def test_return_type_str(self, schema):
+        m = schema.method("compress")
+        assert "Vec<U8>" in m.return_type_str
+
+    def test_method_sig_consistent_with_type_str(self, schema):
+        m = schema.method("compress")
+        sig = schema.method_sig(m)
+        assert m.params[0].type_str in sig
