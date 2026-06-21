@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use pyo3::exceptions::{PyAttributeError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyAnyMethods, PyBool, PyBytes, PyList, PyString, PyTuple};
+use pyo3::types::{PyAnyMethods, PyBool, PyBytes, PyDict, PyDictMethods, PyList, PyString, PyTuple};
 
 use dynspire_core::ffi::{
     DynSpireIdl, FreeFn, IdlMethod, VecView, IDL_ARRAY, IDL_BOOL, IDL_ENUM, IDL_OPTION,
@@ -509,6 +509,39 @@ struct SpierHandle {
 unsafe impl Send for SpierHandle {}
 unsafe impl Sync for SpierHandle {}
 
+/// Merges positional args and kwargs into a single tuple suitable for `invoke`.
+/// If kwargs is empty, returns the original args. Otherwise builds a dict from
+/// positional args (mapped by param name) merged with kwargs.
+fn merge_kwargs<'py>(
+    py: Python<'py>,
+    data: &SchemaData,
+    method: &MethodInfo,
+    args: &Bound<'py, PyTuple>,
+    kwargs: Option<&Bound<'py, PyDict>>,
+) -> PyResult<Bound<'py, PyTuple>> {
+    let Some(kw) = kwargs else {
+        return Ok(args.clone());
+    };
+    if kw.is_empty() {
+        return Ok(args.clone());
+    }
+    let d = PyDict::new(py);
+    let mut pos = 0;
+    for p in &method.params {
+        if data.types[p.type_idx as usize].kind == IDL_OUT_VEC {
+            continue;
+        }
+        if pos < args.len() {
+            d.set_item(p.name.as_str(), args.get_item(pos)?)?;
+            pos += 1;
+        }
+    }
+    for (k, v) in kw.iter() {
+        d.set_item(k, v)?;
+    }
+    Ok(PyTuple::new(py, [d.into_any()])?)
+}
+
 impl SpierHandle {
     fn find_method(&self, name: &str) -> PyResult<(usize, &MethodInfo)> {
         self.data
@@ -535,6 +568,7 @@ impl SpierHandle {
     }
 
     /// Unified entry point: routes to the out-vec or plain path automatically.
+    /// If a single dict arg is passed, expands to positional args by param name.
     fn invoke<'py>(
         &self,
         py: Python<'py>,
@@ -542,7 +576,35 @@ impl SpierHandle {
         args: &Bound<'py, PyTuple>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let (idx, method) = self.find_method(method_name)?;
-        if self.has_outvec(method) {
+
+        // Dict-arg expansion: h.call("put", {"cf": 0, "key": b"..."}) → positional.
+        let dict = if args.len() == 1 {
+            match args.get_item(0)?.extract::<std::collections::HashMap<String, Py<PyAny>>>() {
+                Ok(d) => Some(d),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
+        if let Some(d) = dict {
+            let mut values: Vec<Bound<'py, PyAny>> = Vec::new();
+            for p in &method.params {
+                if self.data.types[p.type_idx as usize].kind == IDL_OUT_VEC {
+                    continue;
+                }
+                let val = d.get(&p.name).ok_or_else(|| {
+                    PyValueError::new_err(format!("missing keyword argument {:?}", p.name))
+                })?;
+                values.push(val.clone_ref(py).into_bound(py));
+            }
+            let tup = PyTuple::new(py, values)?;
+            if self.has_outvec(method) {
+                self.invoke_outvec(py, idx, method, &tup)
+            } else {
+                self.invoke_plain(py, idx, method, &tup)
+            }
+        } else if self.has_outvec(method) {
             self.invoke_outvec(py, idx, method, args)
         } else {
             self.invoke_plain(py, idx, method, args)
@@ -703,14 +765,17 @@ impl SpierHandle {
     /// (`h.compress(data)`) — this exists for dynamic method names. Methods
     /// with out-vec (`&mut Vec<u8>`) params automatically return
     /// `(ret_val, list[bytes])`.
-    #[pyo3(signature = (method_name, *args))]
+    #[pyo3(signature = (method_name, *args, **kwargs))]
     fn call<'py>(
         &self,
         py: Python<'py>,
         method_name: &str,
         args: &Bound<'py, PyTuple>,
+        kwargs: Option<&Bound<'py, PyDict>>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        self.invoke(py, method_name, args)
+        let (_, method) = self.find_method(method_name)?;
+        let args = merge_kwargs(py, &self.data, method, args, kwargs)?;
+        self.invoke(py, method_name, &args)
     }
 
     /// Attribute dispatch: `h.<method_name>` returns a bound callable.
@@ -779,14 +844,17 @@ struct BoundMethod {
 
 #[pymethods]
 impl BoundMethod {
-    #[pyo3(signature = (*args))]
+    #[pyo3(signature = (*args, **kwargs))]
     fn __call__<'py>(
         &self,
         py: Python<'py>,
         args: &Bound<'py, PyTuple>,
+        kwargs: Option<&Bound<'py, PyDict>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let h = self.handle.borrow(py);
-        h.invoke(py, &self.method, args)
+        let (_, method) = h.find_method(&self.method)?;
+        let args = merge_kwargs(py, &h.data, method, args, kwargs)?;
+        h.invoke(py, &self.method, &args)
     }
 
     fn __repr__(&self) -> String {
