@@ -17,9 +17,9 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAnyMethods, PyBool, PyBytes, PyList, PyString, PyTuple};
 
 use dynspire_core::ffi::{
-    DynSpireIdl, FreeFn, IdlMethod, IDL_ARRAY, IDL_BOOL, IDL_ENUM, IDL_OPTION, IDL_OUT_VEC,
-    IDL_SLICE, IDL_STRING, IDL_STRUCT, IDL_STR, IDL_TUPLE, IDL_U32, IDL_U64, IDL_U8, IDL_UNIT,
-    IDL_VEC,
+    DynSpireIdl, FreeFn, IdlMethod, VecView, IDL_ARRAY, IDL_BOOL, IDL_ENUM, IDL_OPTION,
+    IDL_OUT_VEC, IDL_SLICE, IDL_STRING, IDL_STRUCT, IDL_STR, IDL_TUPLE, IDL_U32, IDL_U64, IDL_U8,
+    IDL_UNIT, IDL_VEC,
 };
 use dynspire_core::slots::{SlotReader, SlotWriter, MAX_OUT_SLOTS};
 use pyo3::{Py, PyRef};
@@ -33,6 +33,7 @@ type FnSchema = unsafe extern "C" fn() -> *const DynSpireIdl;
 type FnSpierName = unsafe extern "C" fn() -> *const u8;
 type FnVecCreate = unsafe extern "C" fn() -> *mut c_void;
 type FnVecFree = unsafe extern "C" fn(*mut c_void);
+type FnVecView = unsafe extern "C" fn(*mut c_void) -> VecView;
 
 // === Schema (parsed once from the spier's DynSpireIdl into owned Rust) ===
 
@@ -179,8 +180,8 @@ struct SpierLib {
     dispatch: Arc<[FnDispatch]>,
     #[allow(dead_code)]
     vec_create: FnVecCreate,
-    #[allow(dead_code)]
     vec_free: FnVecFree,
+    vec_view: FnVecView,
 }
 
 #[pymethods]
@@ -204,6 +205,9 @@ impl SpierLib {
             data: self.data.clone(),
             dispatch: self.dispatch.clone(),
             destroy: self.destroy,
+            vec_create: self.vec_create,
+            vec_free: self.vec_free,
+            vec_view: self.vec_view,
             handle,
         })
     }
@@ -265,6 +269,7 @@ fn load_spier(name: &str, lib_dir: Option<&str>) -> PyResult<SpierLib> {
     // Out-vec helpers (used by call_with_outs, resolved from the spier .so).
     let vec_create: FnVecCreate = load_sym(&lib, b"dynspire_vec_create\0")?;
     let vec_free: FnVecFree = load_sym(&lib, b"dynspire_vec_free\0")?;
+    let vec_view: FnVecView = load_sym(&lib, b"dynspire_vec_view\0")?;
 
     let data = unsafe { parse_schema(&*raw, name, lib.clone()) };
 
@@ -281,6 +286,7 @@ fn load_spier(name: &str, lib_dir: Option<&str>) -> PyResult<SpierLib> {
         dispatch: Arc::from(dispatch),
         vec_create,
         vec_free,
+        vec_view,
     })
 }
 
@@ -387,6 +393,21 @@ fn kind_name(k: u8) -> &'static str {
     }
 }
 
+/// RAII guard that frees every out-vec handle created via `dynspire_vec_create`,
+/// ensuring release on every path (success, error, panic).
+struct OutVecGuard {
+    ptrs: Vec<*mut c_void>,
+    free: FnVecFree,
+}
+
+impl Drop for OutVecGuard {
+    fn drop(&mut self) {
+        for p in &self.ptrs {
+            unsafe { (self.free)(*p) };
+        }
+    }
+}
+
 // === SpierHandle ===
 
 /// Runtime handle for calling a spier. `Drop` calls `dynspire_destroy`.
@@ -395,6 +416,9 @@ struct SpierHandle {
     data: Arc<SchemaData>,
     dispatch: Arc<[FnDispatch]>,
     destroy: FnDestroy,
+    vec_create: FnVecCreate,
+    vec_free: FnVecFree,
+    vec_view: FnVecView,
     handle: *mut c_void,
 }
 
@@ -484,19 +508,101 @@ impl SpierHandle {
         decode_value(&mut r, method.return_type_idx, &self.data, py)
     }
 
-    /// Out-vec variant. TODO: mirrors `call` but resolves `&mut Vec<u8>` params
-    /// via the spier's `dynspire_vec_*` helpers. Not yet implemented.
+    /// Calls a method with `&mut Vec<u8>` (out-vec) parameters. The caller
+    /// supplies only the non-out-vec args; the spier fills each out-vec, which
+    /// is returned as `bytes`. Returns `(ret_val, list[bytes])`.
     #[pyo3(signature = (method_name, *args))]
-    #[allow(unused_variables)]
     fn call_with_outs<'py>(
         &self,
         py: Python<'py>,
         method_name: &str,
         args: &Bound<'py, PyTuple>,
-    ) -> PyResult<Py<PyAny>> {
-        Err(PyRuntimeError::new_err(
-            "call_with_outs() not yet implemented in the PyO3 engine",
-        ))
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let (idx, method) = self.find_method(method_name)?;
+
+        // Out-vec params are skipped from the caller's args; they're allocated here.
+        let input_count = method
+            .params
+            .iter()
+            .filter(|p| self.data.types[p.type_idx as usize].kind != IDL_OUT_VEC)
+            .count();
+        if args.len() != input_count {
+            return Err(PyValueError::new_err(format!(
+                "{} expects {} input arg(s) (excluding out-vecs), got {}",
+                method_name, input_count, args.len()
+            )));
+        }
+
+        // Build the slot stream in declaration order: out-vec params get a fresh
+        // `Vec<u8>` handle (freed by the guard), inputs are encoded from `args`.
+        let mut w = SlotWriter::new();
+        let mut keepalive: Vec<Box<dyn std::any::Any + Send>> = Vec::new();
+        let mut guard = OutVecGuard {
+            ptrs: Vec::new(),
+            free: self.vec_free,
+        };
+        let mut arg_iter = args.iter();
+        for p in &method.params {
+            if self.data.types[p.type_idx as usize].kind == IDL_OUT_VEC {
+                let vp = unsafe { (self.vec_create)() };
+                if vp.is_null() {
+                    return Err(PyRuntimeError::new_err("dynspire_vec_create returned null"));
+                }
+                guard.ptrs.push(vp);
+                w.write_u64(vp as u64);
+            } else {
+                let arg = arg_iter
+                    .next()
+                    .expect("input arg count was validated above");
+                encode_value(&mut w, p.type_idx, &self.data, &arg, &mut keepalive)?;
+            }
+        }
+        drop(keepalive);
+
+        // Dispatch (GIL held: input borrows into Python memory are safe).
+        let in_slots = w.as_slice();
+        let mut out = [0u64; MAX_OUT_SLOTS];
+        let ret = unsafe {
+            (self.dispatch[idx])(
+                self.handle,
+                in_slots.as_ptr(),
+                in_slots.len(),
+                out.as_mut_ptr(),
+                MAX_OUT_SLOTS,
+            )
+        };
+        if ret != 0 {
+            return Err(PyRuntimeError::new_err(format!(
+                "dispatch transport error (code {ret})"
+            )));
+        }
+
+        // Snapshot the out-vec contents before the guard frees the handles.
+        let out_bytes: Vec<Vec<u8>> = guard
+            .ptrs
+            .iter()
+            .map(|&vp| {
+                let view = unsafe { (self.vec_view)(vp) };
+                if view.ptr.is_null() || view.len == 0 {
+                    Vec::new()
+                } else {
+                    unsafe { std::slice::from_raw_parts(view.ptr, view.len).to_vec() }
+                }
+            })
+            .collect();
+
+        // Decode the return value (Result<T, String> framing, same as `call`).
+        let mut r = SlotReader::new(&out);
+        let tag = r.read_u64();
+        let ret_val = if tag == 1 {
+            let err = reconstruct_owned_string(&mut r);
+            return Err(PyRuntimeError::new_err(format!("spier error: {err}")));
+        } else {
+            decode_value(&mut r, method.return_type_idx, &self.data, py)?
+        };
+
+        let list = PyList::new(py, out_bytes.iter().map(|b| PyBytes::new(py, b)))?;
+        PyTuple::new(py, [ret_val, list.into_any()]).map(|t| t.into_any())
     }
 
     fn destroy(&mut self) {
@@ -729,8 +835,12 @@ fn decode_value<'py>(
                     list.append(PyBytes::new(py, inner))?;
                 }
                 Ok(list.into_any())
+            } else if child.kind == IDL_STRING {
+                let v = reconstruct_owned_vec_string(r);
+                let list = PyList::new(py, v.iter().map(|s| PyString::new(py, s)))?;
+                Ok(list.into_any())
             } else {
-                // TODO: Vec<T> of scalars — reconstruct by element stride.
+                // TODO: Vec<[u8; N]>, Vec<(Vec<u8>, Vec<u8>)> — mirror ctypes.
                 Err(PyValueError::new_err(format!(
                     "unsupported Vec element kind {}",
                     child.kind
@@ -798,6 +908,21 @@ fn reconstruct_owned_bytes(r: &mut SlotReader) -> Vec<u8> {
 fn reconstruct_owned_string(r: &mut SlotReader) -> String {
     // The spier's String output is its bytes handed as Vec<u8>; it was valid UTF-8.
     unsafe { String::from_utf8_unchecked(reconstruct_owned_bytes(r)) }
+}
+
+/// Reconstructs an owned `Vec<String>` from its `(ptr, len)` slot pair. The
+/// spier leaks a `Box<[String]>`; `Box::from_raw` reclaims the whole array and
+/// every `String` in it (no 24-byte stride arithmetic — we're in Rust).
+fn reconstruct_owned_vec_string(r: &mut SlotReader) -> Vec<String> {
+    let ptr = r.read_u64() as *mut String;
+    let len = r.read_u64() as usize;
+    if ptr.is_null() || len == 0 {
+        return Vec::new();
+    }
+    unsafe {
+        let fat = std::ptr::slice_from_raw_parts_mut(ptr, len);
+        Box::from_raw(fat).into_vec()
+    }
 }
 
 fn reconstruct_owned_vec_vec_u8(r: &mut SlotReader) -> Vec<Vec<u8>> {
