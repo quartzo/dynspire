@@ -13,6 +13,8 @@ pub const IDL_BOOL: u8 = 11;
 pub const IDL_OUT_VEC: u8 = 12;
 pub const IDL_ENUM: u8 = 13;
 pub const IDL_STRUCT: u8 = 14;
+pub const IDL_F32: u8 = 15;
+pub const IDL_F64: u8 = 16;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]

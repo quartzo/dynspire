@@ -74,7 +74,7 @@ def main():
         # IDL methods, not by reading Rust memory directly.
         report_handle = h.analyze(input_data)
         print("h.analyze() -> CompressionReport")
-        print(f"  opaque handle : 0x{report_handle.handle:016x}")
+        print(f"  {report_handle!r}")
         print()
 
         # Pass the opaque handle back to an IDL method that reads the struct

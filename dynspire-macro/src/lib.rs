@@ -444,14 +444,14 @@ impl TypeTableBuilder {
                     "f32" => {
                         let idx = self.nodes.len();
                         self.nodes.push(quote! {
-                            dynspire::ffi::IdlTypeNode { kind: dynspire::ffi::IDL_U32, _pad: [0; 3], size: 0, child0: -1, child1: -1 }
+                            dynspire::ffi::IdlTypeNode { kind: dynspire::ffi::IDL_F32, _pad: [0; 3], size: 0, child0: -1, child1: -1 }
                         });
                         idx
                     }
                     "f64" => {
                         let idx = self.nodes.len();
                         self.nodes.push(quote! {
-                            dynspire::ffi::IdlTypeNode { kind: dynspire::ffi::IDL_U64, _pad: [0; 3], size: 0, child0: -1, child1: -1 }
+                            dynspire::ffi::IdlTypeNode { kind: dynspire::ffi::IDL_F64, _pad: [0; 3], size: 0, child0: -1, child1: -1 }
                         });
                         idx
                     }

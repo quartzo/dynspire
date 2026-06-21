@@ -12,14 +12,14 @@
 use std::ffi::c_void;
 use std::sync::Arc;
 
-use pyo3::exceptions::{PyAttributeError, PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyAttributeError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAnyMethods, PyBool, PyBytes, PyList, PyString, PyTuple};
 
 use dynspire_core::ffi::{
     DynSpireIdl, FreeFn, IdlMethod, VecView, IDL_ARRAY, IDL_BOOL, IDL_ENUM, IDL_OPTION,
     IDL_OUT_VEC, IDL_SLICE, IDL_STRING, IDL_STRUCT, IDL_STR, IDL_TUPLE, IDL_U32, IDL_U64, IDL_U8,
-    IDL_UNIT, IDL_VEC,
+    IDL_F32, IDL_F64, IDL_UNIT, IDL_VEC,
 };
 use dynspire_core::slots::{SlotReader, SlotWriter, MAX_OUT_SLOTS};
 use pyo3::{Py, PyRef};
@@ -367,36 +367,48 @@ struct SpierSchema {
     data: Arc<SchemaData>,
 }
 
-impl SpierSchema {
-    fn type_str(&self, idx: u32) -> String {
-        let types = &self.data.types;
-        if (idx as usize) >= types.len() {
-            return "?".into();
-        }
-        let t = &types[idx as usize];
-        let name = kind_name(t.kind);
-        if t.kind == IDL_STRUCT && t.child0 >= 0 {
-            let s = self
-                .data
-                .struct_names
-                .get(t.child0 as usize)
-                .cloned()
-                .unwrap_or_else(|| "?".into());
-            return format!("Struct<{s}>");
-        }
-        let mut parts = Vec::new();
-        if t.child0 >= 0 {
-            parts.push(self.type_str(t.child0 as u32));
-        }
-        if t.child1 >= 0 {
-            parts.push(self.type_str(t.child1 as u32));
-        }
-        if parts.is_empty() {
-            name.into()
-        } else {
-            format!("{name}<{}>", parts.join(", "))
-        }
+fn schema_type_str(data: &SchemaData, idx: u32) -> String {
+    let types = &data.types;
+    if (idx as usize) >= types.len() {
+        return "?".into();
     }
+    let t = &types[idx as usize];
+    let name = kind_name(t.kind);
+    if t.kind == IDL_STRUCT && t.child0 >= 0 {
+        let s = data
+            .struct_names
+            .get(t.child0 as usize)
+            .cloned()
+            .unwrap_or_else(|| "?".into());
+        return format!("Struct<{s}>");
+    }
+    let mut parts = Vec::new();
+    if t.child0 >= 0 {
+        parts.push(schema_type_str(data, t.child0 as u32));
+    }
+    if t.child1 >= 0 {
+        parts.push(schema_type_str(data, t.child1 as u32));
+    }
+    if parts.is_empty() {
+        name.into()
+    } else {
+        format!("{name}<{}>", parts.join(", "))
+    }
+}
+
+fn struct_name_at(data: &SchemaData, idx: u32) -> String {
+    struct_id_at(data, idx)
+        .and_then(|sid| data.struct_names.get(sid as usize).cloned())
+        .unwrap_or_else(|| "OpaqueValue".into())
+}
+
+/// Returns the struct's stable index (`child0` into `struct_names`) if this
+/// type node is a struct, or `None` otherwise. Used for O(1) type-identity
+/// comparison without string allocation.
+fn struct_id_at(data: &SchemaData, idx: u32) -> Option<i32> {
+    data.types.get(idx as usize)
+        .filter(|t| t.kind == IDL_STRUCT && t.child0 >= 0)
+        .map(|t| t.child0)
 }
 
 #[pymethods]
@@ -427,13 +439,13 @@ impl SpierSchema {
         let params = m
             .params
             .iter()
-            .map(|p| format!("{}: {}", p.name, self.type_str(p.type_idx)))
+            .map(|p| format!("{}: {}", p.name, schema_type_str(&self.data, p.type_idx)))
             .collect::<Vec<_>>()
             .join(", ");
         Ok(format!(
             "{}({params}) -> Result<{}, String>",
             m.name,
-            self.type_str(m.return_type_idx)
+            schema_type_str(&self.data, m.return_type_idx)
         ))
     }
 
@@ -448,6 +460,8 @@ fn kind_name(k: u8) -> &'static str {
         IDL_U8 => "U8",
         IDL_U32 => "U32",
         IDL_U64 => "U64",
+        IDL_F32 => "F32",
+        IDL_F64 => "F64",
         IDL_ARRAY => "Array",
         IDL_SLICE => "Slice",
         IDL_STR => "Str",
@@ -807,6 +821,12 @@ impl OpaqueHandle {
         self.ptr
     }
 
+    /// The struct type name from the spier's IDL schema (e.g. "CompressionReport").
+    #[getter]
+    fn type_name(&self) -> String {
+        struct_name_at(&self.data, self.type_idx)
+    }
+
     fn __int__(&self) -> u64 {
         self.ptr
     }
@@ -816,7 +836,7 @@ impl OpaqueHandle {
     }
 
     fn __repr__(&self) -> String {
-        format!("<OpaqueHandle type_idx={} ptr=0x{:x}>", self.type_idx, self.ptr)
+        format!("<{} 0x{:x}>", struct_name_at(&self.data, self.type_idx), self.ptr)
     }
 }
 
@@ -894,22 +914,20 @@ fn encode_value<'py>(
             w.write_u64(if arg.is_truthy()? { 1 } else { 0 });
             Ok(())
         }
-        // IDL_U32 collapses i16/u16/i32/u32/f32; follow Python's value type.
         IDL_U32 => {
-            if let Ok(f) = arg.extract::<f32>() {
-                w.write_u64(f.to_bits() as u64);
-            } else {
-                w.write_u64(arg.extract::<u32>()? as u64);
-            }
+            w.write_u64(arg.extract::<u32>()? as u64);
             Ok(())
         }
-        // IDL_U64 collapses u64/i64/isize/usize/f64; follow Python's value type.
         IDL_U64 => {
-            if let Ok(f) = arg.extract::<f64>() {
-                w.write_u64(f.to_bits());
-            } else {
-                w.write_u64(arg.extract::<u64>()?);
-            }
+            w.write_u64(arg.extract::<u64>()?);
+            Ok(())
+        }
+        IDL_F32 => {
+            w.write_u64(arg.extract::<f32>()?.to_bits() as u64);
+            Ok(())
+        }
+        IDL_F64 => {
+            w.write_u64(arg.extract::<f64>()?.to_bits());
             Ok(())
         }
         IDL_U8 => {
@@ -952,14 +970,26 @@ fn encode_value<'py>(
             }
         }
         IDL_STRUCT => {
-            // Pass-through of an opaque handle (or a raw int) returned earlier.
-            let ptr = if let Ok(h) = arg.extract::<PyRef<'_, OpaqueHandle>>() {
-                h.ptr
+            // Pass-through of an opaque handle returned earlier.
+            let expected_id = struct_id_at(data, type_idx);
+            if let Ok(h) = arg.extract::<PyRef<'_, OpaqueHandle>>() {
+                let actual_id = struct_id_at(data, h.type_idx);
+                if actual_id != expected_id {
+                    return Err(PyTypeError::new_err(format!(
+                        "expected {}, got {}",
+                        struct_name_at(data, type_idx),
+                        struct_name_at(data, h.type_idx),
+                    )));
+                }
+                w.write_u64(h.ptr);
+                Ok(())
             } else {
-                arg.extract::<u64>()?
-            };
-            w.write_u64(ptr);
-            Ok(())
+                Err(PyTypeError::new_err(format!(
+                    "expected {} (OpaqueHandle), got {}",
+                    struct_name_at(data, type_idx),
+                    arg.get_type().name()?,
+                )))
+            }
         }
         IDL_ENUM => {
             let ev = arg.extract::<PyRef<'_, SpierEnumValue>>()?;
@@ -1035,6 +1065,8 @@ fn decode_value<'py>(
             .into_pyobject(py)?
             .into_any()),
         IDL_U32 | IDL_U64 => Ok(r.read_u64().into_pyobject(py)?.into_any()),
+        IDL_F32 => Ok(f32::from_bits(r.read_u64() as u32).into_pyobject(py)?.into_any()),
+        IDL_F64 => Ok(f64::from_bits(r.read_u64()).into_pyobject(py)?.into_any()),
         IDL_STRING => {
             let s = reconstruct_owned_string(r);
             Ok(PyString::new(py, &s).into_any())
