@@ -269,9 +269,13 @@ impl SpierLib {
 
     /// Creates a client handle, optionally passing a `dict[str, str]` config.
     #[pyo3(signature = (config=None))]
-    fn create_handle(&self, config: Option<&Bound<'_, PyAny>>) -> PyResult<SpierHandle> {
+    fn create_handle(&self, py: Python<'_>, config: Option<&Bound<'_, PyAny>>) -> PyResult<SpierHandle> {
         let buf = serialize_config(config)?;
-        let handle = unsafe { (self.create)(buf.as_ptr(), buf.len()) };
+        let create_fn = self.create;
+        let buf_ptr = buf.as_ptr() as usize;
+        let buf_len = buf.len();
+        let handle = py.detach(|| unsafe { (create_fn)(buf_ptr as *const u8, buf_len) as usize });
+        let handle = handle as *mut c_void;
         if handle.is_null() {
             return Err(PyRuntimeError::new_err("spier create returned null"));
         }
