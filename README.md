@@ -36,7 +36,7 @@ Or from Python — with full schema reflection, no codegen:
 
 ```python
 with load_spier("rle_spier", lib_dir="target/debug").create_handle() as h:
-    compressed = h.call("compress", input_data)
+    compressed = h.compress(input_data)
 ```
 
 ## Features
@@ -45,7 +45,7 @@ with load_spier("rle_spier", lib_dir="target/debug").create_handle() as h:
 - **Zero-copy FFI** — borrows (`&[u8]`, `&str`) and mutable out-params (`&mut Vec<u8>`) pass through raw pointers. No serialization overhead. `Vec<T: Clone>` input works for any element type (Rust→Rust).
 - **Type-safe dispatch** — Rust hosts use generated Op enums. No magic numbers.
 - **IDL hash verification** — incompatible plugins are rejected at load time.
-- **Python without codegen** — `ctypes` reads the IDL schema from the `.so` directly. No stub generation, no `bindgen`, no C headers.
+- **Python without codegen** — a PyO3 extension reads the IDL schema from the `.so` directly. No stub generation, no `bindgen`, no C headers.
 - **Any return type** — `Result<T, String>` where `T` can be `()`, `Vec<u8>`, `(u64, u64)`, `Option<String>`, any `#[slot_enum]` type, any `#[slot_struct]` type, or any composed combination.
 
 ## The Boundary as Discipline
@@ -83,8 +83,8 @@ demo/
   rle-idl/       IDL trait definition
   rle-spier/     cdylib implementation (loaded at runtime)
   rle-host/      Rust host binary
-  rle_client.py  Python host (ctypes, schema reflection)
-  rle_client2.py Bug fix showcase (call_with_outs, negative index, scalar Option)
+  rle_client.py  Python host (PyO3, schema reflection)
+  rle_client2.py Showcase (out-vec auto-tuple, negative index, scalar Option)
 ```
 
 ```bash
@@ -95,7 +95,7 @@ cargo build
 cargo run -p rle-host
 
 # Run Python host
-pip install -e python/
+pip install -e dynspire-py/
 python3 demo/rle_client.py
 python3 demo/rle_client2.py
 ```
@@ -124,7 +124,7 @@ stats()
 dynspire/          Core: arena FFI, slot system, tower client
 dynspire-macro/    Proc macros: #[modulo_interface], #[spier_dispatch], #[spier_storage], #[slot_enum], #[slot_struct]
 dynspire-libs/     Library discovery helpers
-python/            ctypes adapter (schema-driven, zero codegen)
+dynspire-py/       Python bindings (PyO3, schema-driven, zero codegen)
 demo/              RLE compression showcase
 ```
 
@@ -152,21 +152,30 @@ For the deep dive, see [docs/architecture.md](docs/architecture.md).
 
 ## Python Bindings
 
-The Python adapter loads any DynSpire `.so` and discovers its full interface at runtime:
+The Python adapter is a compiled PyO3 extension that loads any DynSpire `.so`
+and discovers its full interface at runtime:
 
 ```python
 from dynspire import load_spier
 
 lib = load_spier("rle_spier", lib_dir="target/debug")
+schema = lib.schema()
 
 # Schema reflection — methods, types, params, all from the .so
-for m in lib.schema().methods:
-    print(lib.schema().method_sig(m))
+for m in schema.methods:
+    print(schema.method_sig(m))
 
-# Call with native Python types
-with lib.create_handle() as handle:
-    compressed = handle.call("compress", b"AAAABBBBCCCC")
+# Call via attribute access with native Python types
+with lib.create_handle() as h:
+    compressed = h.compress(b"AAAABBBBCCCC")
+    decompressed = h.decompress(compressed)
+
+    # Out-vec methods (&mut Vec<u8>) auto-return (ret_val, list[bytes])
+    ok, outs = h.compress_into_checked(b"AAAABBBBCCCC")
 ```
+
+`h.compress(data)` is sugar for `h.call("compress", data)`. The bound method
+holds a reference to the handle, so `f = h.compress; del h; f(data)` is safe.
 
 Finding the `.so`:
 

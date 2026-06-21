@@ -1,6 +1,6 @@
 # DynSpire Architecture
 
-This document covers the internals of the DynSpire plugin framework: the slot system, FFI conventions, IDL schema export, proc macros, and the Python ctypes adapter.
+This document covers the internals of the DynSpire plugin framework: the slot system, FFI conventions, IDL schema export, proc macros, and the Python PyO3 adapter.
 
 ## Table of Contents
 
@@ -9,7 +9,7 @@ This document covers the internals of the DynSpire plugin framework: the slot sy
 - [IDL Schema Export](#idl-schema-export)
 - [Proc Macros](#proc-macros)
 - [Tower Client](#tower-client)
-- [Python ctypes Adapter](#python-ctypes-adapter)
+- [Python PyO3 Adapter](#python-pyo3-adapter)
 - [Path Resolution](#path-resolution)
 
 ---
@@ -40,7 +40,7 @@ DynSpire is a plugin architecture with three roles:
 │    → dispatch via FFI                       │
 │    → SlotReader decodes response u64[]      │
 └──────────────────┬──────────────────────────┘
-                   │ libloading / ctypes
+                   │ libloading / PyO3
                    ▼
 ┌─────────────────────────────────────────────┐
 │  Spier .so (cdylib)                         │
@@ -242,9 +242,9 @@ The `SpierOp` trait ensures `call()` only accepts the generated Op enum — raw 
 
 ---
 
-## Python ctypes Adapter
+## Python PyO3 Adapter
 
-The Python adapter (package `dynspire` under `python/src/dynspire/`) provides the same capabilities as the Rust tower client, entirely through `ctypes`:
+The Python adapter (crate `dynspire-py`, package `dynspire`) is a compiled PyO3 extension that provides the same capabilities as the Rust tower client. Decode runs in Rust — owned `Vec`/`String` reconstruction uses `Box::from_raw` natively, so there is no stride arithmetic and no per-call `dynspire_free` for data returns.
 
 ### Schema Reflection
 
@@ -257,55 +257,42 @@ for m in schema.methods:
     # compress(data: Slice<U8>) -> Result<Vec<U8>, String>
 ```
 
-The adapter reads the `DynSpireIdl` C struct directly via `ctypes.from_address`, walking the type table and method table to build Pythonic dataclasses (`TypeInfo`, `MethodInfo`, `EnumSchema`).
+The engine reads the `DynSpireIdl` C struct via `libloading`, walking the type table and method table to build an in-memory `SchemaData` (method descriptors, type nodes, enum descriptors).
 
 ### Calling Convention
 
 ```python
-with lib.create_handle() as handle:
-    # Positional args (recommended)
-    compressed = handle.call("compress", input_data)
+with lib.create_handle() as h:
+    # Attribute access (recommended)
+    compressed = h.compress(input_data)
 
-    # Named args (explicit)
-    compressed = handle.call("compress", {"data": input_data})
+    # Escape hatch for dynamic method names
+    compressed = h.call("compress", input_data)
 
-    # Out-vec methods require call_with_outs
-    ret, outs = handle.call_with_outs("compress_into", input_data)
-    # ret = return value (None for Unit), outs = list[bytes] per &mut Vec param
+    # Out-vec methods (&mut Vec<u8>) auto-return (ret_val, list[bytes])
+    ok, outs = h.compress_into_checked(input_data)
 ```
 
-`call()` raises `ValueError` if the method has `&mut Vec<u8>` (OutVec) parameters — those require `call_with_outs()`, which returns `(ret_val, list[bytes])`. Positional args are bound by parameter order. The adapter handles:
+Attribute access (`h.compress(data)`) returns a `BoundMethod` that dispatches through the same unified path as `h.call("compress", data)`. The engine auto-detects out-vec parameters from the schema — no separate `call_with_outs` is needed. When a method has `&mut Vec<u8>` params, the call returns `(ret_val, list[bytes])`; otherwise it returns the decoded value directly.
 
-- **Borrows** (`&[u8]`, `&str`): allocates ctypes byte arrays, keeps them alive during the call
-- **Owned returns** (`Vec<u8>`, `String`, `#[slot_struct]`): reads `(ptr, len)` or opaque handle from slots, wraps in `FFIResource` for lifecycle management (see below)
-- **OutVec** (`&mut Vec<u8>`): creates a Rust `Vec` via `dynspire_vec_create()`, passes pointer, reads back via `dynspire_vec_view()`, frees via `dynspire_vec_free()`
-- **Result<T, String>**: reads tag slot, decodes Ok value or raises `RuntimeError` with the error string
+The engine handles:
+
+- **Borrows** (`&[u8]`, `&str`): borrows Python memory directly (GIL is held during the call, so the borrow is sound)
+- **Owned returns** (`Vec<u8>`, `String`, tuples, enums): reconstructed in Rust via `Box::from_raw` and converted to Python objects; dropped normally
+- **`#[slot_struct]` returns**: wrapped in `OpaqueHandle` (holds the boxed pointer, frees via `dynspire_free` on GC; can be passed back as an input)
+- **OutVec** (`&mut Vec<u8>`): creates a Rust `Vec` via `dynspire_vec_create()`, passes the handle, snapshots contents via `dynspire_vec_view()`, frees via `dynspire_vec_free()`
+- **`#[slot_enum]`**: decoded to `SpierEnumValue` (variant name + payload tuple); can be passed back as an input
+- **Result<T, String>**: reads the tag slot, decodes the Ok value or raises `RuntimeError` with the error string
 
 ### Lifecycle
 
 ```python
-with lib.create_handle() as handle:
-    handle.call("compress", data)
+with lib.create_handle() as h:
+    h.compress(data)
     # destroy() called automatically on __exit__
 ```
 
-`SpierHandle.__del__` is a safety net — calls `destroy()` if the `with` block wasn't used. `destroy()` is idempotent (checks for null handle).
-
-### Return Value Lifecycle (`FFIResource`)
-
-Non-scalar return values from the spier carry heap allocations that must be released. All non-scalar returns are wrapped in `FFIResource`, which provides **lazy access** to the Rust heap memory — data is never copied until the user explicitly accesses it.
-
-**Lazy access by type:**
-
-- **`String` / `Vec<u8>`**: `len()` reads the length from slot metadata (no copy). Indexing and iteration read individual bytes directly from the Rust pointer. `str()` / `bytes()` copy the full buffer on demand.
-- **`#[slot_struct]`**: the opaque handle is exposed via `int()` directly from the slot (no decode). Can be passed to subsequent calls — `encode_slot` unwraps automatically.
-- **Other types** (`Vec<String>`, tuples, enums): decoded on first `.value` access and cached.
-
-**Mechanism:** Each spier exports a single unified `dynspire_free(type_index, slots, count)` function. It reconstructs the value via `SlotReceive::from_slots` and drops it — the Rust `Drop` cascade frees all nested heap allocations. Called on `close()` or garbage collection (`__del__`).
-
-**Error path:** When a spier returns `Err(String)`, the adapter calls `dynspire_free` to release the error string's heap allocation before raising `RuntimeError`.
-
-**Transparency:** `FFIResource` proxies dunder methods (`__len__`, `__iter__`, `__eq__`, `__str__`, `__format__`, `__getattr__`, etc.) with lazy semantics. Scalar returns (`u32`, `bool`, etc.) and scalar `Option<T>` (e.g. `Option<u64>`) are returned as native Python values with no wrapping; heap-backed options (`Option<String>`) remain wrapped in `FFIResource`.
+`SpierHandle` implements `Drop` — calls `dynspire_destroy()` if the `with` block wasn't used. The `.so` stays mapped (`Arc<Library>`) until the last handle, `OpaqueHandle`, or `BoundMethod` referencing it is dropped, so `f = h.compress; del h; f(data)` is safe.
 
 ---
 
@@ -317,7 +304,7 @@ Both Rust and Python follow the same three-tier resolution:
 |----------|------|--------|
 | 1 | Explicit path in `DynSpireLib::load(path)` | `lib_dir=` parameter |
 | 2 | `DYNSPIRE_LIB_DIR` env var → constructs full path | `DYNSPIRE_LIB_DIR` env var → constructs full path |
-| 3 | Bare filename → `dlopen` resolves via `LD_LIBRARY_PATH` | Bare filename → `ctypes.CDLL` resolves via `dlopen` |
+| 3 | Bare filename → `dlopen` resolves via `LD_LIBRARY_PATH` | Bare filename → `dlopen` resolves via `LD_LIBRARY_PATH` |
 
 Levels 1 and 2 construct a full filesystem path before calling `dlopen` — no side effects on the system's dynamic linker. Level 3 delegates entirely to `dlopen`, which searches `LD_LIBRARY_PATH`, `/usr/lib`, `/usr/local/lib`, etc.
 

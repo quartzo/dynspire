@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
-"""DynSpire RLE demo 2 — showcases the three upstream bug fixes.
+"""DynSpire RLE demo 2 — showcases edge-case return types under the PyO3 engine.
 
-B1: _call_out_vec returns (out_data, ret_val) for non-Unit returns.
-    compress_into_checked -> Result<bool, String> exercises the OutVec
-    path with a bool return, producing a (bytes, bool) tuple.
+B1: Out-vec with a non-Unit return type.
+    compress_into_checked -> Result<bool, String> exercises the &mut Vec<u8>
+    path with a bool return. The unified call returns (ret_val, list[bytes])
+    automatically — no separate call_with_outs needed.
 
-B2: FFIResource.__getitem__ normalizes negative indices.
-    split_runs -> Result<Vec<Vec<u8>>, String> returns an FFIResource
-    (vec-of-vec). We use [-1] to access the last element safely.
+B2: Vec<Vec<u8>> decoded to a native Python list.
+    split_runs -> Result<Vec<Vec<u8>>, String> returns a plain list of bytes,
+    so negative indexing works out of the box.
 
-B3: Eager decode for scalar Option<T>.
-    first_byte -> Result<Option<u8>, String> returns a plain int or None
-    instead of an FFIResource, so isinstance / is None checks work.
+B3: Scalar Option<T> decoded to a native Python value.
+    first_byte -> Result<Option<u8>, String> returns a plain int or None,
+    so isinstance / is None checks work directly.
 """
 
-from dynspire import FFIResource, load_spier
+from dynspire import load_spier
 
 
 def hex_fmt(data: bytes) -> str:
@@ -23,19 +24,18 @@ def hex_fmt(data: bytes) -> str:
 
 def main():
     lib = load_spier("rle_spier", lib_dir="target/debug")
-    schema = lib.schema()
 
-    print("=== DynSpire RLE Demo 2 — Bug Fix Showcase ===")
+    print("=== DynSpire RLE Demo 2 — Edge-Case Showcase ===")
     print()
 
     input_data = b"AAAABBBCCCCDDDDDEEEEFFFFFFGGG"
 
-    with lib.create_handle() as handle:
-        compressed = handle.call("compress", input_data)
+    with lib.create_handle() as h:
+        compressed = h.compress(input_data)
 
-        # --- B1: call_with_outs returns (ret_val, list[bytes]) ----------
+        # --- B1: out-vec auto-tuple -------------------------------------
         print("[B1] compress_into_checked(&mut Vec<u8>) -> Result<bool, String>")
-        ok, outs = handle.call_with_outs("compress_into_checked", input_data)
+        ok, outs = h.compress_into_checked(input_data)
         out_data = outs[0]
         matches = out_data == compressed
         print(f"  out_data : [{hex_fmt(out_data)}] ({len(out_data)} bytes)")
@@ -43,26 +43,25 @@ def main():
         print(f"  matches compress(): {matches}")
         print()
 
-        # --- B2: Negative index on vec-of-vec FFIResource ----------------
+        # --- B2: Vec<Vec<u8>> -> native list ----------------------------
         print("[B2] split_runs() -> Result<Vec<Vec<u8>>, String>")
-        runs = handle.call("split_runs", input_data)
-        first = runs[0]
-        last = runs[-1]
-        print(f"  runs[0]  : {bytes(first)!r}")
-        print(f"  runs[-1] : {bytes(last)!r}  (negative index, no segfault)")
-        print(f"  is FFIResource: {isinstance(runs, FFIResource)}")
+        runs = h.split_runs(input_data)
+        first = bytes(runs[0])
+        last = bytes(runs[-1])
+        print(f"  runs[0]  : {first!r}")
+        print(f"  runs[-1] : {last!r}  (negative index, native list)")
+        print(f"  type     : {type(runs).__name__}")
         print()
 
-        # --- B3: Scalar Option<T> eager-decoded ---------------------------
+        # --- B3: Scalar Option<T> -> native int | None ------------------
         print("[B3] first_byte() -> Result<Option<u8>, String>")
-        some_val = handle.call("first_byte", input_data)
-        none_val = handle.call("first_byte", b"")
+        some_val = h.first_byte(input_data)
+        none_val = h.first_byte(b"")
         print(f"  first_byte(input) : {some_val}  (type={type(some_val).__name__})")
         print(f"  first_byte(b'')   : {none_val}  (is None: {none_val is None})")
-        print(f"  is FFIResource: {isinstance(some_val, FFIResource)}")
 
     print()
-    print("Done. All three fixes working correctly.")
+    print("Done. All edge cases handled natively by the PyO3 engine.")
 
 
 if __name__ == "__main__":

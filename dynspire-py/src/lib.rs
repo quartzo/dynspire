@@ -12,7 +12,7 @@
 use std::ffi::c_void;
 use std::sync::Arc;
 
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyAttributeError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAnyMethods, PyBool, PyBytes, PyList, PyString, PyTuple};
 
@@ -299,7 +299,7 @@ fn serialize_config(config: Option<&Bound<'_, PyAny>>) -> PyResult<Vec<u8>> {
 
 /// Loads a spier `.so` by name and reflects its schema.
 ///
-/// Discovery follows the same priority as the ctypes adapter:
+/// Discovery follows the same priority for all hosts:
 /// `lib_dir=` parameter → `DYNSPIRE_LIB_DIR` → bare `lib{name}.so`.
 #[pyfunction]
 #[pyo3(signature = (name, lib_dir=None))]
@@ -336,7 +336,7 @@ fn load_spier(name: &str, lib_dir: Option<&str>) -> PyResult<SpierLib> {
     let create: FnCreate = load_sym(&lib, b"dynspire_create\0")?;
     let destroy: FnDestroy = load_sym(&lib, b"dynspire_destroy\0")?;
 
-    // Out-vec helpers (used by call_with_outs, resolved from the spier .so).
+    // Out-vec helpers (used by the unified invoke path, resolved from the .so).
     let vec_create: FnVecCreate = load_sym(&lib, b"dynspire_vec_create\0")?;
     let vec_free: FnVecFree = load_sym(&lib, b"dynspire_vec_free\0")?;
     let vec_view: FnVecView = load_sym(&lib, b"dynspire_vec_view\0")?;
@@ -511,34 +511,44 @@ impl SpierHandle {
             self.handle = std::ptr::null_mut();
         }
     }
-}
 
-#[pymethods]
-impl SpierHandle {
-    /// Calls a spier method by name with positional args, returning the
-    /// decoded result. The return type is inferred from the schema.
-    #[pyo3(signature = (method_name, *args))]
-    fn call<'py>(
+    /// True if the method has any `&mut Vec<u8>` (out-vec) parameters.
+    fn has_outvec(&self, method: &MethodInfo) -> bool {
+        method
+            .params
+            .iter()
+            .any(|p| self.data.types[p.type_idx as usize].kind == IDL_OUT_VEC)
+    }
+
+    /// Unified entry point: routes to the out-vec or plain path automatically.
+    fn invoke<'py>(
         &self,
         py: Python<'py>,
         method_name: &str,
         args: &Bound<'py, PyTuple>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let (idx, method) = self.find_method(method_name)?;
+        if self.has_outvec(method) {
+            self.invoke_outvec(py, idx, method, args)
+        } else {
+            self.invoke_plain(py, idx, method, args)
+        }
+    }
+
+    fn invoke_plain<'py>(
+        &self,
+        py: Python<'py>,
+        idx: usize,
+        method: &MethodInfo,
+        args: &Bound<'py, PyTuple>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         if method.params.len() != args.len() {
             return Err(PyValueError::new_err(format!(
                 "{} expects {} args, got {}",
-                method_name,
+                method.name,
                 method.params.len(),
                 args.len()
             )));
-        }
-        for p in &method.params {
-            if self.data.types[p.type_idx as usize].kind == IDL_OUT_VEC {
-                return Err(PyValueError::new_err(format!(
-                    "{method_name} has out-vec params; use call_with_outs()"
-                )));
-            }
         }
 
         // Encode. Input borrows alias the Python objects held by `args`, which
@@ -578,18 +588,13 @@ impl SpierHandle {
         decode_value(&mut r, method.return_type_idx, &self.data, py)
     }
 
-    /// Calls a method with `&mut Vec<u8>` (out-vec) parameters. The caller
-    /// supplies only the non-out-vec args; the spier fills each out-vec, which
-    /// is returned as `bytes`. Returns `(ret_val, list[bytes])`.
-    #[pyo3(signature = (method_name, *args))]
-    fn call_with_outs<'py>(
+    fn invoke_outvec<'py>(
         &self,
         py: Python<'py>,
-        method_name: &str,
+        idx: usize,
+        method: &MethodInfo,
         args: &Bound<'py, PyTuple>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let (idx, method) = self.find_method(method_name)?;
-
         // Out-vec params are skipped from the caller's args; they're allocated here.
         let input_count = method
             .params
@@ -599,7 +604,9 @@ impl SpierHandle {
         if args.len() != input_count {
             return Err(PyValueError::new_err(format!(
                 "{} expects {} input arg(s) (excluding out-vecs), got {}",
-                method_name, input_count, args.len()
+                method.name,
+                input_count,
+                args.len()
             )));
         }
 
@@ -661,7 +668,7 @@ impl SpierHandle {
             })
             .collect();
 
-        // Decode the return value (Result<T, String> framing, same as `call`).
+        // Decode the return value (Result<T, String> framing, same as plain).
         let mut r = SlotReader::new(&out);
         let tag = r.read_u64();
         let ret_val = if tag == 1 {
@@ -673,6 +680,46 @@ impl SpierHandle {
 
         let list = PyList::new(py, out_bytes.iter().map(|b| PyBytes::new(py, b)))?;
         PyTuple::new(py, [ret_val, list.into_any()]).map(|t| t.into_any())
+    }
+}
+
+#[pymethods]
+impl SpierHandle {
+    /// Escape-hatch dispatch by method name. Prefer attribute access
+    /// (`h.compress(data)`) — this exists for dynamic method names. Methods
+    /// with out-vec (`&mut Vec<u8>`) params automatically return
+    /// `(ret_val, list[bytes])`.
+    #[pyo3(signature = (method_name, *args))]
+    fn call<'py>(
+        &self,
+        py: Python<'py>,
+        method_name: &str,
+        args: &Bound<'py, PyTuple>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.invoke(py, method_name, args)
+    }
+
+    /// Attribute dispatch: `h.<method_name>` returns a bound callable.
+    fn __getattr__<'py>(
+        slf: &Bound<'py, Self>,
+        py: Python<'py>,
+        name: &str,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let this = slf.borrow();
+        let exists = this.data.methods.iter().any(|m| m.name == name);
+        drop(this);
+        if exists {
+            let handle = slf.clone().unbind();
+            let bm = BoundMethod {
+                handle,
+                method: name.to_string(),
+            };
+            Py::new(py, bm).map(|o| o.into_bound(py).into_any())
+        } else {
+            Err(PyAttributeError::new_err(format!(
+                "'SpierHandle' object has no attribute {name:?}"
+            )))
+        }
     }
 
     fn destroy(&mut self) {
@@ -701,6 +748,35 @@ impl SpierHandle {
 impl Drop for SpierHandle {
     fn drop(&mut self) {
         self.free_handle();
+    }
+}
+
+// === BoundMethod: callable wrapper returned by SpierHandle.__getattr__ ===
+
+/// A spier method bound to a specific handle. Created by attribute access on a
+/// [`SpierHandle`] (e.g. `h.compress`). Calling it dispatches through the same
+/// unified invoke path as attribute access (e.g. `h.compress(data)`), so out-vec methods automatically
+/// return `(ret_val, list[bytes])`.
+#[pyclass(name = "BoundMethod", module = "dynspire")]
+struct BoundMethod {
+    handle: Py<SpierHandle>,
+    method: String,
+}
+
+#[pymethods]
+impl BoundMethod {
+    #[pyo3(signature = (*args))]
+    fn __call__<'py>(
+        &self,
+        py: Python<'py>,
+        args: &Bound<'py, PyTuple>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let h = self.handle.borrow(py);
+        h.invoke(py, &self.method, args)
+    }
+
+    fn __repr__(&self) -> String {
+        format!("<bound spier method {:?}>", self.method)
     }
 }
 
@@ -764,7 +840,7 @@ impl Drop for OpaqueHandle {
 
 /// A `#[slot_enum]` value returned by a spier, or built to pass one back as an
 /// input. `variant` is the variant name; `fields` is the tuple of payload slots
-/// (empty for unit variants). Mirrors the ctypes `EnumValue`.
+/// (empty for unit variants).
 #[pyclass(name = "SpierEnumValue")]
 struct SpierEnumValue {
     variant: String,
@@ -980,7 +1056,7 @@ fn decode_value<'py>(
                 let list = PyList::new(py, v.iter().map(|s| PyString::new(py, s)))?;
                 Ok(list.into_any())
             } else {
-                // TODO: Vec<[u8; N]>, Vec<(Vec<u8>, Vec<u8>)> — mirror ctypes.
+                // TODO: Vec<[u8; N]>, Vec<(Vec<u8>, Vec<u8>)>.
                 Err(PyValueError::new_err(format!(
                     "unsupported Vec element kind {}",
                     child.kind
@@ -1109,6 +1185,7 @@ fn dynspire(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<SpierLib>()?;
     m.add_class::<SpierSchema>()?;
     m.add_class::<SpierHandle>()?;
+    m.add_class::<BoundMethod>()?;
     m.add_class::<OpaqueHandle>()?;
     m.add_class::<SpierEnumValue>()?;
     Ok(())
