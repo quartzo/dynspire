@@ -205,6 +205,7 @@ impl_scalar!(i32, |v: &i32| *v as u64, |v: u64| v as i32);
 impl_scalar!(i64, |v: &i64| *v as u64, |v: u64| v as i64);
 impl_scalar!(bool, |v: &bool| *v as u64, |v: u64| v != 0);
 impl_scalar!(f64, |v: &f64| v.to_bits(), |v: u64| f64::from_bits(v));
+impl_scalar!(f32, |v: &f32| v.to_bits() as u64, |v: u64| f32::from_bits(v as u32));
 
 // [u8; 16] — 2 slots
 impl SlotEncode for [u8; 16] {
