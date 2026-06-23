@@ -195,6 +195,7 @@ pub fn modulo_interface(attr: TokenStream, item: TokenStream) -> TokenStream {
         .collect();
     let struct_name_lens: Vec<usize> = struct_type_names.iter().map(|n| n.len()).collect();
 
+
     let expanded = quote! {
         #[allow(dead_code)]
         #item_trait
@@ -298,6 +299,7 @@ pub fn modulo_interface(attr: TokenStream, item: TokenStream) -> TokenStream {
                 _ => {}
             }
         }
+
 
     };
     TokenStream::from(expanded)

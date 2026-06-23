@@ -217,24 +217,22 @@ impl DynSpireClient {
         Ok(())
     }
 
-    /// Calls a spier method, returning the decoded result.
+    /// Internal dispatch primitive — encodes args to slots and calls the spier.
     ///
-    /// The return type `R` must be annotated — Rust cannot infer it from
-    /// the slot buffer. The `op` selects the method; `args` is encoded
-    /// via [`SlotEncode`](crate::slots::SlotEncode).
-    ///
-    /// For single-argument methods, pass the arg directly. For multi-argument
-    /// methods, pass a tuple.
+    /// **Do not call this directly from tower/host code.**
+    /// Implement the IDL trait explicitly on your client wrapper instead, so
+    /// that the compiler and editors verify method signatures against the IDL:
     ///
     /// ```ignore
-    /// // Single arg — return type annotation required
+    /// // WRONG — bypasses the IDL, no type checking
     /// let out: Vec<u8> = client.call(MyOp::Compress, (&data[..]))?;
     ///
-    /// // Multi-arg — tuple
-    /// let n: () = client.call::<(), _, _>(MyOp::CompressInto, (&data[..], &mut buf))?;
-    ///
-    /// // No args — pass ()
-    /// let info: (u64, u64) = client.call(MyOp::Stats, ())?;
+    /// // RIGHT — implement the trait, editors verify signatures
+    /// impl MyEngine for DynSpireMy {
+    ///     fn compress(&self, data: &[u8]) -> Result<Vec<u8>, String> {
+    ///         self.client.call(MyOp::Compress, (data,))
+    ///     }
+    /// }
     /// ```
     pub fn call<R: crate::slots::SlotReceive, A: crate::slots::SlotEncode, Op: SpierOp>(
         &self,
