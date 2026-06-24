@@ -20,15 +20,15 @@ DynSpire is a plugin architecture with three roles:
 
 > **Read this first — DynSpire is an in-process plugin ABI, not an RPC framework.** A spier is a `cdylib` loaded into the host via `dlopen`; host and spier run in **the same process and the same address space**. Crossing the boundary means a **C ABI call with a flat `u64[]` slot convention** — there is no network, no IPC, no wire format. Consequences that follow from this and *do not* hold under an RPC mental model:
 >
-> - **Opaque pointers are valid across the boundary.** `#[slot_struct]` passes `Box::into_raw` → 1 slot (the raw address); the receiver does `Box::from_raw` or dereferences directly. The struct is **not serialized** — it stays live, with whatever state machine, lock, or inner reference it holds. Both sides alias the same memory.
+> - **Opaque pointers are valid across the boundary.** DSL-declared structs pass `Box::into_raw` → 1 slot (the raw address); the receiver does `Box::from_raw` or dereferences directly. The struct is **not serialized** — it stays live, with whatever state machine, lock, or inner reference it holds. Both sides alias the same memory.
 > - **"IDL" / "schema" = in-process ABI contract + runtime type table**, exposed via `dynspire_idl_schema()`. Not a serialization descriptor, not a protobuf schema. The IDL hash gates **binary/link compatibility** between two `.so`s compiled against the same trait — not message-level versioning.
 > - **The boundary is compile/link, not process.** Borrows (`&[u8]`, `&str`), out-params (`&mut Vec<u8>`), and ownership-transfer (`Vec<T>` via `Box::into_raw`) are all sound precisely because caller and callee share one heap. None of this is possible across a process boundary; all of it is routine here.
 
 | Role | Who | What |
 |------|-----|------|
-| **IDL** | Shared crate | Defines a trait interface. The `#[modulo_interface]` macro generates an Op enum, IDL hash, type table, and method descriptors. |
-| **Spier** | `cdylib` crate | Implements the IDL trait. The `#[spier_dispatch]` and `#[spier_storage]` macros generate C-ABI entry points (`dynspire_create`, `dynspire_dispatch_{method}`, `dynspire_destroy`, etc.). |
-| **Host** | Binary or script | Loads the spier `.so` via `dlopen`, verifies the IDL hash, and dispatches method calls through slots. |
+| **IDL** | Shared crate | A `.dspi` file is the single source of truth. `build.rs` invokes `dynspire_codegen::build()` to generate the trait, types, Op enum, IDL hash, type table, schema, tower client wrapper, and spier dispatch macro. |
+| **Spier** | `cdylib` crate | Implements the generated trait. Invokes `impl_{name}_spier!($state, init, "name")` — a generated `macro_rules!` that produces all C-ABI entry points (`dynspire_create`, `dynspire_dispatch_{method}`, `dynspire_destroy`, etc.). No proc macros. |
+| **Host** | Binary or script | Uses the generated `DynSpire{Name}` client wrapper directly. One import, no boilerplate. |
 
 ```
 ┌─────────────────────────────────────────────┐
@@ -107,8 +107,8 @@ pub trait SlotReceive: Sized {
 | `Option<T>` | 1 + T | Tag (0=None, 1=Some) followed by T's slots. |
 | `(A, B)` | A + B | Concatenation of A's and B's slots. |
 | `Result<T, E>` | 1 + T or E | Tag (0=Ok, 1=Err) followed by the variant's slots. |
-| Enums (`#[slot_enum]`) | 1 + fields | Discriminant + each field's slots. |
-| Structs (`#[slot_struct]`) | 1 | Opaque boxed pointer (`Box::into_raw` / `Box::from_raw`). Rust dereferences directly; Python receives an opaque handle. |
+| Enums (DSL `enum`) | 1 + fields | Discriminant + each field's slots. |
+| Structs (DSL `struct` / `opaque struct`) | 1 | Opaque boxed pointer (`Box::into_raw` / `Box::from_raw`). Rust dereferences directly; Python receives an opaque handle. |
 
 ### Key Design Points
 
@@ -149,86 +149,153 @@ The type table uses a node-based representation:
 ```rust
 #[repr(C)]
 pub struct IdlTypeNode {
-    pub kind: u8,      // IDL_U8, IDL_SLICE, IDL_VEC, IDL_TUPLE, ...
-    pub size: u32,     // Array length (for IDL_ARRAY)
-    pub child0: i32,   // Index into type_table, or -1
-    pub child1: i32,   // Index into type_table, or -1
+    pub kind: u8,           // IDL_U8, IDL_SLICE, IDL_VEC, IDL_TUPLE, ...
+    pub child_count: u8,    // Number of valid children (0-8)
+    pub size: u32,          // Array length (for IDL_ARRAY)
+    pub children: [i32; 8], // Indices into type_table, or -1
 }
 ```
 
-Composite types are built recursively: `Vec<u8>` is `IDL_VEC` with `child0` pointing to `IDL_U8`. `Option<(String, u64)>` is `IDL_OPTION` with `child0` pointing to `IDL_TUPLE(String, U64)`.
+Composite types are built recursively: `Vec<u8>` is `IDL_VEC` with `children[0]` pointing to `IDL_U8`. `Option<(String, u64)>` is `IDL_OPTION` with `children[0]` pointing to `IDL_TUPLE(String, U64)`. Tuples of up to 8 elements are supported (matching the 8-slot FFI limit).
 
 ---
 
-## Proc Macros
+## DSL Codegen
 
-### `#[modulo_interface]`
+The `.dspi` file is the contract. `dynspire-codegen` parses it and generates all Rust code via `build.rs`. No proc macros, no `syn`-based type parsing — the grammar is closed and each production maps 1:1 to a slot encoding strategy.
 
-Applied to a trait. Generates:
+### `.dspi` grammar
 
-| Output | Description |
-|--------|-------------|
-| `{PREFIX}_IDL_HASH: u64` | FNV-1a hash of the canonical method signatures |
-| `pub static IDL: IdlDescriptor` | Bundle of hash + method names for `connect()` |
-| `{Prefix}Op` enum | `#[repr(u8)]` enum with one variant per method |
-| `impl SpierOp for {Prefix}Op` | Enables type-safe `call(Op::Method, ...)` |
-| `pub mod tower` | `METHODS`, `IDL_TYPE_TABLE`, `IDL_METHODS`, `IDL_SCHEMA` |
-| `idl_schema()` | Returns `&'static DynSpireIdl` |
+```
+interface Rle {
+  struct CompressionReport {
+    original_size: u64,
+    ratio: f64,
+  }
 
-The hash is computed from the canonical signature string: `TraitName{method(params)->ret,...}`. This ensures that any change to method names, parameter types, or return types produces a different hash, preventing version mismatches.
+  enum Tone {
+    Quiet,
+    Loud(u8),
+  }
 
-### `#[spier_storage]`
+  opaque struct ExternalHandle;
 
-Applied to an `init` function. Generates:
-
-- `dynspire_create(data_ptr, data_len) -> *mut c_void` — deserializes config (URL-encoded kvmap), calls the init function, returns `Box::into_raw(Box::new(state))`.
-- `dynspire_destroy(handle)` — `drop(Box::from_raw(handle))`.
-
-### `#[spier_dispatch(name = "...", idl = ...)]`
-
-Applied to `impl Trait for State`. For each method, generates:
-
-```c
-// Signature:
-u8 dynspire_dispatch_{method}(
-    void *state,
-    const u64 *in_slots, usize in_count,
-    u64 *out_slots, usize out_capacity
-);
+  fn compress(data: &[u8]) -> Vec<u8>;
+  fn compress_into(data: &[u8], out: &mut Vec<u8>) -> ();
+  fn analyze(data: &[u8]) -> CompressionReport;
+}
 ```
 
-The function:
-1. Decodes arguments from `in_slots` using `SlotDecode`
-2. Calls the trait method
-3. Encodes the `Result<T, String>` return into `out_slots` using `write_to_ffi`
-4. Returns 0 on success, 2 if out buffer too small
+Return types are the `Ok` variant — `Result<_, String>` is implicit. The type grammar is a closed set:
 
-Also generates `dynspire_idl_hash()`, `dynspire_spier_name()`, and `dynspire_idl_schema()`.
+| DSL syntax | Rust | Slots | Type table node |
+|---|---|---|---|
+| `u8`..`u64`, `i8`..`i64`, `f32`, `f64`, `bool` | same | 1 | `IDL_U8`/`U32`/`U64`/`F32`/`F64`/`BOOL` |
+| `&[u8]` | `&[u8]` | 2 (ptr,len) | `IDL_SLICE<U8>` |
+| `&str` | `&str` | 2 (ptr,len) | `IDL_STR` |
+| `&mut Vec<u8>` | `&mut Vec<u8>` | 1 (raw ptr) | `IDL_OUT_VEC` |
+| `String` | `String` | 2 (owned) | `IDL_STRING` |
+| `Vec<T>` | `Vec<T>` | 2 (owned) | `IDL_VEC<T>` |
+| `Option<T>` | `Option<T>` | 1+T | `IDL_OPTION<T>` |
+| `(A, B, ...)` | `(A, B, ...)` | sum of elements | `IDL_TUPLE<A,B,...>` (up to 8) |
+| Named struct/enum/opaque | same | boxed ptr (1) or disc+fields | `IDL_STRUCT`/`IDL_ENUM` |
 
-### `#[slot_enum]`
+### Generated artifacts
 
-Applied to an enum. Generates `SlotEncode`, `SlotDecode`, `SlotReturn`, `SlotReceive` impls plus a static `EnumDescriptor` for schema reflection. Each variant is encoded as `(discriminant, field0_slots, field1_slots, ...)`.
+The `build.rs` in the IDL crate calls `dynspire_codegen::build("src/my.dspi")`, which writes `OUT_DIR/my_idl.rs`. This single file contains:
 
-### `#[slot_struct]`
+| Output | Used by |
+|--------|---------|
+| `pub trait {Name}Engine: Send + Sync` | Spier + Host |
+| `pub struct {Type}` / `pub enum {Type}` + slot impls | Spier + Host |
+| `pub enum {Name}Op` + `impl SpierOp` | Host |
+| `pub const {NAME}_IDL_HASH: u64` | Spier + Host |
+| `pub static IDL: IdlDescriptor` | Host |
+| `pub fn idl_schema()` + `DynSpireIdl` + `dynspire_free()` | Spier (export) + Python (read) |
+| `pub struct DynSpire{Name}` + `impl {Name}Engine` | Host |
+| `#[macro_export] macro_rules! impl_{name}_spier!` | Spier |
 
-Applied to a struct. Generates `SlotEncode`, `SlotDecode`, `SlotReturn`, `SlotReceive` impls using an opaque boxed pointer (1 slot). The struct crosses the FFI boundary as `Box::into_raw` on the sender side and `Box::from_raw` on the receiver side. Rust callers access fields natively; Python callers receive an opaque integer handle and use explicit IDL methods for field access. Requires `Clone`.
+### Spier dispatch macro
+
+The generated `macro_rules!` takes `$state:ty`, `$init:path`, and `$name:literal`:
+
+```rust
+// In the spier crate:
+impl RleEngine for RleState {
+    fn compress(&self, data: &[u8]) -> Result<Vec<u8>, String> { /* business logic */ }
+    // ...
+}
+
+rle_idl::impl_rle_spier!(RleState, init, "rle");
+```
+
+The macro expands to all `dynspire_dispatch_{method}` functions (decoding args from slots, calling the trait method, encoding the result), plus `dynspire_create`, `dynspire_destroy`, `dynspire_idl_hash`, `dynspire_spier_name`, and `dynspire_idl_schema`.
+
+### Application errors: use IDL-declared enums
+
+Every method return is wrapped in `Result<T, String>` — this is the **transport layer** (null handle, buffer overflow, init failure). Application errors need a separate mechanism.
+
+The idiomatic pattern is a **custom Result enum declared in the `.dspi` file**:
+
+```
+interface Parser {
+    enum ParseError {
+        InvalidFormat,
+        TooLarge(u64),
+    }
+
+    enum ParseResult {
+        Ok(u64),
+        Err(ParseError),
+    }
+
+    fn parse(data: &[u8]) -> ParseResult;
+}
+```
+
+This generates `fn parse(&self, data: &[u8]) -> Result<ParseResult, String>`. The slot layout is `[transport_tag, enum_discriminant, ...field_slots]`:
+
+- `transport_tag = 1` → transport error (the `String` from `Result<_, String>`)
+- `transport_tag = 0, discriminant = 0` → `ParseResult::Ok(value)`
+- `transport_tag = 0, discriminant = 1` → `ParseResult::Err(error)`
+
+On the host side, `?` handles transport errors; `match` handles application errors:
+
+```rust
+match client.parse(data)? {
+    ParseResult::Ok(value) => println!("parsed: {value}"),
+    ParseResult::Err(ParseError::TooLarge(max)) => println!("too large (max {max})"),
+    ParseResult::Err(ParseError::InvalidFormat) => println!("invalid"),
+}
+```
+
+Python sees the enum natively via schema reflection:
+
+```python
+result = h.parse(data)
+if result.variant == "Ok":
+    print(result.fields[0])
+elif result.variant == "Err":
+    err = result.fields[0]
+    # err is itself a SpierEnumValue
+```
+
+**Why not `Result<T, E>` in the DSL?** The implicit `Result<T, String>` wrapping is always present (transport). If the DSL supported `-> Result<T, E>`, it would generate `Result<Result<T, E>, String>` — nesting that's mechanically correct but semantically confusing. Custom enums avoid the nesting entirely: the transport `Result<_, String>` wraps the user's enum, and the enum's discriminant IS the application-level Ok/Err tag.
+
+Additional benefits: enums support 3+ variants (`Ok`, `Err`, `Partial`), are fully reflected in the schema, and don't mix with the application's internal `Result` types — the IDL enum is the boundary contract.
 
 ---
 
 ## Tower Client
 
-The tower client (`DynSpireClient`) is the Rust host-side API:
+The tower client (`DynSpireClient`) is the Rust host-side API. The generated `DynSpire{Name}` wrapper uses it internally:
 
 ```rust
-// One-line setup
-let client = DynSpireClient::connect(
-    "rle_spier",       // spier name → finds .so
-    &rle_idl::IDL,     // IDL descriptor (hash + methods)
-    &config,           // creation config
-)?;
+// One-line setup — generated wrapper, no handwritten boilerplate
+let client = DynSpireRle::connect("rle_spier", &config)?;
 
-// Type-safe dispatch
-let result: Vec<u8> = client.call(RleOp::Compress, (&data[..]))?;
+// Type-safe dispatch via the generated trait
+let result: Vec<u8> = client.compress(&input[..])?;
 ```
 
 `connect()` performs:
@@ -289,9 +356,9 @@ The engine handles:
 
 - **Borrows** (`&[u8]`, `&str`): borrows Python memory directly (GIL is held during the call, so the borrow is sound)
 - **Owned returns** (`Vec<u8>`, `String`, tuples, enums): reconstructed in Rust via `Box::from_raw` and converted to Python objects; dropped normally
-- **`#[slot_struct]` returns**: wrapped in `OpaqueHandle` (holds the boxed pointer, frees via `dynspire_free` on GC; can be passed back as an input)
+- **Opaque struct returns**: wrapped in `OpaqueHandle` (holds the boxed pointer, frees via `dynspire_free` on GC; can be passed back as an input)
 - **OutVec** (`&mut Vec<u8>`): creates a Rust `Vec` via `dynspire_vec_create()`, passes the handle, snapshots contents via `dynspire_vec_view()`, frees via `dynspire_vec_free()`
-- **`#[slot_enum]`**: decoded to `SpierEnumValue` (variant name + payload tuple); can be passed back as an input
+- **Enums** (DSL `enum`): decoded to `SpierEnumValue` (variant name + payload tuple); can be passed back as an input
 - **Result<T, String>**: reads the tag slot, decodes the Ok value or raises `RuntimeError` with the error string
 
 ### Lifecycle

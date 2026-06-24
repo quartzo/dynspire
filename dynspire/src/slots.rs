@@ -86,45 +86,41 @@ impl SlotEncode for () {
     fn encode(&self, _w: &mut SlotWriter) {}
 }
 
-impl<A: SlotEncode> SlotEncode for (A,) {
-    fn encode(&self, w: &mut SlotWriter) {
-        self.0.encode(w);
-    }
+/// Generates all four slot trait impls for tuples of arity N.
+/// Covers input (Encode/Decode) and output (Return/Receive) paths.
+macro_rules! impl_slot_tuple {
+    ($($T:ident),*; $($i:tt),*) => {
+        impl<$($T: SlotEncode),*> SlotEncode for ($($T,)*) {
+            fn encode(&self, w: &mut SlotWriter) {
+                $(self.$i.encode(w);)*
+            }
+        }
+        impl<'a, $($T: SlotDecode<'a>),*> SlotDecode<'a> for ($($T,)*) {
+            unsafe fn decode(r: &mut SlotReader<'a>) -> Self {
+                ($($T::decode(r),)*)
+            }
+        }
+        impl<$($T: SlotReturn),*> SlotReturn for ($($T,)*) {
+            fn into_slots(self, w: &mut SlotWriter) {
+                $(self.$i.into_slots(w);)*
+            }
+        }
+        impl<$($T: SlotReceive),*> SlotReceive for ($($T,)*) {
+            unsafe fn from_slots(r: &mut SlotReader) -> Self {
+                ($($T::from_slots(r),)*)
+            }
+        }
+    };
 }
 
-impl<A: SlotEncode, B: SlotEncode> SlotEncode for (A, B) {
-    fn encode(&self, w: &mut SlotWriter) {
-        self.0.encode(w);
-        self.1.encode(w);
-    }
-}
-
-impl<A: SlotEncode, B: SlotEncode, C: SlotEncode> SlotEncode for (A, B, C) {
-    fn encode(&self, w: &mut SlotWriter) {
-        self.0.encode(w);
-        self.1.encode(w);
-        self.2.encode(w);
-    }
-}
-
-impl<A: SlotEncode, B: SlotEncode, C: SlotEncode, D: SlotEncode> SlotEncode for (A, B, C, D) {
-    fn encode(&self, w: &mut SlotWriter) {
-        self.0.encode(w);
-        self.1.encode(w);
-        self.2.encode(w);
-        self.3.encode(w);
-    }
-}
-
-impl<A: SlotEncode, B: SlotEncode, C: SlotEncode, D: SlotEncode, E: SlotEncode> SlotEncode for (A, B, C, D, E) {
-    fn encode(&self, w: &mut SlotWriter) {
-        self.0.encode(w);
-        self.1.encode(w);
-        self.2.encode(w);
-        self.3.encode(w);
-        self.4.encode(w);
-    }
-}
+impl_slot_tuple!(A; 0);
+impl_slot_tuple!(A, B; 0, 1);
+impl_slot_tuple!(A, B, C; 0, 1, 2);
+impl_slot_tuple!(A, B, C, D; 0, 1, 2, 3);
+impl_slot_tuple!(A, B, C, D, E; 0, 1, 2, 3, 4);
+impl_slot_tuple!(A, B, C, D, E, F; 0, 1, 2, 3, 4, 5);
+impl_slot_tuple!(A, B, C, D, E, F, G; 0, 1, 2, 3, 4, 5, 6);
+impl_slot_tuple!(A, B, C, D, E, F, G, H; 0, 1, 2, 3, 4, 5, 6, 7);
 
 /// Decodes a value from slots on the spier side (input parameter).
 ///
@@ -401,20 +397,6 @@ impl<T: SlotReceive> SlotReceive for Option<T> {
         } else {
             Some(T::from_slots(r))
         }
-    }
-}
-
-impl<A: SlotReturn, B: SlotReturn> SlotReturn for (A, B) {
-    fn into_slots(self, w: &mut SlotWriter) {
-        self.0.into_slots(w);
-        self.1.into_slots(w);
-    }
-}
-impl<A: SlotReceive, B: SlotReceive> SlotReceive for (A, B) {
-    unsafe fn from_slots(r: &mut SlotReader) -> Self {
-        let a = A::from_slots(r);
-        let b = B::from_slots(r);
-        (a, b)
     }
 }
 

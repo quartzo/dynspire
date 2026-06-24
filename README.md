@@ -1,38 +1,46 @@
 # DynSpire
 
-A Rust plugin framework for loading native `.so` libraries at runtime — with self-describing IDL schemas, zero-copy FFI, and Python bindings with no code generation.
+A Rust plugin framework for loading native `.so` libraries at runtime — with self-describing IDL schemas, zero-copy FFI, and Python bindings.
 
-> **In-process by design.** A spier is a `.so` loaded into the host via `dlopen` — same process, same address space. Arguments and return values cross the boundary through a flat `u64[]` slot convention over a C ABI: borrows and owned values pass by raw pointer, and `#[slot_struct]` hands over a boxed pointer (1 slot) rather than a serialized copy, so live objects cross freely.
+> **In-process by design.** A spier is a `.so` loaded into the host via `dlopen` — same process, same address space. Arguments and return values cross the boundary through a flat `u64[]` slot convention over a C ABI: borrows and owned values pass by raw pointer, and opaque structs hand over a boxed pointer (1 slot) rather than a serialized copy, so live objects cross freely.
 
 ## Why?
 
-You wrote a Rust library. You want to load it at runtime as a plugin — discover its methods, call them, and get typed results back. Without recompiling. Without stubs. Without a build step.
+You wrote a Rust library. You want to load it at runtime as a plugin — discover its methods, call them, and get typed results back. Without hand-writing FFI boilerplate. Without stubs.
 
-DynSpire does that.
+DynSpire does that — a `.dspi` file is the contract; `build.rs` generates everything.
 
 ## In 30 Seconds
 
-Define an interface:
+Define an interface in a `.dspi` file:
 
-```rust
-#[modulo_interface]
-pub trait RleEngine {
-    fn compress(&self, data: &[u8]) -> Result<Vec<u8>, String>;
-    fn decompress(&self, data: &[u8]) -> Result<Vec<u8>, String>;
-    fn compress_into(&self, data: &[u8], out: &mut Vec<u8>) -> Result<(), String>;
-    fn stats(&self, data: &[u8]) -> Result<(u64, u64), String>;
+```
+interface Rle {
+    fn compress(data: &[u8]) -> Vec<u8>;
+    fn decompress(data: &[u8]) -> Vec<u8>;
+    fn compress_into(data: &[u8], out: &mut Vec<u8>) -> ();
+    fn stats(data: &[u8]) -> (u64, u64);
 }
 ```
 
-Implement it as a `.so` plugin (spier). Load it from Rust:
+`build.rs` generates the trait, types, Op enum, schema, tower client, and spier dispatch macro. Implement the trait and load it:
 
 ```rust
-let client = DynSpireClient::connect("rle_spier", &rle_idl::IDL, &config)?;
-
-let compressed: Vec<u8> = client.call(RleOp::Compress, (&input[..]))?;
+// Spier crate
+impl RleEngine for RleState {
+    fn compress(&self, data: &[u8]) -> Result<Vec<u8>, String> { /* ... */ }
+    // ...
+}
+rle_idl::impl_rle_spier!(RleState, init, "rle");
 ```
 
-Or from Python — with full schema reflection, no codegen:
+```rust
+// Host crate
+let client = DynSpireRle::connect("rle_spier", &config)?;
+let compressed: Vec<u8> = client.compress(&input[..])?;
+```
+
+Or from Python — with full schema reflection:
 
 ```python
 with load_spier("rle_spier", lib_dir="target/debug").create_handle() as h:
@@ -41,12 +49,13 @@ with load_spier("rle_spier", lib_dir="target/debug").create_handle() as h:
 
 ## Features
 
+- **DSL-driven** — a `.dspi` file is the single source of truth. `build.rs` generates trait, types, Op enum, schema, tower client, and spier dispatch. No proc macros on business code.
 - **Self-describing** — spiers export their full IDL schema (methods, types, enums) via a C ABI. Hosts discover everything at runtime.
 - **Zero-copy FFI** — borrows (`&[u8]`, `&str`) and mutable out-params (`&mut Vec<u8>`) pass through raw pointers. No serialization overhead. `Vec<T: Clone>` input works for any element type (Rust→Rust).
-- **Type-safe dispatch** — Rust hosts use generated Op enums. No magic numbers.
+- **Type-safe dispatch** — Rust hosts use the generated tower wrapper. No magic numbers, no manual slot encoding.
 - **IDL hash verification** — incompatible plugins are rejected at load time.
 - **Python without codegen** — a PyO3 extension reads the IDL schema from the `.so` directly. No stub generation, no `bindgen`, no C headers.
-- **Any return type** — `Result<T, String>` where `T` can be `()`, `Vec<u8>`, `(u64, u64)`, `Option<String>`, any `#[slot_enum]` type, any `#[slot_struct]` type, or any composed combination.
+- **Any return type** — `Result<T, String>` where `T` can be `()`, `Vec<u8>`, `(u64, u64, u64)`, `Option<String>`, any DSL-declared enum or struct, or any composed combination. Application errors use IDL-declared enums (e.g., `enum ParseResult { Ok(u64), Err(ParseError) }`) — self-contained, schema-reflected, no Result nesting.
 
 ## The Boundary as Discipline
 
@@ -58,9 +67,9 @@ constraint that enforces clean separation at compile time.
   on the spier's internals. No sneaky imports, no shared private modules. If
   it's not in the IDL trait, it doesn't cross the boundary.
 - **Interfaces stay focused.** Return types cross as ≤8 `u64` slots. You can't
-  return a 50-field struct without consciously choosing `#[slot_struct]`. This
-  friction is intentional — it surfaces design problems at the interface, not
-  at integration time.
+  return a 50-field struct without consciously choosing an opaque struct
+  declaration. This friction is intentional — it surfaces design problems at
+  the interface, not at integration time.
 - **Components are independently built and tested.** Each spier is a separate
   crate with its own `Cargo.toml`, test suite, and release cycle. You can't
   reach into another component's internals during a refactor.
@@ -80,7 +89,7 @@ An RLE compression spier showcases the full cycle:
 
 ```
 demo/
-  rle-idl/       IDL trait definition
+  rle-idl/       .dspi interface + build.rs (generates trait, types, tower, macro)
   rle-spier/     cdylib implementation (loaded at runtime)
   rle-host/      Rust host binary
   rle_client.py  Python host (PyO3, schema reflection)
@@ -122,7 +131,7 @@ stats()
 ```
 pyproject.toml     uv project root (declares dynspire-py as local dependency)
 dynspire/          Core: arena FFI, slot system, tower client
-dynspire-macro/    Proc macros: #[modulo_interface], #[spier_dispatch], #[spier_storage], #[slot_enum], #[slot_struct]
+dynspire-codegen/  DSL parser + code generator (.dspi → .rs)
 dynspire-libs/     Library discovery helpers
 dynspire-py/       Python bindings (PyO3, schema-driven, zero codegen)
 demo/              RLE compression showcase
@@ -133,7 +142,7 @@ demo/              RLE compression showcase
 ```
   Host (Rust binary or Python script)
     │
-    │  DynSpireClient::connect("my_spier", &IDL, &config)
+    │  DynSpire{Name}::connect("my_spier", &config)
     │   1. find .so  (DYNSPIRE_LIB_DIR / LD_LIBRARY_PATH / explicit)
     │   2. dlopen
     │   3. verify IDL hash
@@ -146,7 +155,7 @@ demo/              RLE compression showcase
     dynspire_destroy()  → free State
 ```
 
-Arguments and return values flow through **u64 slots** — a compact calling convention that handles scalars, borrows, owned types, tuples, enums, and structs without heap allocation on the FFI boundary. Complex structs cross as opaque boxed pointers (1 slot) via `#[slot_struct]`.
+Arguments and return values flow through **u64 slots** — a compact calling convention that handles scalars, borrows, owned types, tuples, enums, and structs without heap allocation on the FFI boundary. Complex structs cross as opaque boxed pointers (1 slot) via the DSL's `opaque struct` declaration.
 
 For the deep dive, see [docs/architecture.md](docs/architecture.md).
 
@@ -230,6 +239,8 @@ All four are equivalent — use whichever reads best:
 | `SpierParam` | `.name` | `str` |
 | | `.type_idx` | `int` |
 | `SpierTypeInfo` | `.kind_name` | `str` (`"Slice"`, `"U64"`, `"Enum"`, ...) |
+| | `.child_count` | `int` (number of child type indices) |
+| | `.children` | `list[int]` (child type-table indices) |
 | `SpierEnumSchema` | `.name` | `str` |
 | | `.variant_names` | `list[str]` |
 | | `.create_enum_class()` | `SpierEnumClass` |

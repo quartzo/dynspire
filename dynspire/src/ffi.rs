@@ -16,14 +16,17 @@ pub const IDL_STRUCT: u8 = 14;
 pub const IDL_F32: u8 = 15;
 pub const IDL_F64: u8 = 16;
 
+/// Maximum children per type node (matches the 8-slot FFI limit).
+pub const MAX_TYPE_CHILDREN: usize = 8;
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct IdlTypeNode {
     pub kind: u8,
-    pub _pad: [u8; 3],
+    pub child_count: u8,
+    pub _pad: [u8; 2],
     pub size: u32,
-    pub child0: i32,
-    pub child1: i32,
+    pub children: [i32; MAX_TYPE_CHILDREN],
 }
 
 #[repr(C)]

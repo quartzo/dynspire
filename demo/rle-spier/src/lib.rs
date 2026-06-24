@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 
-use dynspire_macro::{spier_dispatch, spier_storage};
-use rle_idl::{CompressionReport, RleEngine, Tone};
+use rle_idl::{impl_rle_spier, CompressionReport, RleEngine, Tone};
 
 pub struct RleState;
 
@@ -35,12 +34,10 @@ fn rle_decompress(data: &[u8]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-#[spier_storage]
 fn init(_config: &HashMap<String, String>) -> Result<RleState, String> {
     Ok(RleState)
 }
 
-#[spier_dispatch(name = "rle", idl = rle_idl::RLE_IDL_HASH)]
 impl RleEngine for RleState {
     fn compress(&self, data: &[u8]) -> Result<Vec<u8>, String> {
         Ok(rle_compress(data))
@@ -90,7 +87,7 @@ impl RleEngine for RleState {
         let compressed = rle_compress(data);
         let labels = compressed
             .chunks_exact(2)
-            .map(|pair| format!("{}×{}", pair[0], pair[1] as char))
+            .map(|pair| format!("{}x{}", pair[0], pair[1] as char))
             .collect();
         Ok(labels)
     }
@@ -139,3 +136,5 @@ impl RleEngine for RleState {
         Ok(())
     }
 }
+
+impl_rle_spier!(RleState, init, "rle");

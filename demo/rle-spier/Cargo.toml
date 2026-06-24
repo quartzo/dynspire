@@ -10,5 +10,4 @@ crate-type = ["cdylib"]
 
 [dependencies]
 dynspire = { path = "../../dynspire" }
-dynspire-macro = { path = "../../dynspire-macro" }
 rle-idl = { path = "../rle-idl" }

@@ -401,7 +401,7 @@ impl TypeTableBuilder {
             Type::Tuple(t) if t.elems.is_empty() => {
                 let idx = self.nodes.len();
                 self.nodes.push(quote! {
-                    dynspire::ffi::IdlTypeNode { kind: dynspire::ffi::IDL_UNIT, _pad: [0; 3], size: 0, child0: -1, child1: -1 }
+                    dynspire::ffi::IdlTypeNode { kind: dynspire::ffi::IDL_UNIT, child_count: 0, _pad: [0; 2], size: 0, children: [-1, -1, -1, -1, -1, -1, -1, -1] }
                 });
                 idx
             }
@@ -411,56 +411,56 @@ impl TypeTableBuilder {
                     "bool" => {
                         let idx = self.nodes.len();
                         self.nodes.push(quote! {
-                            dynspire::ffi::IdlTypeNode { kind: dynspire::ffi::IDL_BOOL, _pad: [0; 3], size: 0, child0: -1, child1: -1 }
+                            dynspire::ffi::IdlTypeNode { kind: dynspire::ffi::IDL_BOOL, child_count: 0, _pad: [0; 2], size: 0, children: [-1, -1, -1, -1, -1, -1, -1, -1] }
                         });
                         idx
                     }
                     "u64" => {
                         let idx = self.nodes.len();
                         self.nodes.push(quote! {
-                            dynspire::ffi::IdlTypeNode { kind: dynspire::ffi::IDL_U64, _pad: [0; 3], size: 0, child0: -1, child1: -1 }
+                            dynspire::ffi::IdlTypeNode { kind: dynspire::ffi::IDL_U64, child_count: 0, _pad: [0; 2], size: 0, children: [-1, -1, -1, -1, -1, -1, -1, -1] }
                         });
                         idx
                     }
                     "i8" | "u8" => {
                         let idx = self.nodes.len();
                         self.nodes.push(quote! {
-                            dynspire::ffi::IdlTypeNode { kind: dynspire::ffi::IDL_U8, _pad: [0; 3], size: 0, child0: -1, child1: -1 }
+                            dynspire::ffi::IdlTypeNode { kind: dynspire::ffi::IDL_U8, child_count: 0, _pad: [0; 2], size: 0, children: [-1, -1, -1, -1, -1, -1, -1, -1] }
                         });
                         idx
                     }
                     "i16" | "u16" | "i32" | "u32" => {
                         let idx = self.nodes.len();
                         self.nodes.push(quote! {
-                            dynspire::ffi::IdlTypeNode { kind: dynspire::ffi::IDL_U32, _pad: [0; 3], size: 0, child0: -1, child1: -1 }
+                            dynspire::ffi::IdlTypeNode { kind: dynspire::ffi::IDL_U32, child_count: 0, _pad: [0; 2], size: 0, children: [-1, -1, -1, -1, -1, -1, -1, -1] }
                         });
                         idx
                     }
                     "i64" | "isize" | "usize" => {
                         let idx = self.nodes.len();
                         self.nodes.push(quote! {
-                            dynspire::ffi::IdlTypeNode { kind: dynspire::ffi::IDL_U64, _pad: [0; 3], size: 0, child0: -1, child1: -1 }
+                            dynspire::ffi::IdlTypeNode { kind: dynspire::ffi::IDL_U64, child_count: 0, _pad: [0; 2], size: 0, children: [-1, -1, -1, -1, -1, -1, -1, -1] }
                         });
                         idx
                     }
                     "f32" => {
                         let idx = self.nodes.len();
                         self.nodes.push(quote! {
-                            dynspire::ffi::IdlTypeNode { kind: dynspire::ffi::IDL_F32, _pad: [0; 3], size: 0, child0: -1, child1: -1 }
+                            dynspire::ffi::IdlTypeNode { kind: dynspire::ffi::IDL_F32, child_count: 0, _pad: [0; 2], size: 0, children: [-1, -1, -1, -1, -1, -1, -1, -1] }
                         });
                         idx
                     }
                     "f64" => {
                         let idx = self.nodes.len();
                         self.nodes.push(quote! {
-                            dynspire::ffi::IdlTypeNode { kind: dynspire::ffi::IDL_F64, _pad: [0; 3], size: 0, child0: -1, child1: -1 }
+                            dynspire::ffi::IdlTypeNode { kind: dynspire::ffi::IDL_F64, child_count: 0, _pad: [0; 2], size: 0, children: [-1, -1, -1, -1, -1, -1, -1, -1] }
                         });
                         idx
                     }
                     "String" => {
                         let idx = self.nodes.len();
                         self.nodes.push(quote! {
-                            dynspire::ffi::IdlTypeNode { kind: dynspire::ffi::IDL_STRING, _pad: [0; 3], size: 0, child0: -1, child1: -1 }
+                            dynspire::ffi::IdlTypeNode { kind: dynspire::ffi::IDL_STRING, child_count: 0, _pad: [0; 2], size: 0, children: [-1, -1, -1, -1, -1, -1, -1, -1] }
                         });
                         idx
                     }
@@ -475,7 +475,7 @@ impl TypeTableBuilder {
                         let idx = self.nodes.len();
                         let enum_idx_i32 = enum_idx as i32;
                         self.nodes.push(quote! {
-                            dynspire::ffi::IdlTypeNode { kind: dynspire::ffi::IDL_ENUM, _pad: [0; 3], size: 0, child0: #enum_idx_i32, child1: -1 }
+                            dynspire::ffi::IdlTypeNode { kind: dynspire::ffi::IDL_ENUM, child_count: 1, _pad: [0; 2], size: 0, children: [#enum_idx_i32, -1, -1, -1, -1, -1, -1, -1] }
                         });
                         idx
                     }
@@ -486,7 +486,7 @@ impl TypeTableBuilder {
                                 let idx = self.nodes.len();
                                 let c = child as i32;
                                 self.nodes.push(quote! {
-                                    dynspire::ffi::IdlTypeNode { kind: dynspire::ffi::IDL_OPTION, _pad: [0; 3], size: 0, child0: #c, child1: -1 }
+                                    dynspire::ffi::IdlTypeNode { kind: dynspire::ffi::IDL_OPTION, child_count: 1, _pad: [0; 2], size: 0, children: [#c, -1, -1, -1, -1, -1, -1, -1] }
                                 });
                                 return idx;
                             }
@@ -500,7 +500,7 @@ impl TypeTableBuilder {
                                 let idx = self.nodes.len();
                                 let c = child as i32;
                                 self.nodes.push(quote! {
-                                    dynspire::ffi::IdlTypeNode { kind: dynspire::ffi::IDL_VEC, _pad: [0; 3], size: 0, child0: #c, child1: -1 }
+                                    dynspire::ffi::IdlTypeNode { kind: dynspire::ffi::IDL_VEC, child_count: 1, _pad: [0; 2], size: 0, children: [#c, -1, -1, -1, -1, -1, -1, -1] }
                                 });
                                 return idx;
                             }
@@ -522,7 +522,7 @@ impl TypeTableBuilder {
                     Type::Path(tp) if tp.path.is_ident("str") => {
                         let idx = self.nodes.len();
                         self.nodes.push(quote! {
-                            dynspire::ffi::IdlTypeNode { kind: dynspire::ffi::IDL_STR, _pad: [0; 3], size: 0, child0: -1, child1: -1 }
+                            dynspire::ffi::IdlTypeNode { kind: dynspire::ffi::IDL_STR, child_count: 0, _pad: [0; 2], size: 0, children: [-1, -1, -1, -1, -1, -1, -1, -1] }
                         });
                         idx
                     }
@@ -531,7 +531,7 @@ impl TypeTableBuilder {
                         let idx = self.nodes.len();
                         let c = child as i32;
                         self.nodes.push(quote! {
-                            dynspire::ffi::IdlTypeNode { kind: dynspire::ffi::IDL_SLICE, _pad: [0; 3], size: 0, child0: #c, child1: -1 }
+                            dynspire::ffi::IdlTypeNode { kind: dynspire::ffi::IDL_SLICE, child_count: 1, _pad: [0; 2], size: 0, children: [#c, -1, -1, -1, -1, -1, -1, -1] }
                         });
                         idx
                     }
@@ -541,7 +541,7 @@ impl TypeTableBuilder {
                     {
                         let idx = self.nodes.len();
                         self.nodes.push(quote! {
-                            dynspire::ffi::IdlTypeNode { kind: dynspire::ffi::IDL_OUT_VEC, _pad: [0; 3], size: 0, child0: -1, child1: -1 }
+                            dynspire::ffi::IdlTypeNode { kind: dynspire::ffi::IDL_OUT_VEC, child_count: 0, _pad: [0; 2], size: 0, children: [-1, -1, -1, -1, -1, -1, -1, -1] }
                         });
                         idx
                     }
@@ -557,7 +557,7 @@ impl TypeTableBuilder {
                 let idx = self.nodes.len();
                 let c = child as i32;
                 self.nodes.push(quote! {
-                    dynspire::ffi::IdlTypeNode { kind: dynspire::ffi::IDL_ARRAY, _pad: [0; 3], size: #len_lit, child0: #c, child1: -1 }
+                    dynspire::ffi::IdlTypeNode { kind: dynspire::ffi::IDL_ARRAY, child_count: 1, _pad: [0; 2], size: #len_lit, children: [#c, -1, -1, -1, -1, -1, -1, -1] }
                 });
                 idx
             }
@@ -570,7 +570,7 @@ impl TypeTableBuilder {
                     let a = c0 as i32;
                     let b = c1 as i32;
                     self.nodes.push(quote! {
-                        dynspire::ffi::IdlTypeNode { kind: dynspire::ffi::IDL_TUPLE, _pad: [0; 3], size: 0, child0: #a, child1: #b }
+                        dynspire::ffi::IdlTypeNode { kind: dynspire::ffi::IDL_TUPLE, child_count: 2, _pad: [0; 2], size: 0, children: [#a, #b, -1, -1, -1, -1, -1, -1] }
                     });
                     idx
                 } else {
@@ -584,7 +584,7 @@ impl TypeTableBuilder {
     fn add_unit(&mut self) -> usize {
         let idx = self.nodes.len();
         self.nodes.push(quote! {
-            dynspire::ffi::IdlTypeNode { kind: dynspire::ffi::IDL_UNIT, _pad: [0; 3], size: 0, child0: -1, child1: -1 }
+            dynspire::ffi::IdlTypeNode { kind: dynspire::ffi::IDL_UNIT, child_count: 0, _pad: [0; 2], size: 0, children: [-1, -1, -1, -1, -1, -1, -1, -1] }
         });
         idx
     }
@@ -599,7 +599,7 @@ impl TypeTableBuilder {
         let idx = self.nodes.len();
         let enum_idx_i32 = enum_idx as i32;
         self.nodes.push(quote! {
-            dynspire::ffi::IdlTypeNode { kind: dynspire::ffi::IDL_ENUM, _pad: [0; 3], size: 0, child0: #enum_idx_i32, child1: -1 }
+            dynspire::ffi::IdlTypeNode { kind: dynspire::ffi::IDL_ENUM, child_count: 1, _pad: [0; 2], size: 0, children: [#enum_idx_i32, -1, -1, -1, -1, -1, -1, -1] }
         });
         idx
     }
@@ -614,7 +614,7 @@ impl TypeTableBuilder {
         let idx = self.nodes.len();
         let struct_idx_i32 = struct_idx as i32;
         self.nodes.push(quote! {
-            dynspire::ffi::IdlTypeNode { kind: dynspire::ffi::IDL_STRUCT, _pad: [0; 3], size: 0, child0: #struct_idx_i32, child1: -1 }
+            dynspire::ffi::IdlTypeNode { kind: dynspire::ffi::IDL_STRUCT, child_count: 1, _pad: [0; 2], size: 0, children: [#struct_idx_i32, -1, -1, -1, -1, -1, -1, -1] }
         });
         idx
     }

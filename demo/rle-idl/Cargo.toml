@@ -5,6 +5,10 @@ edition = "2021"
 description = "IDL interface for the RLE compression demo spier"
 license = "MIT"
 
+build = "build.rs"
+
 [dependencies]
 dynspire = { path = "../../dynspire" }
-dynspire-macro = { path = "../../dynspire-macro" }
+
+[build-dependencies]
+dynspire-codegen = { path = "../../dynspire-codegen" }

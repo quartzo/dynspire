@@ -40,9 +40,9 @@ type FnVecView = unsafe extern "C" fn(*mut c_void) -> VecView;
 #[derive(Clone, Copy)]
 struct TypeNode {
     kind: u8,
+    child_count: u8,
     _size: u32,
-    child0: i32,
-    child1: i32,
+    children: [i32; 8],
 }
 
 struct ParamInfo {
@@ -128,9 +128,9 @@ unsafe fn parse_schema(raw: &DynSpireIdl, name: String, lib: Arc<libloading::Lib
         .iter()
         .map(|t| TypeNode {
             kind: t.kind,
+            child_count: t.child_count,
             _size: t.size,
-            child0: t.child0,
-            child1: t.child1,
+            children: t.children,
         })
         .collect();
 
@@ -165,11 +165,15 @@ unsafe fn parse_schema(raw: &DynSpireIdl, name: String, lib: Arc<libloading::Lib
         let base = types.len() as i32;
         let enum_tt = std::slice::from_raw_parts(ed.type_table, ed.type_count);
         for node in enum_tt {
+            let mut children = [-1i32; 8];
+            for (i, &c) in node.children.iter().enumerate().take(node.child_count as usize) {
+                children[i] = if c >= 0 { c + base } else { c };
+            }
             types.push(TypeNode {
                 kind: node.kind,
+                child_count: node.child_count,
                 _size: node.size,
-                child0: if node.child0 >= 0 { node.child0 + base } else { node.child0 },
-                child1: if node.child1 >= 0 { node.child1 + base } else { node.child1 },
+                children,
             });
         }
 
@@ -382,20 +386,19 @@ fn schema_type_str(data: &SchemaData, idx: u32) -> String {
     }
     let t = &types[idx as usize];
     let name = kind_name(t.kind);
-    if t.kind == IDL_STRUCT && t.child0 >= 0 {
+    if t.kind == IDL_STRUCT && t.child_count > 0 {
         let s = data
             .struct_names
-            .get(t.child0 as usize)
+            .get(t.children[0] as usize)
             .cloned()
             .unwrap_or_else(|| "?".into());
         return format!("Struct<{s}>");
     }
     let mut parts = Vec::new();
-    if t.child0 >= 0 {
-        parts.push(schema_type_str(data, t.child0 as u32));
-    }
-    if t.child1 >= 0 {
-        parts.push(schema_type_str(data, t.child1 as u32));
+    for i in 0..t.child_count as usize {
+        if t.children[i] >= 0 {
+            parts.push(schema_type_str(data, t.children[i] as u32));
+        }
     }
     if parts.is_empty() {
         name.into()
@@ -423,13 +426,13 @@ fn build_enum_schema(data: &SchemaData, e: &EnumInfo) -> SpierEnumSchema {
     }
 }
 
-/// Returns the struct's stable index (`child0` into `struct_names`) if this
+/// Returns the struct's stable index (`children[0]` into `struct_names`) if this
 /// type node is a struct, or `None` otherwise. Used for O(1) type-identity
 /// comparison without string allocation.
 fn struct_id_at(data: &SchemaData, idx: u32) -> Option<i32> {
     data.types.get(idx as usize)
-        .filter(|t| t.kind == IDL_STRUCT && t.child0 >= 0)
-        .map(|t| t.child0)
+        .filter(|t| t.kind == IDL_STRUCT && t.child_count > 0)
+        .map(|t| t.children[0])
 }
 
 // === Rich schema objects for introspection ===
@@ -478,8 +481,8 @@ impl SpierMethod {
 #[pyclass(name = "SpierTypeInfo")]
 struct SpierTypeInfo {
     kind: u8,
-    child0: i32,
-    child1: i32,
+    child_count: u8,
+    children: Vec<i32>,
     #[pyo3(get)]
     type_idx: u32,
 }
@@ -497,16 +500,16 @@ impl SpierTypeInfo {
         kind_name(self.kind)
     }
 
-    /// First child index into the type table (-1 if absent).
+    /// Number of child type-table indices.
     #[getter]
-    fn child0(&self) -> i32 {
-        self.child0
+    fn child_count(&self) -> u8 {
+        self.child_count
     }
 
-    /// Second child index into the type table (-1 if absent).
+    /// Child type-table indices (empty for leaf types).
     #[getter]
-    fn child1(&self) -> i32 {
-        self.child1
+    fn children(&self) -> Vec<i32> {
+        self.children.clone()
     }
 }
 
@@ -634,7 +637,12 @@ impl SpierSchema {
     /// Returns type info at a given type-table index.
     fn type_at(&self, type_idx: u32) -> PyResult<SpierTypeInfo> {
         self.data.types.get(type_idx as usize)
-            .map(|t| SpierTypeInfo { kind: t.kind, child0: t.child0, child1: t.child1, type_idx })
+            .map(|t| SpierTypeInfo {
+                kind: t.kind,
+                child_count: t.child_count,
+                children: t.children[..t.child_count as usize].to_vec(),
+                type_idx,
+            })
             .ok_or_else(|| PyValueError::new_err(format!("type index {type_idx} out of range")))
     }
 
@@ -1269,7 +1277,7 @@ fn encode_value<'py>(
             Ok(())
         }
         IDL_SLICE => {
-            let child = &data.types[t.child0 as usize];
+            let child = &data.types[t.children[0] as usize];
             if child.kind == IDL_U8 {
                 let b: &[u8] = arg.extract()?;
                 w.write_u64(b.as_ptr() as u64);
@@ -1280,7 +1288,7 @@ fn encode_value<'py>(
             }
         }
         IDL_VEC => {
-            let child = &data.types[t.child0 as usize];
+            let child = &data.types[t.children[0] as usize];
             match child.kind {
                 IDL_U8 => {
                     let b: &[u8] = arg.extract()?;
@@ -1288,7 +1296,7 @@ fn encode_value<'py>(
                     w.write_u64(b.len() as u64);
                     Ok(())
                 }
-                IDL_VEC if data.types[child.child0 as usize].kind == IDL_U8 => {
+                IDL_VEC if data.types[child.children[0] as usize].kind == IDL_U8 => {
                     encode_vec_vec_u8_input(w, arg, keepalive)
                 }
                 IDL_STRING => {
@@ -1328,8 +1336,8 @@ fn encode_value<'py>(
         IDL_ENUM => {
             let ev = arg.extract::<PyRef<'_, SpierEnumValue>>()?;
             let ei = data.enums
-                .get(t.child0 as usize)
-                .ok_or_else(|| PyValueError::new_err(format!("enum index {} out of range", t.child0)))?;
+                .get(t.children[0] as usize)
+                .ok_or_else(|| PyValueError::new_err(format!("enum index {} out of range", t.children[0])))?;
             let variant = ei
                 .variants
                 .iter()
@@ -1359,13 +1367,12 @@ fn encode_value<'py>(
                 Ok(())
             } else {
                 w.write_u64(1);
-                encode_value(py, w, t.child0 as u32, data, arg, keepalive)
+                encode_value(py, w, t.children[0] as u32, data, arg, keepalive)
             }
         }
         IDL_TUPLE => {
-            let mut field_idxs = Vec::new();
-            if t.child0 >= 0 { field_idxs.push(t.child0 as u32); }
-            if t.child1 >= 0 { field_idxs.push(t.child1 as u32); }
+            let field_idxs: Vec<u32> = t.children[..t.child_count as usize]
+                .iter().map(|&c| c as u32).collect();
             let elems: Vec<Bound<'_, PyAny>> = arg.try_iter()?.collect::<PyResult<Vec<_>>>()?;
             if elems.len() != field_idxs.len() {
                 return Err(PyValueError::new_err(format!(
@@ -1451,11 +1458,11 @@ fn decode_value<'py>(
             Ok(PyString::new(py, &s).into_any())
         }
         IDL_VEC => {
-            let child = &data.types[t.child0 as usize];
+            let child = &data.types[t.children[0] as usize];
             if child.kind == IDL_U8 {
                 let bytes = reconstruct_owned_bytes(r);
                 Ok(PyBytes::new(py, &bytes).into_any())
-            } else if child.kind == IDL_VEC && data.types[child.child0 as usize].kind == IDL_U8 {
+            } else if child.kind == IDL_VEC && data.types[child.children[0] as usize].kind == IDL_U8 {
                 let outer = reconstruct_owned_vec_vec_u8(r);
                 let list = PyList::empty(py);
                 for inner in &outer {
@@ -1478,25 +1485,15 @@ fn decode_value<'py>(
             if r.read_u64() == 0 {
                 Ok(py.None().into_bound(py))
             } else {
-                decode_value(r, t.child0 as u32, data, py)
+                decode_value(r, t.children[0] as u32, data, py)
             }
         }
         IDL_TUPLE => {
-            let a = if t.child0 >= 0 {
-                Some(decode_value(r, t.child0 as u32, data, py)?)
-            } else {
-                None
-            };
-            let b = if t.child1 >= 0 {
-                Some(decode_value(r, t.child1 as u32, data, py)?)
-            } else {
-                None
-            };
-            match (a, b) {
-                (Some(a), Some(b)) => Ok(PyTuple::new(py, [a, b])?.into_any()),
-                (Some(a), None) => Ok(a.into_any()),
-                _ => Ok(py.None().into_bound(py)),
-            }
+            let parts: Vec<Bound<'_, PyAny>> = t.children[..t.child_count as usize]
+                .iter()
+                .map(|&c| decode_value(r, c as u32, data, py))
+                .collect::<PyResult<Vec<_>>>()?;
+            Ok(PyTuple::new(py, parts)?.into_any())
         }
         IDL_STRUCT => {
             // Opaque: engine can't name the type, so wrap the boxed pointer and
@@ -1511,8 +1508,8 @@ fn decode_value<'py>(
         }
         IDL_ENUM => {
             let ei = data.enums
-                .get(t.child0 as usize)
-                .ok_or_else(|| PyValueError::new_err(format!("enum index {} out of range", t.child0)))?;
+                .get(t.children[0] as usize)
+                .ok_or_else(|| PyValueError::new_err(format!("enum index {} out of range", t.children[0])))?;
             let disc = r.read_u64() as u32;
             let variant = ei
                 .variants

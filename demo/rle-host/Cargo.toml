@@ -10,5 +10,4 @@ name = "rle-host"
 path = "src/main.rs"
 
 [dependencies]
-dynspire = { path = "../../dynspire" }
 rle-idl = { path = "../rle-idl" }
