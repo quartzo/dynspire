@@ -1,13 +1,13 @@
 # DynSpire Architecture
 
-This document covers the internals of the DynSpire plugin framework: the slot system, FFI conventions, IDL schema export, proc macros, and the Python PyO3 adapter.
+This document covers the internals of the DynSpire plugin framework: the slot system, FFI conventions, IDL schema export, DSL codegen, and the Python PyO3 adapter.
 
 ## Table of Contents
 
 - [Overview](#overview)
 - [Slot System](#slot-system)
 - [IDL Schema Export](#idl-schema-export)
-- [Proc Macros](#proc-macros)
+- [DSL Codegen](#dsl-codegen)
 - [Tower Client](#tower-client)
 - [Python PyO3 Adapter](#python-pyo3-adapter)
 - [Path Resolution](#path-resolution)
@@ -325,10 +325,10 @@ for m in schema.methods:
     # compress(data: Slice<U8>) -> Result<Vec<U8>, String>
 
 # Detailed introspection
-m = schema.method("eavt_save")       # SpierMethod
+m = schema.method("compress")        # SpierMethod
 p = m.params[0]                      # SpierParam (.name, .type_idx)
 ti = schema.type_at(p.type_idx)      # SpierTypeInfo (.kind_name)
-enum = schema.enum_by_name("Value")  # SpierEnumSchema (.name, .variant_names)
+enum = schema.enum_by_name("Tone")   # SpierEnumSchema (.name, .variant_names)
 EnumCls = enum.create_enum_class()   # SpierEnumClass — VariantName(payload) → SpierEnumValue
 
 assert lib.idl_hash() == schema.hash

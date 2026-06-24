@@ -40,15 +40,6 @@ name = "dynspire-codegen"
 version = "0.1.0"
 
 [[package]]
-name = "dynspire-macro"
-version = "0.1.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
 name = "dynspire-py"
 version = "0.2.0"
 dependencies = [

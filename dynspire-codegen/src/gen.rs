@@ -219,7 +219,7 @@ fn gen_enum_def(e: &EnumDecl) -> String {
     out
 }
 
-/// Boxed-pointer slot impls — same pattern as #[slot_struct].
+/// Boxed-pointer slot impls — generated for DSL-declared structs/opaques.
 fn gen_boxed_slot_impls(name: &str) -> String {
     format!(
         r#"impl dynspire::slots::SlotEncode for {n} {{
@@ -262,7 +262,7 @@ pub static __STRUCT_DESC_{n}: dynspire::ffi::StructDescriptor = dynspire::ffi::S
     )
 }
 
-/// Enum slot impls — discriminant + fields, same pattern as #[slot_enum].
+/// Enum slot impls — discriminant + fields, generated for DSL-declared enums.
 fn gen_enum_slot_impls(e: &EnumDecl) -> String {
     let n = &e.name;
     let discs: Vec<i64> = {

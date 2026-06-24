@@ -73,7 +73,7 @@ fn main() {
     println!();
 
     // --- analyze: &[u8] -> Result<CompressionReport, String> ---
-    // #[slot_struct] crosses FFI as 1 opaque slot (boxed pointer).
+    // opaque struct crosses FFI as 1 slot (boxed pointer).
     // Rust host accesses fields natively — no serialization, no navigator.
     let report: rle_idl::CompressionReport = client.analyze(&input[..]).expect("analyze failed");
     println!("analyze() -> CompressionReport (opaque box, 1 slot)");

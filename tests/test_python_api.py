@@ -356,7 +356,7 @@ class TestEnumVariantInfo:
 
 
 # ---------------------------------------------------------------------------
-# SpierTypeInfo: kind (numeric), child0, child1
+# SpierTypeInfo: kind (numeric), children, child_count
 # ---------------------------------------------------------------------------
 
 class TestTypeInfoNavigation:
@@ -369,8 +369,9 @@ class TestTypeInfoNavigation:
     def test_child_indices(self, schema):
         m = schema.method("compress")
         ti = schema.type_at(m.params[0].type_idx)
-        # Slice<U8> — child0 should point to the U8 node
-        assert ti.child0 >= 0
+        # Slice<U8> — first child should point to the U8 node
+        assert ti.child_count >= 1
+        assert ti.children[0] >= 0
 
     def test_kind_matches_kind_name(self, schema):
         m = schema.method("compress")
@@ -380,12 +381,12 @@ class TestTypeInfoNavigation:
         assert ti.kind == 5
 
     def test_return_type_has_child(self, schema):
-        # compress returns Result<Vec<U8>, String> → the outer type is Result (encoded as Vec)
         m = schema.method("stats")
         ti = schema.type_at(m.return_type)
         # stats returns Tuple<U64, U64> → should have two children
-        assert ti.child0 >= 0
-        assert ti.child1 >= 0
+        assert ti.child_count >= 2
+        assert ti.children[0] >= 0
+        assert ti.children[1] >= 0
 
 
 # ---------------------------------------------------------------------------

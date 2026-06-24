@@ -69,7 +69,7 @@ def main():
         print(f"  ratio     : {ratio:.1f}%")
         print()
 
-        # analyze returns a #[slot_struct] — opaque boxed pointer (1 slot).
+        # analyze returns an opaque struct — boxed pointer (1 slot).
         # Python receives an OpaqueHandle. Fields are accessed via explicit
         # IDL methods, not by reading Rust memory directly.
         report_handle = h.analyze(input_data)

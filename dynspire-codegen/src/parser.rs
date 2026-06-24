@@ -453,7 +453,68 @@ pub fn parse(src: &str) -> Result<Interface> {
         return Err(parser.err("trailing tokens after interface definition"));
     }
 
+    validate(&interface)?;
     Ok(interface)
+}
+
+fn validate(iface: &Interface) -> Result<()> {
+    let declared: std::collections::HashSet<&str> = iface.types.iter()
+        .map(|t| match t {
+            TypeDecl::Struct(s) => s.name.as_str(),
+            TypeDecl::Enum(e) => e.name.as_str(),
+            TypeDecl::Opaque(o) => o.name.as_str(),
+        })
+        .collect();
+
+    for m in &iface.methods {
+        for p in &m.params {
+            check_named_types(&p.ty, &declared)?;
+        }
+        check_named_types(&m.return_type, &declared)?;
+    }
+
+    for ty in &iface.types {
+        match ty {
+            TypeDecl::Struct(s) => {
+                for (_, ft) in &s.fields {
+                    check_named_types(ft, &declared)?;
+                }
+            }
+            TypeDecl::Enum(e) => {
+                for v in &e.variants {
+                    for ft in &v.fields {
+                        check_named_types(ft, &declared)?;
+                    }
+                }
+            }
+            TypeDecl::Opaque(_) => {}
+        }
+    }
+
+    Ok(())
+}
+
+fn check_named_types(ty: &FieldType, declared: &std::collections::HashSet<&str>) -> Result<()> {
+    match ty {
+        FieldType::Named(name) => {
+            if !declared.contains(name.as_str()) {
+                return Err(ParseError {
+                    line: 0,
+                    col: 0,
+                    msg: format!("undeclared type reference: {}", name),
+                });
+            }
+            Ok(())
+        }
+        FieldType::Vec(inner) | FieldType::Option(inner) => check_named_types(inner, declared),
+        FieldType::Tuple(elems) => {
+            for e in elems {
+                check_named_types(e, declared)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -692,5 +753,42 @@ interface Rle {
             iface.methods[0].return_type,
             FieldType::Tuple(vec![FieldType::U64, FieldType::U64]),
         );
+    }
+
+    #[test]
+    fn test_undeclared_type_in_return() {
+        let err = parse("interface Foo { fn a() -> MissingType; }").unwrap_err();
+        assert!(err.msg.contains("undeclared type reference: MissingType"));
+    }
+
+    #[test]
+    fn test_undeclared_type_in_param() {
+        let err = parse("interface Foo { fn a(x: MissingType) -> (); }").unwrap_err();
+        assert!(err.msg.contains("undeclared type reference: MissingType"));
+    }
+
+    #[test]
+    fn test_undeclared_type_in_vec() {
+        let err = parse("interface Foo { fn a() -> Vec<MissingType>; }").unwrap_err();
+        assert!(err.msg.contains("undeclared type reference: MissingType"));
+    }
+
+    #[test]
+    fn test_undeclared_type_in_enum_field() {
+        let src = "interface Foo {
+            enum Bar { Variant(MissingType) }
+            fn a() -> Bar;
+        }";
+        let err = parse(src).unwrap_err();
+        assert!(err.msg.contains("undeclared type reference: MissingType"));
+    }
+
+    #[test]
+    fn test_declared_type_passes() {
+        let src = "interface Foo {
+            enum Bar { A, B(u64) }
+            fn a() -> Bar;
+        }";
+        assert!(parse(src).is_ok());
     }
 }

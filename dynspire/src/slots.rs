@@ -76,8 +76,8 @@ impl<'a> SlotReader<'a> {
 ///
 /// You should not implement this manually. Built-in impls cover all conventional
 /// types (scalars, `&[u8]`, `&str`, `String`, `Vec<T: Clone>`, `&mut Vec<u8>`,
-/// tuples, `Option<T>`, `Result<T,E>`). For custom types, use `#[slot_struct]`
-/// or `#[slot_enum]` — they generate all four slot traits automatically.
+/// tuples, `Option<T>`, `Result<T,E>`). For custom types, declare them in `.dspi`
+/// — the codegen generates all four slot traits automatically.
 pub trait SlotEncode {
     fn encode(&self, w: &mut SlotWriter);
 }
@@ -124,8 +124,8 @@ impl_slot_tuple!(A, B, C, D, E, F, G, H; 0, 1, 2, 3, 4, 5, 6, 7);
 
 /// Decodes a value from slots on the spier side (input parameter).
 ///
-/// You should not implement this manually. For custom types, use `#[slot_struct]`
-/// or `#[slot_enum]` to generate all four slot traits automatically.
+/// You should not implement this manually. For custom types, declare them in
+/// `.dspi` to generate all four slot traits automatically.
 ///
 /// # Safety
 ///
@@ -145,16 +145,16 @@ pub unsafe fn decode_param<'a, T: SlotDecode<'a>>(r: &mut SlotReader<'a>) -> T {
 ///
 /// You should not implement this manually. Built-in impls cover all conventional
 /// types (scalars, `String`, `Vec<u8>`, `Vec<T>`, tuples, `Option<T>`,
-/// `Result<T,E>`). For custom types, use `#[slot_struct]` or `#[slot_enum]` —
-/// they generate all four slot traits automatically.
+/// `Result<T,E>`). For custom types, declare them in `.dspi` to generate all
+/// four slot traits automatically.
 pub trait SlotReturn: Sized {
     fn into_slots(self, w: &mut SlotWriter);
 }
 
 /// Decodes a return value from slots on the caller side.
 ///
-/// You should not implement this manually. For custom types, use `#[slot_struct]`
-/// or `#[slot_enum]` to generate all four slot traits automatically.
+/// You should not implement this manually. For custom types, declare them in
+/// `.dspi` to generate all four slot traits automatically.
 ///
 /// # Safety
 ///

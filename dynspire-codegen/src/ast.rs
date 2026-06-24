@@ -242,7 +242,7 @@ impl TypeDecl {
 }
 
 // ---------------------------------------------------------------------------
-// FNV-1a 64-bit (same algorithm as current dynspire-macro)
+// FNV-1a 64-bit — used for IDL hash computation
 // ---------------------------------------------------------------------------
 
 pub fn fnv1a_64(data: &[u8]) -> u64 {

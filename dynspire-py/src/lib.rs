@@ -5,7 +5,7 @@
 //! 24-byte stride arithmetic, no `dynspire_free` for data returns. The engine
 //! owns the Rust value, converts to Python objects, and drops it normally.
 //!
-//! `dynspire_free` is kept ONLY for opaque `#[slot_struct]` returns whose
+//! `dynspire_free` is kept ONLY for opaque struct returns whose
 //! concrete Rust type the engine cannot name to drop. Those wrap in
 //! [`OpaqueHandle`], which frees itself via the spier's `free_fn` on GC.
 
@@ -72,7 +72,7 @@ struct SchemaData {
     lib: Arc<libloading::Library>,
 }
 
-/// A parsed `#[slot_enum]`: its name and variants (each variant's field types
+/// A parsed DSL-declared enum: its name and variants (each variant's field types
 /// resolved to GLOBAL type-table indices, so field decode recurses normally).
 struct EnumInfo {
     name: String,
@@ -1116,9 +1116,9 @@ impl BoundMethod {
     }
 }
 
-// === OpaqueHandle: a #[slot_struct] return the engine can't drop by type ===
+// === OpaqueHandle: an opaque struct return the engine can't drop by type ===
 
-/// Wraps an opaque spier-owned value (a `#[slot_struct]` return). The engine
+/// Wraps an opaque spier-owned value (an opaque struct return). The engine
 /// cannot reconstruct its concrete Rust type, so it holds the boxed pointer and
 /// releases it through the spier's `dynspire_free` on garbage collection.
 ///
@@ -1178,9 +1178,9 @@ impl Drop for OpaqueHandle {
     }
 }
 
-// === SpierEnumValue: a #[slot_enum] value (variant name + payload fields) ===
+// === SpierEnumValue: a DSL-declared enum value (variant name + payload fields) ===
 
-/// A `#[slot_enum]` value returned by a spier, or built to pass one back as an
+/// A DSL-declared enum value returned by a spier, or built to pass one back as an
 /// input. `variant` is the variant name; `fields` is the tuple of payload slots
 /// (empty for unit variants).
 #[pyclass(name = "SpierEnumValue")]

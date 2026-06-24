@@ -132,7 +132,6 @@ stats()
 pyproject.toml     uv project root (declares dynspire-py as local dependency)
 dynspire/          Core: arena FFI, slot system, tower client
 dynspire-codegen/  DSL parser + code generator (.dspi → .rs)
-dynspire-libs/     Library discovery helpers
 dynspire-py/       Python bindings (PyO3, schema-driven, zero codegen)
 demo/              RLE compression showcase
 ```
