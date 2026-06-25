@@ -26,9 +26,17 @@ DynSpire is a plugin architecture with three roles:
 
 | Role | Who | What |
 |------|-----|------|
-| **IDL** | Shared crate | A `.dspi` file is the single source of truth. `build.rs` invokes `dynspire_codegen::build()` to generate the trait, types, Op enum, IDL hash, type table, schema, tower client wrapper, and spier dispatch macro. |
-| **Spier** | `cdylib` crate | Implements the generated trait. Invokes `impl_{name}_spier!($state, init, "name")` — a generated `macro_rules!` that produces all C-ABI entry points (`dynspire_create`, `dynspire_dispatch_{method}`, `dynspire_destroy`, etc.). No proc macros. |
-| **Host** | Binary or script | Uses the generated `DynSpire{Name}` client wrapper directly. One import, no boilerplate. |
+| **IDL** | `.dspi` file | A `.dspi` file is the single source of truth. `build.rs` invokes `dynspire_codegen::build()` to generate the trait, types, Op enum, IDL hash, type table, schema, tower client wrapper, and spier dispatch macro. |
+| **Spier** | `cdylib` crate | Compiles the `.dspi` independently. Implements the generated trait. Invokes `impl_{name}_spier!($state, init, "name")` — a generated `macro_rules!` that produces all C-ABI entry points (`dynspire_create`, `dynspire_dispatch_{method}`, `dynspire_destroy`, etc.). No proc macros. |
+| **Host** | Binary or script | Compiles the same `.dspi` independently (or depends on a shared IDL crate — see below). Uses the generated `DynSpire{Name}` client wrapper directly. One import, no boilerplate. Python hosts skip codegen entirely and read the schema at runtime. |
+
+> **The IDL hash is the contract, not the crate dependency.** The spier and host
+> can each compile the `.dspi` independently — both sides produce the same hash
+> from the same interface signature, so `connect()` accepts the spier. A shared
+> IDL crate is a convenience (prevents version skew by construction), not a
+> requirement. The FFI boundary uses raw pointers and slots, never Rust type
+> identity, so independently-compiled types from the same `.dspi` are
+> layout-compatible.
 
 ```
 ┌─────────────────────────────────────────────┐
@@ -200,9 +208,21 @@ Return types are the `Ok` variant — `Result<_, String>` is implicit. The type 
 | `(A, B, ...)` | `(A, B, ...)` | sum of elements | `IDL_TUPLE<A,B,...>` (up to 8) |
 | Named struct/enum/opaque | same | boxed ptr (1) or disc+fields | `IDL_STRUCT`/`IDL_ENUM` |
 
+### Grammar rules
+
+The parser enforces these constraints:
+
+- **Keywords**: `interface`, `struct`, `enum`, `opaque`, `fn`, `mut` — cannot be used as identifiers.
+- **Comments**: `//` line comments only. No `/* */` block comments.
+- **Interface**: exactly one per file. Must contain at least one method. Trailing tokens after the closing `}` are an error.
+- **Tuples**: 2–8 elements. Single-element parens `(X)` collapse to `X` (not a tuple).
+- **Borrow constraints**: `&[` accepts only `u8`; `&mut` accepts only `Vec<u8>`. Other borrow types are parse errors.
+- **Named type references**: every named type used in params, returns, struct fields, enum variants, or inside `Vec`/`Option`/`Tuple` must be declared in the same interface. Undeclared references are a parse error.
+- **Trailing commas**: allowed in struct fields, enum variants, and tuple elements.
+
 ### Generated artifacts
 
-The `build.rs` in the IDL crate calls `dynspire_codegen::build("src/my.dspi")`, which writes `OUT_DIR/my_idl.rs`. This single file contains:
+The `build.rs` calls `dynspire_codegen::build("src/my.dspi")`, which writes `OUT_DIR/my_idl.rs`. This single file contains:
 
 | Output | Used by |
 |--------|---------|
@@ -214,6 +234,35 @@ The `build.rs` in the IDL crate calls `dynspire_codegen::build("src/my.dspi")`, 
 | `pub fn idl_schema()` + `DynSpireIdl` + `dynspire_free()` | Spier (export) + Python (read) |
 | `pub struct DynSpire{Name}` + `impl {Name}Engine` | Host |
 | `#[macro_export] macro_rules! impl_{name}_spier!` | Spier |
+
+Symbol names are derived from the interface name:
+
+| Interface name | Generated symbol | Example (`interface My`) |
+|---|---|---|
+| `interface {N}` | `pub trait {N}Engine` | `MyEngine` |
+| | `pub enum {N}Op` | `MyOp` |
+| | `pub struct DynSpire{N}` | `DynSpireMy` |
+| | `pub const {N_UPPER}_IDL_HASH: u64` | `MY_IDL_HASH` |
+| | `macro_rules! impl_{n_lower}_spier!` | `impl_my_spier!` |
+| | output file: `{n_lower}_idl.rs` | `my_idl.rs` |
+
+### Codegen API
+
+The `dynspire-codegen` crate exposes three public functions:
+
+```rust
+// build.rs entry point — reads file, parses, generates, writes to OUT_DIR.
+// Emits cargo:rerun-if-changed for the .dspi file. Panics on error.
+pub fn build(dspi_path: &str);
+
+// AST → full Rust source string (for testing or custom build scripts).
+pub fn generate(iface: &Interface) -> String;
+
+// Source text → AST (for tooling, tests, IDE integration).
+pub fn parse(src: &str) -> Result<Interface, ParseError>;
+```
+
+The AST types (`Interface`, `Method`, `FieldType`, `TypeDecl`, etc.) are re-exported via `dynspire_codegen::ast::*`. The crate has no dependency on the `dynspire` runtime — generated code references `dynspire::*`, but the codegen itself only produces strings.
 
 ### Spier dispatch macro
 

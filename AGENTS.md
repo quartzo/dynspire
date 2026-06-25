@@ -7,16 +7,19 @@
 The `.dspi` interface file is the single source of truth. A `build.rs`
 step invokes `dynspire_codegen::build()` to generate all Rust code:
 
-- **IDL crate**: `build.rs` reads `.dspi`, writes generated `.rs` to
-  `OUT_DIR`. `lib.rs` does `include!()`. The generated code contains the
-  trait, types, Op enum, schema, hash, tower client wrapper, and the
-  spier dispatch macro.
-- **Spier crate**: depends on the IDL crate. Implements the generated
-  trait, then invokes `impl_{name}_spier!($state, init, "name")` — a
-  `macro_rules!` that generates all C-ABI dispatch functions, create/
-  destroy, and schema exports.
-- **Host crate**: depends on the IDL crate. Uses the generated
-  `DynSpire{Name}` client wrapper directly. No handwritten boilerplate.
+- **Spier crate**: compiles the `.dspi` via its own `build.rs`.
+  Implements the generated trait, then invokes
+  `impl_{name}_spier!($state, init, "name")` — a `macro_rules!` that
+  generates all C-ABI dispatch functions, create/destroy, and schema
+  exports.
+- **Host crate**: compiles the same `.dspi` (independently or via a
+  shared IDL crate). Uses the generated `DynSpire{Name}` client wrapper
+  directly. No handwritten boilerplate.
+
+> **The IDL hash is the contract, not the crate dependency.** The spier
+> and host can each compile the `.dspi` independently — the hash ensures
+> compatibility at load time. A shared IDL crate is a convenience for
+> single-team projects, not a requirement.
 
 **NEVER** call `DynSpireClient::call()` directly from host business logic.
 Always go through the generated trait wrapper.
@@ -29,12 +32,16 @@ not depend on the `dynspire` runtime crate. The generated code references
 
 ### Layout
 
+Two valid patterns (demo uses the shared-crate pattern):
+
 ```
-demo/
-  rle-idl/       ← IDL: .dspi + build.rs + include!() (generated trait, types, tower, macro)
-  rle-spier/     ← Spier: impl trait + impl_rle_spier!() (no proc macros)
-  rle-host/      ← Tower: use DynSpireRle (1 import, no boilerplate)
-dynspire-codegen/ ← Parser + code generator (.dspi → .rs)
+Shared IDL crate:                    Independent compilation:
+
+demo/                                  my-spier/        my-host/
+  rle-idl/   ← .dspi + build.rs          build.rs         build.rs
+  rle-spier/ ← depends on rle-idl        src/my.dspi      src/my.dspi
+  rle-host/  ← depends on rle-idl        src/lib.rs       src/main.rs
+dynspire-codegen/ ← .dspi → .rs
 ```
 
 ### What the DSL replaces
