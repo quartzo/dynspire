@@ -202,7 +202,7 @@ class TestReturnTypes:
 
     def test_vec_string(self, handle):
         labels = handle.run_labels(DATA)
-        assert labels == ["4×A", "3×B", "4×C", "5×D", "4×E", "6×F", "3×G"]
+        assert labels == ["4xA", "3xB", "4xC", "5xD", "4xE", "6xF", "3xG"]
 
     def test_round_trip(self, handle):
         assert handle.decompress(COMPRESSED) == DATA
