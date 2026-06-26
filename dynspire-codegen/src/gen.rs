@@ -145,6 +145,422 @@ fn pascal(s: &str) -> String {
 }
 
 // ===========================================================================
+// Inline slot encoding/decoding — replaces trait-based dispatch
+// ===========================================================================
+
+fn find_type<'a>(types: &'a [TypeDecl], name: &str) -> &'a TypeDecl {
+    types
+        .iter()
+        .find(|t| t.name() == name)
+        .unwrap_or_else(|| panic!("dynspire-codegen: unknown type reference: {name}"))
+}
+
+/// Generate inline write-encode statements for a borrowed value (input param).
+fn gen_write_encode(ft: &FieldType, expr: &str, w: &str, types: &[TypeDecl]) -> String {
+    match ft {
+        FieldType::Unit => String::new(),
+        FieldType::Bool => format!("{w}.write_u64(if {expr} {{ 1 }} else {{ 0 }});"),
+        FieldType::U8 | FieldType::I8 => format!("{w}.write_u64({expr} as u64);"),
+        FieldType::U16 | FieldType::I16 | FieldType::U32 | FieldType::I32 => {
+            format!("{w}.write_u64({expr} as u64);")
+        }
+        FieldType::U64 => format!("{w}.write_u64({expr});"),
+        FieldType::I64 => format!("{w}.write_u64({expr} as u64);"),
+        FieldType::F32 => format!("{w}.write_u64({expr}.to_bits() as u64);"),
+        FieldType::F64 => format!("{w}.write_u64({expr}.to_bits());"),
+        FieldType::Str | FieldType::U8Slice => {
+            format!("{w}.write_u64({expr}.as_ptr() as u64); {w}.write_u64({expr}.len() as u64);")
+        }
+        FieldType::OutU8Vec => {
+            format!("{w}.write_u64(core::ptr::addr_of!(*{expr}) as u64);")
+        }
+        FieldType::String => {
+            format!("{w}.write_u64({expr}.as_ptr() as u64); {w}.write_u64({expr}.len() as u64);")
+        }
+        FieldType::Vec(_) => {
+            format!("{w}.write_u64({expr}.as_ptr() as u64); {w}.write_u64({expr}.len() as u64);")
+        }
+        FieldType::Option(inner) => {
+            let some = gen_write_encode(inner, "__v", w, types);
+            if some.is_empty() {
+                format!("if {expr}.is_some() {{ {w}.write_u64(1); }} else {{ {w}.write_u64(0); }}")
+            } else {
+                format!("if let Some(__v) = {expr} {{ {w}.write_u64(1); {some} }} else {{ {w}.write_u64(0); }}")
+            }
+        }
+        FieldType::Tuple(elems) => {
+            let mut s = String::new();
+            for (i, e) in elems.iter().enumerate() {
+                s.push_str(&gen_write_encode(e, &format!("{expr}.{i}"), w, types));
+            }
+            s
+        }
+        FieldType::Array(inner, len) => {
+            if matches!(inner.as_ref(), FieldType::U8) && *len % 8 == 0 {
+                let mut s = String::new();
+                for i in 0..*len / 8 {
+                    let start = i * 8;
+                    s.push_str(&format!(
+                        "{w}.write_u64(u64::from_le_bytes({expr}[{start}..{}].try_into().unwrap()));",
+                        start + 8,
+                    ));
+                }
+                s
+            } else {
+                let mut s = String::new();
+                for i in 0..*len {
+                    s.push_str(&gen_write_encode(inner, &format!("{expr}[{i}]"), w, types));
+                }
+                s
+            }
+        }
+        FieldType::Named(name) => {
+            let ty = find_type(types, name);
+            match ty {
+                TypeDecl::Struct(s) if s.fields.is_empty() => {
+                    format!("{w}.write_u64(core::ptr::addr_of!({expr}) as u64);")
+                }
+                TypeDecl::Struct(_) | TypeDecl::Opaque(_) => {
+                    format!("{w}.write_u64(&{expr} as *const {name} as u64);")
+                }
+                TypeDecl::Enum(e) => gen_write_enum_encode(e, expr, w, types),
+            }
+        }
+    }
+}
+
+/// Generate inline write-return statements for an owned value (output return).
+fn gen_write_return(ft: &FieldType, expr: &str, w: &str, types: &[TypeDecl]) -> String {
+    match ft {
+        FieldType::Unit => String::new(),
+        FieldType::Bool => format!("{w}.write_u64(if {expr} {{ 1 }} else {{ 0 }});"),
+        FieldType::U8 | FieldType::I8 => format!("{w}.write_u64({expr} as u64);"),
+        FieldType::U16 | FieldType::I16 | FieldType::U32 | FieldType::I32 => {
+            format!("{w}.write_u64({expr} as u64);")
+        }
+        FieldType::U64 => format!("{w}.write_u64({expr});"),
+        FieldType::I64 => format!("{w}.write_u64({expr} as u64);"),
+        FieldType::F32 => format!("{w}.write_u64({expr}.to_bits() as u64);"),
+        FieldType::F64 => format!("{w}.write_u64({expr}.to_bits());"),
+        FieldType::Str | FieldType::U8Slice | FieldType::OutU8Vec => {
+            gen_write_encode(ft, expr, w, types)
+        }
+        FieldType::String => format!(
+            "if {expr}.is_empty() {{ {w}.write_u64(0); {w}.write_u64(0); }} else {{ \
+             let __len = {expr}.len(); \
+             let __boxed = {expr}.into_bytes().into_boxed_slice(); \
+             let __ptr = __boxed.as_ptr() as usize; \
+             core::mem::forget(__boxed); \
+             {w}.write_u64(__ptr as u64); \
+             {w}.write_u64(__len as u64); }}"
+        ),
+        FieldType::Vec(_) => format!(
+            "if {expr}.is_empty() {{ {w}.write_u64(0); {w}.write_u64(0); }} else {{ \
+             let __len = {expr}.len(); \
+             let __boxed = {expr}.into_boxed_slice(); \
+             let __ptr = __boxed.as_ptr() as usize; \
+             core::mem::forget(__boxed); \
+             {w}.write_u64(__ptr as u64); \
+             {w}.write_u64(__len as u64); }}"
+        ),
+        FieldType::Option(inner) => {
+            let some = gen_write_return(inner, "__v", w, types);
+            if some.is_empty() {
+                format!("if {expr}.is_some() {{ {w}.write_u64(1); }} else {{ {w}.write_u64(0); }}")
+            } else {
+                format!("if let Some(__v) = {expr} {{ {w}.write_u64(1); {some} }} else {{ {w}.write_u64(0); }}")
+            }
+        }
+        FieldType::Tuple(elems) => {
+            let mut s = String::new();
+            for (i, e) in elems.iter().enumerate() {
+                s.push_str(&gen_write_return(e, &format!("{expr}.{i}"), w, types));
+            }
+            s
+        }
+        FieldType::Array(inner, len) => gen_write_encode(
+            &FieldType::Array(inner.clone(), *len),
+            expr,
+            w,
+            types,
+        ),
+        FieldType::Named(name) => {
+            let ty = find_type(types, name);
+            match ty {
+                TypeDecl::Struct(s) if s.fields.is_empty() => {
+                    format!("{w}.write_u64(core::ptr::addr_of!({expr}) as u64);")
+                }
+                TypeDecl::Struct(_) | TypeDecl::Opaque(_) => {
+                    format!("{w}.write_u64(Box::into_raw(Box::new({expr})) as u64);")
+                }
+                TypeDecl::Enum(e) => gen_write_enum_return(e, expr, w, types),
+            }
+        }
+    }
+}
+
+/// Generate inline read-decode expression for a borrowed value (input param, spier side).
+fn gen_read_decode(ft: &FieldType, r: &str, types: &[TypeDecl]) -> String {
+    match ft {
+        FieldType::Unit => "()".into(),
+        FieldType::Bool => format!("{r}.read_u64() != 0"),
+        FieldType::U8 => format!("{r}.read_u64() as u8"),
+        FieldType::U16 => format!("{r}.read_u64() as u16"),
+        FieldType::U32 => format!("{r}.read_u64() as u32"),
+        FieldType::U64 => format!("{r}.read_u64()"),
+        FieldType::I8 => format!("{r}.read_u64() as i8"),
+        FieldType::I16 => format!("{r}.read_u64() as i16"),
+        FieldType::I32 => format!("{r}.read_u64() as i32"),
+        FieldType::I64 => format!("{r}.read_u64() as i64"),
+        FieldType::F32 => format!("f32::from_bits({r}.read_u64() as u32)"),
+        FieldType::F64 => format!("f64::from_bits({r}.read_u64())"),
+        FieldType::Str => format!(
+            "unsafe {{ let __p = {r}.read_u64() as *const u8; let __l = {r}.read_u64() as usize; \
+             if __p.is_null() || __l == 0 {{ \"\" }} \
+             else {{ core::str::from_utf8_unchecked(core::slice::from_raw_parts(__p, __l)) }} }}"
+        ),
+        FieldType::U8Slice => format!(
+            "unsafe {{ let __p = {r}.read_u64() as *const u8; let __l = {r}.read_u64() as usize; \
+             if __p.is_null() || __l == 0 {{ &[] as &[u8] }} \
+             else {{ core::slice::from_raw_parts(__p, __l) }} }}"
+        ),
+        FieldType::OutU8Vec => format!("unsafe {{ &mut *({r}.read_u64() as *mut Vec<u8>) }}"),
+        FieldType::String => format!(
+            "unsafe {{ let __p = {r}.read_u64() as *const u8; let __l = {r}.read_u64() as usize; \
+             if __p.is_null() || __l == 0 {{ String::new() }} \
+             else {{ String::from_utf8_unchecked(core::slice::from_raw_parts(__p, __l).to_vec()) }} }}"
+        ),
+        FieldType::Vec(inner) => {
+            let rt = inner.rust_type();
+            format!(
+                "unsafe {{ let __p = {r}.read_u64() as *const {rt}; let __l = {r}.read_u64() as usize; \
+                 if __p.is_null() || __l == 0 {{ Vec::new() }} \
+                 else {{ core::slice::from_raw_parts(__p, __l).to_vec() }} }}"
+            )
+        }
+        FieldType::Option(inner) => {
+            let inner_decode = gen_read_decode(inner, r, types);
+            format!(
+                "{{ let __tag = {r}.read_u64(); if __tag == 0 {{ None }} else {{ Some({inner_decode}) }} }}"
+            )
+        }
+        FieldType::Tuple(elems) => {
+            let parts: Vec<String> = elems.iter().map(|e| gen_read_decode(e, r, types)).collect();
+            format!("({})", parts.join(", "))
+        }
+        FieldType::Array(inner, len) => {
+            if matches!(inner.as_ref(), FieldType::U8) && *len % 8 == 0 {
+                let mut chunks = String::new();
+                for i in 0..*len / 8 {
+                    chunks.push_str(&format!(
+                        "__arr[{}..{}].copy_from_slice(&{r}.read_u64().to_le_bytes());",
+                        i * 8,
+                        i * 8 + 8,
+                    ));
+                }
+                format!("{{ let mut __arr = [0u8; {len}]; {chunks} __arr }}")
+            } else {
+                let mut inits = String::new();
+                for _ in 0..*len {
+                    inits.push_str(&format!("{},", gen_read_decode(inner, r, types)));
+                }
+                format!("[{inits}]")
+            }
+        }
+        FieldType::Named(name) => {
+            let ty = find_type(types, name);
+            match ty {
+                TypeDecl::Struct(s) if s.fields.is_empty() => {
+                    format!("{{ let _ = {r}.read_u64(); {name} }}")
+                }
+                TypeDecl::Struct(_) | TypeDecl::Opaque(_) => {
+                    format!("unsafe {{ (*({r}.read_u64() as *const {name})).clone() }}")
+                }
+                TypeDecl::Enum(e) => gen_read_enum_decode(e, r, types),
+            }
+        }
+    }
+}
+
+/// Generate inline read-receive expression for an owned value (output return, host side).
+fn gen_read_receive(ft: &FieldType, r: &str, types: &[TypeDecl]) -> String {
+    match ft {
+        FieldType::Unit => "()".into(),
+        FieldType::Bool => format!("{r}.read_u64() != 0"),
+        FieldType::U8 => format!("{r}.read_u64() as u8"),
+        FieldType::U16 => format!("{r}.read_u64() as u16"),
+        FieldType::U32 => format!("{r}.read_u64() as u32"),
+        FieldType::U64 => format!("{r}.read_u64()"),
+        FieldType::I8 => format!("{r}.read_u64() as i8"),
+        FieldType::I16 => format!("{r}.read_u64() as i16"),
+        FieldType::I32 => format!("{r}.read_u64() as i32"),
+        FieldType::I64 => format!("{r}.read_u64() as i64"),
+        FieldType::F32 => format!("f32::from_bits({r}.read_u64() as u32)"),
+        FieldType::F64 => format!("f64::from_bits({r}.read_u64())"),
+        FieldType::Str | FieldType::U8Slice | FieldType::OutU8Vec => {
+            gen_read_decode(ft, r, types)
+        }
+        FieldType::String => format!(
+            "unsafe {{ \
+             let __ptr = {r}.read_u64() as *mut u8; \
+             let __len = {r}.read_u64() as usize; \
+             if __ptr.is_null() || __len == 0 {{ String::new() }} \
+             else {{ String::from_utf8_unchecked(Box::from_raw(core::ptr::slice_from_raw_parts_mut(__ptr, __len)).into_vec()) }} }}"
+        ),
+        FieldType::Vec(inner) => {
+            let rt = inner.rust_type();
+            format!(
+                "unsafe {{ \
+                 let __ptr = {r}.read_u64() as *mut {rt}; \
+                 let __len = {r}.read_u64() as usize; \
+                 if __ptr.is_null() || __len == 0 {{ Vec::new() }} \
+                 else {{ Box::from_raw(core::ptr::slice_from_raw_parts_mut(__ptr, __len)).into_vec() }} }}"
+            )
+        }
+        FieldType::Option(inner) => {
+            let inner_recv = gen_read_receive(inner, r, types);
+            format!(
+                "{{ let __tag = {r}.read_u64(); if __tag == 0 {{ None }} else {{ Some({inner_recv}) }} }}"
+            )
+        }
+        FieldType::Tuple(elems) => {
+            let parts: Vec<String> = elems.iter().map(|e| gen_read_receive(e, r, types)).collect();
+            format!("({})", parts.join(", "))
+        }
+        FieldType::Array(inner, len) => {
+            if matches!(inner.as_ref(), FieldType::U8) && *len % 8 == 0 {
+                let mut chunks = String::new();
+                for i in 0..*len / 8 {
+                    chunks.push_str(&format!(
+                        "__arr[{}..{}].copy_from_slice(&{r}.read_u64().to_le_bytes());",
+                        i * 8,
+                        i * 8 + 8,
+                    ));
+                }
+                format!("{{ let mut __arr = [0u8; {len}]; {chunks} __arr }}")
+            } else {
+                let mut inits = String::new();
+                for _ in 0..*len {
+                    inits.push_str(&format!("{},", gen_read_receive(inner, r, types)));
+                }
+                format!("[{inits}]")
+            }
+        }
+        FieldType::Named(name) => {
+            let ty = find_type(types, name);
+            match ty {
+                TypeDecl::Struct(s) if s.fields.is_empty() => {
+                    format!("{{ let _ = {r}.read_u64(); {name} }}")
+                }
+                TypeDecl::Struct(_) | TypeDecl::Opaque(_) => {
+                    format!("unsafe {{ *Box::from_raw({r}.read_u64() as *mut {name}) }}")
+                }
+                TypeDecl::Enum(e) => gen_read_enum_receive(e, r, types),
+            }
+        }
+    }
+}
+
+// --- Enum inline helpers ---
+
+fn gen_write_enum_encode(e: &EnumDecl, expr: &str, w: &str, types: &[TypeDecl]) -> String {
+    let n = &e.name;
+    let mut arms = String::new();
+    for (i, v) in e.variants.iter().enumerate() {
+        let disc = i as u64;
+        if v.fields.is_empty() {
+            arms.push_str(&format!("{n}::{vn} => {{ {w}.write_u64({disc}); }} ", vn=v.name));
+        } else {
+            let fnames: Vec<String> = (0..v.fields.len()).map(|i| format!("__f{i}")).collect();
+            let ref_pats: Vec<String> = fnames.iter().map(|f| format!("ref {f}")).collect();
+            let mut field_stmts = String::new();
+            for (fty, fname) in v.fields.iter().zip(&fnames) {
+                let needs_deref = matches!(fty, FieldType::U8 | FieldType::I8 | FieldType::U16 | FieldType::I16 | FieldType::U32 | FieldType::I32 | FieldType::U64 | FieldType::I64 | FieldType::F32 | FieldType::F64 | FieldType::Bool);
+                let actual_expr = if needs_deref { format!("*{fname}") } else { fname.clone() };
+                field_stmts.push_str(&gen_write_encode(fty, &actual_expr, w, types));
+            }
+            arms.push_str(&format!(
+                "{n}::{vn}({pats}) => {{ {w}.write_u64({disc}); {field_stmts} }} ",
+                vn=v.name, pats=ref_pats.join(", "),
+            ));
+        }
+    }
+    format!("match {expr} {{ {arms} }}")
+}
+
+fn gen_write_enum_return(e: &EnumDecl, expr: &str, w: &str, types: &[TypeDecl]) -> String {
+    let n = &e.name;
+    let mut arms = String::new();
+    for (i, v) in e.variants.iter().enumerate() {
+        let disc = i as u64;
+        if v.fields.is_empty() {
+            arms.push_str(&format!("{n}::{vn} => {{ {w}.write_u64({disc}); }} ", vn=v.name));
+        } else {
+            let fnames: Vec<String> = (0..v.fields.len()).map(|i| format!("__f{i}")).collect();
+            let mut field_stmts = String::new();
+            for (fty, fname) in v.fields.iter().zip(&fnames) {
+                field_stmts.push_str(&gen_write_return(fty, fname, w, types));
+            }
+            arms.push_str(&format!(
+                "{n}::{vn}({pats}) => {{ {w}.write_u64({disc}); {field_stmts} }} ",
+                vn=v.name, pats=fnames.join(", "),
+            ));
+        }
+    }
+    format!("match {expr} {{ {arms} }}")
+}
+
+fn gen_read_enum_decode(e: &EnumDecl, r: &str, types: &[TypeDecl]) -> String {
+    let n = &e.name;
+    let mut arms = String::new();
+    for (i, v) in e.variants.iter().enumerate() {
+        let disc = i as u64;
+        if v.fields.is_empty() {
+            arms.push_str(&format!("{disc} => {n}::{vn}, ", vn=v.name));
+        } else {
+            let fields: Vec<String> = v.fields.iter().map(|fty| gen_read_decode(fty, r, types)).collect();
+            arms.push_str(&format!("{disc} => {n}::{vn}({fields}), ", vn=v.name, fields=fields.join(", ")));
+        }
+    }
+    format!(
+        "match {r}.read_u64() {{ {arms} _ => panic!(\"invalid discriminant for {n}\") }}"
+    )
+}
+
+fn gen_read_enum_receive(e: &EnumDecl, r: &str, types: &[TypeDecl]) -> String {
+    let n = &e.name;
+    let mut arms = String::new();
+    for (i, v) in e.variants.iter().enumerate() {
+        let disc = i as u64;
+        if v.fields.is_empty() {
+            arms.push_str(&format!("{disc} => {n}::{vn}, ", vn=v.name));
+        } else {
+            let fields: Vec<String> = v.fields.iter().map(|fty| gen_read_receive(fty, r, types)).collect();
+            arms.push_str(&format!("{disc} => {n}::{vn}({fields}), ", vn=v.name, fields=fields.join(", ")));
+        }
+    }
+    format!(
+        "match {r}.read_u64() {{ {arms} _ => panic!(\"invalid discriminant for {n}\") }}"
+    )
+}
+
+/// Generate the Result<T, String> receive expression (host side).
+fn gen_read_result_receive(ret: &FieldType, r: &str, types: &[TypeDecl]) -> String {
+    let ok_recv = gen_read_receive(ret, r, types);
+    let err_recv = gen_read_receive(&FieldType::String, r, types);
+    format!(
+        "{{ let __tag = {r}.read_u64(); if __tag == 0 {{ Ok({ok_recv}) }} else {{ Err({err_recv}) }} }}"
+    )
+}
+
+/// Generate the inline write-to-out-slots epilogue.
+fn gen_write_out_epilogue(w: &str, out_slots: &str, out_capacity: &str) -> String {
+    format!(
+        "let __n = {w}.len(); if __n > {out_capacity} {{ return 2; }} if __n > 0 {{ unsafe {{ core::ptr::copy_nonoverlapping({w}.as_slice().as_ptr(), {out_slots}, __n); }} }} 0"
+    )
+}
+
+// ===========================================================================
 // gen_trait
 // ===========================================================================
 
@@ -180,16 +596,13 @@ fn gen_types(iface: &Interface) -> String {
                 if !s.fields.is_empty() {
                     out.push_str(&gen_struct_def(s));
                 }
-                out.push_str(&gen_boxed_slot_impls(&s.name));
                 out.push_str(&gen_struct_descriptor(&s.name));
             }
             TypeDecl::Enum(e) => {
                 out.push_str(&gen_enum_def(e));
-                out.push_str(&gen_enum_slot_impls(e));
                 out.push_str(&gen_enum_descriptor(e));
             }
             TypeDecl::Opaque(o) => {
-                out.push_str(&gen_boxed_slot_impls(&o.name));
                 out.push_str(&gen_struct_descriptor(&o.name));
             }
         }
@@ -223,35 +636,6 @@ fn gen_enum_def(e: &EnumDecl) -> String {
     out
 }
 
-/// Boxed-pointer slot impls — generated for DSL-declared structs/opaques.
-fn gen_boxed_slot_impls(name: &str) -> String {
-    format!(
-        r#"impl dynspire::slots::SlotEncode for {n} {{
-    fn encode(&self, w: &mut dynspire::slots::SlotWriter) {{
-        w.write_u64(self as *const Self as u64);
-    }}
-}}
-impl dynspire::slots::SlotDecode<'_> for {n} {{
-    unsafe fn decode(r: &mut dynspire::slots::SlotReader<'_>) -> Self {{
-        let ptr = r.read_u64() as *const Self;
-        (*ptr).clone()
-    }}
-}}
-impl dynspire::slots::SlotReturn for {n} {{
-    fn into_slots(self, w: &mut dynspire::slots::SlotWriter) {{
-        w.write_u64(Box::into_raw(Box::new(self)) as u64);
-    }}
-}}
-impl dynspire::slots::SlotReceive for {n} {{
-    unsafe fn from_slots(r: &mut dynspire::slots::SlotReader) -> Self {{
-        *Box::from_raw(r.read_u64() as *mut Self)
-    }}
-}}
-"#,
-        n = name,
-    )
-}
-
 fn gen_struct_descriptor(name: &str) -> String {
     format!(
         r#"#[doc(hidden)]
@@ -263,114 +647,6 @@ pub static __STRUCT_DESC_{n}: dynspire::ffi::StructDescriptor = dynspire::ffi::S
 "#,
         n = name,
         len = name.len(),
-    )
-}
-
-/// Enum slot impls — discriminant + fields, generated for DSL-declared enums.
-fn gen_enum_slot_impls(e: &EnumDecl) -> String {
-    let n = &e.name;
-    let discs: Vec<i64> = {
-        let mut d = Vec::new();
-        let mut next: i64 = 0;
-        for _ in &e.variants {
-            d.push(next);
-            next += 1;
-        }
-        d
-    };
-
-    // encode
-    let mut enc = String::new();
-    let mut dec = String::new();
-    let mut ret = String::new();
-    let mut recv = String::new();
-
-    for (v, &disc) in e.variants.iter().zip(&discs) {
-        if v.fields.is_empty() {
-            enc.push_str(&format!("        {n}::{vn} => {{ w.write_u64({d}); }}\n", n=n, vn=v.name, d=disc));
-            dec.push_str(&format!("            {d} => {n}::{vn},\n", d=disc, n=n, vn=v.name));
-            ret.push_str(&format!("        {n}::{vn} => {{ w.write_u64({d}); }}\n", n=n, vn=v.name, d=disc));
-            recv.push_str(&format!("            {d} => {n}::{vn},\n", d=disc, n=n, vn=v.name));
-        } else {
-            let fnames: Vec<String> = (0..v.fields.len())
-                .map(|i| format!("f{i}"))
-                .collect();
-            let ftypes: Vec<&FieldType> = v.fields.iter().collect();
-
-            // encode: Variant(ref f0, ref f1) => { w.write_u64(disc); <T0 as SlotEncode>::encode(f0, w); ... }
-            let ref_pats: Vec<String> = fnames.iter().map(|f| format!("ref {f}")).collect();
-            let enc_fields: Vec<String> = ftypes.iter().zip(fnames.iter())
-                .map(|(t, f)| format!("<{} as dynspire::slots::SlotEncode>::encode({}, w);", t.rust_type(), f))
-                .collect();
-            enc.push_str(&format!(
-                "        {n}::{vn}({pats}) => {{ w.write_u64({d}); {ef} }}\n",
-                n=n, vn=v.name, pats=ref_pats.join(", "), d=disc, ef=enc_fields.join(" "),
-            ));
-
-            // decode: disc => Variant(<T0 as SlotDecode>::decode(r), ...)
-            let dec_fields: Vec<String> = ftypes.iter()
-                .map(|t| format!("<{} as dynspire::slots::SlotDecode>::decode(r)", t.rust_type()))
-                .collect();
-            dec.push_str(&format!(
-                "            {d} => {n}::{vn}({df}),\n",
-                d=disc, n=n, vn=v.name, df=dec_fields.join(", "),
-            ));
-
-            // return: Variant(f0, f1) => { w.write_u64(disc); <T0 as SlotReturn>::into_slots(f0, w); ... }
-            let ret_fields: Vec<String> = ftypes.iter().zip(fnames.iter())
-                .map(|(t, f)| format!("<{} as dynspire::slots::SlotReturn>::into_slots({}, w);", t.rust_type(), f))
-                .collect();
-            ret.push_str(&format!(
-                "        {n}::{vn}({pats}) => {{ w.write_u64({d}); {rf} }}\n",
-                n=n, vn=v.name, pats=fnames.join(", "), d=disc, rf=ret_fields.join(" "),
-            ));
-
-            // receive: disc => Variant(<T0 as SlotReceive>::from_slots(r), ...)
-            let recv_fields: Vec<String> = ftypes.iter()
-                .map(|t| format!("<{} as dynspire::slots::SlotReceive>::from_slots(r)", t.rust_type()))
-                .collect();
-            recv.push_str(&format!(
-                "            {d} => {n}::{vn}({rf}),\n",
-                d=disc, n=n, vn=v.name, rf=recv_fields.join(", "),
-            ));
-        }
-    }
-
-    format!(
-        r#"impl dynspire::slots::SlotEncode for {n} {{
-    fn encode(&self, w: &mut dynspire::slots::SlotWriter) {{
-        match self {{
-{enc}        }}
-    }}
-}}
-impl dynspire::slots::SlotDecode<'_> for {n} {{
-    unsafe fn decode(r: &mut dynspire::slots::SlotReader<'_>) -> Self {{
-        match r.read_u64() {{
-{dec}            _ => panic!("invalid discriminant for {n}"),
-        }}
-    }}
-}}
-impl dynspire::slots::SlotReturn for {n} {{
-    fn into_slots(self, w: &mut dynspire::slots::SlotWriter) {{
-        match self {{
-{ret}        }}
-    }}
-}}
-impl dynspire::slots::SlotReceive for {n} {{
-    unsafe fn from_slots(r: &mut dynspire::slots::SlotReader) -> Self {{
-        match r.read_u64() {{
-{recv}            _ => panic!("invalid discriminant for {n}"),
-        }}
-    }}
-}}
-impl dynspire::slots::SlotEnumDescriptor for {n} {{
-    fn descriptor() -> &'static dynspire::ffi::EnumDescriptor {{
-        &__ENUM_DESC_{n}
-    }}
-}}
-
-"#,
-        n=n, enc=enc, dec=dec, ret=ret, recv=recv,
     )
 }
 
@@ -541,10 +817,9 @@ fn gen_schema(iface: &Interface) -> String {
             m.name, m.name.len(), ret=ret_idx,
         ));
 
+        let recv_expr = gen_read_receive(&m.return_type, "r", &iface.types);
         free_arms.push(format!(
-            "            {} => {{ let _: {} = dynspire::slots::SlotReceive::from_slots(&mut r); }}",
-            ret_idx,
-            m.return_type.rust_type(),
+            "            {ret_idx} => {{ let _ = {recv_expr}; }}",
         ));
     }
 
@@ -640,7 +915,12 @@ pub unsafe extern "C" fn dynspire_free(
     let mut r = dynspire::slots::SlotReader::new(slice);
     let tag = r.read_u64();
     if tag == 1 {{
-        let _: String = dynspire::slots::SlotReceive::from_slots(&mut r);
+        let _ = unsafe {{
+            let __ptr = r.read_u64() as *mut u8;
+            let __len = r.read_u64() as usize;
+            if __ptr.is_null() || __len == 0 {{ String::new() }}
+            else {{ String::from_utf8_unchecked(Box::from_raw(core::ptr::slice_from_raw_parts_mut(__ptr, __len)).into_vec()) }}
+        }};
         return;
     }}
     match type_index {{
@@ -673,6 +953,7 @@ fn gen_tower(iface: &Interface) -> String {
     let cn = client_name(iface);
     let tn = trait_name(iface);
     let opn = op_name(iface);
+    let types = &iface.types;
 
     let mut methods = String::new();
     for m in &iface.methods {
@@ -680,21 +961,26 @@ fn gen_tower(iface: &Interface) -> String {
             .chain(m.params.iter().map(|p| format!("{}: {}", p.name, p.ty.rust_type())))
             .collect();
 
-        let arg_names: Vec<String> = m.params.iter().map(|p| p.name.clone()).collect();
-        let args = match arg_names.len() {
-            0 => "()".to_string(),
-            1 => format!("({},)", arg_names[0]),
-            _ => format!("({})", arg_names.join(", ")),
-        };
+        let mut encode_stmts = String::new();
+        for p in &m.params {
+            encode_stmts.push_str(&gen_write_encode(&p.ty, &p.name, "__w", types));
+        }
+
+        let result_recv = gen_read_result_receive(&m.return_type, "__r", types);
 
         methods.push_str(&format!(
-            "    fn {}({}) -> Result<{}, String> {{\n        self.client.call({}::{}, {})\n    }}\n",
+            "    fn {}({}) -> Result<{}, String> {{\n\
+             let mut __w = dynspire::slots::SlotWriter::new();\n\
+             {encode_stmts}\
+             let mut __out = [0u64; dynspire::slots::MAX_OUT_SLOTS];\n\
+             self.client.dispatch({}::{} as usize, __w.as_slice(), &mut __out)?;\n\
+             let mut __r = dynspire::slots::SlotReader::new(&__out);\n\
+             {result_recv}\n    }}\n",
             m.name,
             params.join(", "),
             m.return_type.rust_type(),
             opn,
             pascal(&m.name),
-            args,
         ));
     }
 
@@ -725,6 +1011,7 @@ impl {tn} for {cn} {{
 fn gen_spier_macro(iface: &Interface) -> String {
     let mn = spier_macro_name(iface);
     let tn = trait_name(iface);
+    let types = &iface.types;
 
     let mut dispatch_fns = String::new();
 
@@ -735,18 +1022,29 @@ fn gen_spier_macro(iface: &Interface) -> String {
             String::new()
         } else {
             let mut block = String::from(
-                "            let in_data = if !in_slots.is_null() && in_count > 0 {\n                unsafe { core::slice::from_raw_parts(in_slots, in_count) }\n            } else { &[] };\n            let mut reader = dynspire::slots::SlotReader::new(in_data);\n",
+                "            let __in_data = if !in_slots.is_null() && in_count > 0 {\n                unsafe { core::slice::from_raw_parts(in_slots, in_count) }\n            } else { &[] };\n            let mut __r = dynspire::slots::SlotReader::new(__in_data);\n",
             );
             for p in &m.params {
+                let decode_expr = gen_read_decode(&p.ty, "__r", types);
                 block.push_str(&format!(
-                    "            let {}: {} = dynspire::slots::decode_param(&mut reader);\n",
+                    "            let {}: {} = {decode_expr};\n",
                     p.name, p.ty.rust_type(),
                 ));
             }
             block
         };
 
-        let null_check = "            if state_handle.is_null() {\n                return dynspire::slots::write_to_ffi(\n                    Err::<(), String>(\"null handle\".to_string()),\n                    out_slots, out_capacity,\n                );\n            }\n";
+        let null_check = "            if state_handle.is_null() {\n\
+                           let mut __w = dynspire::slots::SlotWriter::new();\n\
+                           __w.write_u64(1);\n\
+                           let __err = \"null handle\".to_string();\n\
+                           if __err.is_empty() { __w.write_u64(0); __w.write_u64(0); } else {\n\
+                           let __len = __err.len(); let __boxed = __err.into_bytes().into_boxed_slice();\n\
+                           let __ptr = __boxed.as_ptr() as usize; core::mem::forget(__boxed);\n\
+                           __w.write_u64(__ptr as u64); __w.write_u64(__len as u64); }\n\
+                           let __n = __w.len(); if __n > out_capacity { return 2; }\n\
+                           if __n > 0 { unsafe { core::ptr::copy_nonoverlapping(__w.as_slice().as_ptr(), out_slots, __n); } }\n\
+                           return 0; }\n";
 
         let state_cast = "            let state = &*(state_handle as *const $state);\n";
 
@@ -754,6 +1052,26 @@ fn gen_spier_macro(iface: &Interface) -> String {
             .chain(m.params.iter().map(|p| p.name.clone()))
             .collect();
         let call_args = format!("({})", param_names.join(", "));
+
+        let ok_return = gen_write_return(&m.return_type, "__v", "__w", types);
+        let err_return = gen_write_return(&FieldType::String, "__e", "__w", types);
+        let write_out = gen_write_out_epilogue("__w", "out_slots", "out_capacity");
+
+        let result_encode = if ok_return.is_empty() && m.return_type == FieldType::Unit {
+            format!(
+                "match _result {{\n\
+                 Ok(__v) => {{ __w.write_u64(0); }}\n\
+                 Err(__e) => {{ __w.write_u64(1); {err_return} }}\n\
+                 }}\n"
+            )
+        } else {
+            format!(
+                "match _result {{\n\
+                 Ok(__v) => {{ __w.write_u64(0); {ok_return} }}\n\
+                 Err(__e) => {{ __w.write_u64(1); {err_return} }}\n\
+                 }}\n"
+            )
+        };
 
         dispatch_fns.push_str(&format!(
             r#"        #[no_mangle]
@@ -765,7 +1083,8 @@ fn gen_spier_macro(iface: &Interface) -> String {
             out_capacity: usize,
         ) -> u8 {{
 {null_check}{state_cast}{decode}            let _result = <$state as $crate::{tn}>::{method}{call_args};
-            dynspire::slots::write_to_ffi(_result, out_slots, out_capacity)
+            let mut __w = dynspire::slots::SlotWriter::new();
+            {result_encode}            {write_out}
         }}
 "#,
             fn_name=fn_name,
@@ -1010,8 +1329,8 @@ mod tests {
         let code = generate(&iface);
         assert!(code.contains("pub struct CompressionReport"));
         assert!(code.contains("pub enum Tone"));
-        assert!(code.contains("SlotEncode for CompressionReport"));
-        assert!(code.contains("SlotEncode for Tone"));
+        assert!(!code.contains("impl dynspire::slots::SlotEncode for CompressionReport"), "no trait impls for DSL types");
+        assert!(!code.contains("impl dynspire::slots::SlotEncode for Tone"), "no trait impls for DSL types");
     }
 
     #[test]
@@ -1068,29 +1387,27 @@ mod tests {
         let code = generate(&iface);
         assert!(code.contains("__ENUM_DESC_Tone"));
         assert!(code.contains("EnumVariantDesc"));
-        assert!(code.contains("SlotEnumDescriptor for Tone"));
+        assert!(!code.contains("SlotEnumDescriptor for Tone"), "SlotEnumDescriptor trait impls removed");
     }
 
     #[test]
-    fn generated_code_dispatch_uses_correct_types() {
+    fn generated_code_dispatch_uses_inline_decode() {
         let iface = parse_rle();
         let code = generate(&iface);
-        // compress dispatch should decode &[u8]
-        assert!(code.contains("let data: &[u8] = dynspire::slots::decode_param"));
-        // delay dispatch should decode u64
-        assert!(code.contains("let ms: u64 = dynspire::slots::decode_param"));
+        assert!(!code.contains("dynspire::slots::decode_param"), "decode_param should not be used");
+        assert!(!code.contains("dynspire::slots::write_to_ffi"), "write_to_ffi should not be used");
+        assert!(code.contains("let mut __r = dynspire::slots::SlotReader::new(__in_data)"));
+        assert!(code.contains("let mut __w = dynspire::slots::SlotWriter::new()"));
     }
 
     #[test]
-    fn generated_code_tower_passes_correct_args() {
+    fn generated_code_tower_uses_inline_dispatch() {
         let iface = parse_rle();
         let code = generate(&iface);
-        // compress has 1 param: (data,)
-        assert!(code.contains("self.client.call(RleOp::Compress, (data,))"));
-        // compress_into has 2 params: (data, out)
-        assert!(code.contains("self.client.call(RleOp::CompressInto, (data, out))"));
-        // delay has 1 param: (ms,)
-        assert!(code.contains("self.client.call(RleOp::Delay, (ms,))"));
+        assert!(!code.contains("self.client.call("), "call() should not be used");
+        assert!(code.contains("self.client.dispatch("));
+        assert!(code.contains("let mut __w = dynspire::slots::SlotWriter::new()"));
+        assert!(code.contains("let mut __r = dynspire::slots::SlotReader::new(&__out)"));
     }
 
     #[test]
@@ -1261,7 +1578,7 @@ mod tests {
         parser::validate(&iface).unwrap();
 
         let code = generate(&iface);
-        assert!(code.contains("SlotEncode for SharedHandle"));
+        assert!(!code.contains("impl dynspire::slots::SlotEncode for SharedHandle"), "no trait impls for DSL types");
         assert!(code.contains("pub struct SharedConfig"));
         assert!(code.contains("pub enum SharedStatus"));
     }
