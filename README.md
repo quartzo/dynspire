@@ -109,6 +109,7 @@ The `.dspi` file declares one `interface` containing type declarations and metho
 | `Vec<T>` | `Vec<T>` | 2 | Owned. `T` can be any type: `Vec<u8>`, `Vec<String>`, `Vec<Vec<u8>>`, ... |
 | `Option<T>` | `Option<T>` | 1 + T | Tag + inner |
 | `(A, B, ...)` | `(A, B, ...)` | sum | **2–8 elements** (matches slot limit). Single-element `(X)` collapses to `X`. |
+| `[u8; N]` | `[u8; N]` | N/8 | Fixed-size byte array. **N must be a multiple of 8.** Runtime support: `N = 16`. |
 | Named type | same | 1 (boxed ptr) or disc+fields | Must be a declared struct/enum/opaque in the same interface |
 
 ### Syntax rules

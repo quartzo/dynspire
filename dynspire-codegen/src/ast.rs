@@ -110,6 +110,8 @@ pub enum FieldType {
     Option(Box<FieldType>),
     /// `(A, B, C)` — 2+ elements only.
     Tuple(Vec<FieldType>),
+    /// `[u8; N]` — fixed-size byte array.
+    Array(Box<FieldType>, usize),
     /// Reference to a declared type (struct, enum, or opaque).
     Named(String),
 }
@@ -140,6 +142,7 @@ impl FieldType {
                 let parts: Vec<String> = ts.iter().map(|t| t.canonical()).collect();
                 format!("({})", parts.join(","))
             }
+            FieldType::Array(inner, len) => format!("[{};{}]", inner.canonical(), len),
             FieldType::Named(n) => n.clone(),
         }
     }
@@ -169,6 +172,7 @@ impl FieldType {
                 let parts: Vec<String> = ts.iter().map(|t| t.rust_type()).collect();
                 format!("({})", parts.join(", "))
             }
+            FieldType::Array(inner, len) => format!("[{}; {}]", inner.rust_type(), len),
             FieldType::Named(n) => n.clone(),
         }
     }

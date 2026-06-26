@@ -36,6 +36,8 @@ pub enum TokenKind {
     Ident(String),
     // String literal (e.g. include paths)
     Str(String),
+    // Integer literal (e.g. array length)
+    Int(u64),
     Eof,
 }
 
@@ -64,6 +66,7 @@ impl TokenKind {
             TokenKind::Arrow => "`->`",
             TokenKind::Ident(_) => "identifier",
             TokenKind::Str(_) => "string literal",
+            TokenKind::Int(_) => "integer literal",
             TokenKind::Eof => "end of file",
         }
     }
@@ -207,6 +210,7 @@ impl<'a> Lexer<'a> {
                 TokenKind::Arrow
             }
             b'a'..=b'z' | b'A'..=b'Z' | b'_' => self.read_ident(),
+            b'0'..=b'9' => self.read_int()?,
             b'"' => self.read_string()?,
             _ => {
                 return Err(LexError {
@@ -272,6 +276,20 @@ impl<'a> Lexer<'a> {
             })?
             .to_string();
         Ok(TokenKind::Str(s))
+    }
+
+    fn read_int(&mut self) -> Result<TokenKind, LexError> {
+        let start = self.pos;
+        while self.peek().is_some_and(|b| b.is_ascii_digit()) {
+            self.advance();
+        }
+        let text = std::str::from_utf8(&self.src[start..self.pos]).unwrap();
+        let n = text.parse::<u64>().map_err(|_| LexError {
+            line: self.line,
+            col: self.col,
+            msg: format!("integer literal out of range: {text}"),
+        })?;
+        Ok(TokenKind::Int(n))
     }
 }
 
@@ -375,6 +393,20 @@ mod tests {
     fn test_newline_in_string() {
         let err = Lexer::new("\"bad\n\"").tokenize().unwrap_err();
         assert!(err.msg.contains("newline"));
+    }
+
+    #[test]
+    fn test_integer_literal() {
+        assert_eq!(
+            lex("0 16 255 1024"),
+            vec![
+                TokenKind::Int(0),
+                TokenKind::Int(16),
+                TokenKind::Int(255),
+                TokenKind::Int(1024),
+                TokenKind::Eof,
+            ],
+        );
     }
 
     #[test]

@@ -373,6 +373,35 @@ impl Parser {
         Ok(FieldType::Tuple(elems))
     }
 
+    fn parse_array_type(&mut self) -> Result<FieldType> {
+        self.eat(TokenKind::LBracket)?;
+        let inner = self.parse_type()?;
+        self.eat(TokenKind::Semicolon)?;
+        let len = match self.peek() {
+            TokenKind::Int(n) => {
+                let n = *n as usize;
+                self.advance();
+                n
+            }
+            other => {
+                return Err(self.err(format!(
+                    "expected integer for array length, found {}",
+                    other.kind_name(),
+                )));
+            }
+        };
+        self.eat(TokenKind::RBracket)?;
+        if len == 0 {
+            return Err(self.err("array length must be at least 1"));
+        }
+        if len % 8 != 0 {
+            return Err(self.err(format!(
+                "array length must be a multiple of 8 (slot alignment), got {len}"
+            )));
+        }
+        Ok(FieldType::Array(Box::new(inner), len))
+    }
+
     /// Resolve an identifier into a FieldType.
     /// Handles primitives, Vec<T>, Option<T>, String, and named types.
     fn type_from_ident(&self, name: &str) -> FieldType {
@@ -433,6 +462,11 @@ impl Parser {
         // Tuple / unit: ( ... )
         if *self.peek() == TokenKind::LParen {
             return self.parse_paren_type();
+        }
+
+        // Fixed-size array: [u8; N]
+        if *self.peek() == TokenKind::LBracket {
+            return self.parse_array_type();
         }
 
         let name = self.expect_ident()?;
@@ -572,7 +606,9 @@ fn check_named_types(ty: &FieldType, declared: &std::collections::HashSet<&str>)
             }
             Ok(())
         }
-        FieldType::Vec(inner) | FieldType::Option(inner) => check_named_types(inner, declared),
+        FieldType::Vec(inner) | FieldType::Option(inner) | FieldType::Array(inner, _) => {
+            check_named_types(inner, declared)
+        }
         FieldType::Tuple(elems) => {
             for e in elems {
                 check_named_types(e, declared)?;
@@ -933,5 +969,58 @@ interface Rle {
         let (types, includes) = parse_type_fragment("").unwrap();
         assert!(types.is_empty());
         assert!(includes.is_empty());
+    }
+
+    #[test]
+    fn test_array_type_param() {
+        let iface = parse("interface Foo { fn a(id: [u8; 16]) -> (); }").unwrap();
+        let m = &iface.methods[0];
+        assert_eq!(
+            m.params[0].ty,
+            FieldType::Array(Box::new(FieldType::U8), 16),
+        );
+    }
+
+    #[test]
+    fn test_array_type_return() {
+        let iface = parse("interface Foo { fn a() -> [u8; 16]; }").unwrap();
+        assert_eq!(
+            iface.methods[0].return_type,
+            FieldType::Array(Box::new(FieldType::U8), 16),
+        );
+    }
+
+    #[test]
+    fn test_array_type_in_struct() {
+        let iface = parse("interface Foo {
+            struct Bar { id: [u8; 16], }
+            fn a(b: Bar) -> ();
+        }").unwrap();
+        match &iface.types[0] {
+            TypeDecl::Struct(s) => assert_eq!(
+                s.fields[0].1,
+                FieldType::Array(Box::new(FieldType::U8), 16),
+            ),
+            other => panic!("expected Struct, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_array_canonical_sig() {
+        let iface = parse("interface Foo { fn a(id: [u8; 16]) -> [u8; 16]; }").unwrap();
+        let sig = iface.canonical_sig();
+        assert!(sig.contains("[u8;16]"));
+    }
+
+    #[test]
+    fn test_array_rejects_non_multiple_of_8() {
+        let err = parse("interface Foo { fn a(id: [u8; 10]) -> (); }").unwrap_err();
+        assert!(err.msg.contains("multiple of 8"));
+    }
+
+    #[test]
+    fn test_array_rejects_zero() {
+        let err = parse("interface Foo { fn a(id: [u8; 0]) -> (); }").unwrap_err();
+        assert!(err.msg.contains("at least 1"));
     }
 }

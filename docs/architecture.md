@@ -107,7 +107,7 @@ pub trait SlotReceive: Sized {
 |------|-------|----------|
 | `()`, `bool` | 0–1 | Unit = no slots. Bool = 0 or 1. |
 | `u8`..`u64`, `i8`..`i64`, `f64` | 1 | Cast to `u64` (floats via `to_bits`). |
-| `[u8; 16]` | 2 | Two `u64` (little-endian halves). |
+| `[u8; N]` | N/8 | Little-endian u64 halves. N must be a multiple of 8. Runtime support: N = 16. |
 | `&str`, `&[u8]`, `String`, `Vec<u8>` | 2 | `(ptr, len)` — zero-copy borrow for refs, clone for owned. |
 | `&mut Vec<u8>` | 1 | Raw pointer to the `Vec` struct. Spier writes directly into the caller's allocation. |
 | `Vec<T: Clone>` (input) | 2 | `(ptr, len)` borrow — spier clones elements from caller's memory. Works for any `T: Clone` including `Vec<String>`, `Vec<Vec<u8>>`, nested Vecs. Rust→Rust only; Python cannot construct Rust memory layouts. |

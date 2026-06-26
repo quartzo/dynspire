@@ -64,6 +64,10 @@ impl TypeTable {
                 let children: Vec<i32> = elems.iter().map(|e| self.add(e) as i32).collect();
                 mk("IDL_TUPLE", 0, &children)
             }
+            FieldType::Array(inner, len) => {
+                let child = self.add(inner) as i32;
+                mk("IDL_ARRAY", *len as u32, &[child])
+            }
             FieldType::Named(name) => {
                 if self.enum_indices.contains_key(name) {
                     let ei = self.enum_indices[name];
@@ -1095,6 +1099,16 @@ mod tests {
         let code1 = generate(&iface);
         let code2 = generate(&iface);
         assert_eq!(code1, code2);
+    }
+
+    #[test]
+    fn generated_code_array_type() {
+        let iface = parser::parse(
+            "interface Foo { fn a(id: [u8; 16]) -> [u8; 16]; }",
+        ).unwrap();
+        let code = generate(&iface);
+        assert!(code.contains("IDL_ARRAY"));
+        assert!(code.contains("fn a(&self, id: [u8; 16]) -> Result<[u8; 16], String>"));
     }
 
     // --- Include resolution tests ---

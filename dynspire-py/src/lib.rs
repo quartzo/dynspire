@@ -1386,7 +1386,29 @@ fn encode_value<'py>(
             }
             Ok(())
         }
-        // TODO: IDL_ARRAY inputs (fixed-size [T; N]).
+        IDL_ARRAY => {
+            let len = t._size as usize;
+            if len % 8 != 0 {
+                return Err(PyValueError::new_err(format!(
+                    "array length must be a multiple of 8, got {len}"
+                )));
+            }
+            let bytes: &[u8] = arg.extract::<&[u8]>().map_err(|_| {
+                PyTypeError::new_err(format!("expected bytes of length {len}"))
+            })?;
+            if bytes.len() != len {
+                return Err(PyValueError::new_err(format!(
+                    "expected {len} bytes, got {}",
+                    bytes.len()
+                )));
+            }
+            for chunk in bytes.chunks_exact(8) {
+                let mut arr = [0u8; 8];
+                arr.copy_from_slice(chunk);
+                w.write_u64(u64::from_le_bytes(arr));
+            }
+            Ok(())
+        }
         _ => Err(PyValueError::new_err(format!(
             "unsupported input type kind {}",
             t.kind
@@ -1529,7 +1551,16 @@ fn decode_value<'py>(
             };
             Ok(Bound::new(py, obj)?.into_any())
         }
-        // TODO: IDL_ARRAY returns.
+        IDL_ARRAY => {
+            let len = t._size as usize;
+            let slots = len / 8;
+            let mut bytes = Vec::with_capacity(len);
+            for _ in 0..slots {
+                let val = r.read_u64();
+                bytes.extend_from_slice(&val.to_le_bytes());
+            }
+            Ok(PyBytes::new(py, &bytes).into_any())
+        }
         _ => Err(PyValueError::new_err(format!(
             "unsupported return type kind {}",
             t.kind
