@@ -696,7 +696,7 @@ fn gen_tower(iface: &Interface) -> String {
 
     format!(
         r#"pub struct {cn} {{
-    pub client: dynspire::DynSpireClient,
+    client: dynspire::DynSpireClient,
 }}
 
 impl {cn} {{
@@ -935,6 +935,7 @@ mod tests {
         assert!(code.contains("pub struct DynSpireRle"));
         assert!(code.contains("impl RleEngine for DynSpireRle"));
         assert!(code.contains("DynSpireClient::connect"));
+        assert!(!code.contains("pub client:"), "client field must be private");
     }
 
     #[test]
