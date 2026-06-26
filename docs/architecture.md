@@ -43,7 +43,7 @@ DynSpire is a plugin architecture with three roles:
 │  Host (Rust binary or Python script)        │
 │                                             │
 │  DynSpireClient / SpierHandle               │
-│    .call(Op::Method, args)                  │
+│    .dispatch(Op, in_slots, out_slots)        │
 │    → SlotWriter encodes args as u64[]       │
 │    → dispatch via FFI                       │
 │    → SlotReader decodes response u64[]      │
@@ -71,35 +71,25 @@ DynSpire is a plugin architecture with three roles:
 
 The slot system is the core FFI calling convention. Every argument and return value is encoded as a flat array of `u64` values ("slots"). This avoids heap allocation on the FFI boundary and works with any C-compatible caller.
 
-### Direction: Input (Host → Spier)
+The codegen inlines all slot encoding and decoding directly into each method's tower wrapper (host side) and dispatch function (spier side), using only `SlotWriter::write_u64()` and `SlotReader::read_u64()`. There are no trait dispatch points — the generated code calls the slot primitives directly, which eliminates the duplicate-trait-impl problem when multiple interfaces share type fragments.
 
-The host encodes arguments using `SlotEncode`:
+### Core primitives
 
 ```rust
-pub trait SlotEncode {
-    fn encode(&self, w: &mut SlotWriter);
+pub struct SlotWriter { /* accumulates u64 values */ }
+impl SlotWriter {
+    pub fn write_u64(&mut self, val: u64);
+    pub fn as_slice(&self) -> &[u64];
+    pub fn len(&self) -> usize;
+}
+
+pub struct SlotReader<'a> { /* reads u64 values from a slice */ }
+impl<'a> SlotReader<'a> {
+    pub fn read_u64(&mut self) -> u64;
 }
 ```
 
-`SlotWriter` accumulates `u64` values into an inline array (up to `MAX_IN_SLOTS = 16`), spilling to heap only if exceeded.
-
-### Direction: Output (Spier → Host)
-
-The spier encodes the return value using `SlotReturn`:
-
-```rust
-pub trait SlotReturn: Sized {
-    fn into_slots(self, w: &mut SlotWriter);
-}
-```
-
-The host decodes using `SlotReceive`:
-
-```rust
-pub trait SlotReceive: Sized {
-    unsafe fn from_slots(r: &mut SlotReader) -> Self;
-}
-```
+`SlotWriter` accumulates `u64` values into an inline array (up to `MAX_IN_SLOTS = 16`), spilling to heap only if exceeded. `SlotReader` reads values sequentially from a slice. Both are used exclusively by generated code — no manual slot manipulation is needed.
 
 ### Supported Types
 
@@ -124,7 +114,7 @@ pub trait SlotReceive: Sized {
 - **Out-params via `&mut Vec<u8>`**: the host passes a raw pointer to its `Vec`. The spier pushes data into it. Changes are visible to the host immediately. This is the `IDL_OUT_VEC` pattern.
 - **Ownership transfer on returns**: `Vec<T>` is moved across the boundary via `Box::into_raw` / `forget` on the spier side, `Box::from_raw` on the host side. No copy.
 - **`Vec<T: Clone>` input**: the caller sends `(ptr, len)` pointing to its own heap memory. The spier clones elements via `slice::from_raw_parts(ptr, len).to_vec()`. Elements are never individually slot-encoded — always 2 slots regardless of count or element complexity. Rust→Rust only; Python callers serialize complex Vecs to `&[u8]`.
-- **`Result<T, String>` is universal**: every dispatch method returns `Result<T, String>`. The tag slot (0/1) distinguishes Ok from Err. The host's `call()` returns `Result<R, String>` — the outer layer is transport errors, the inner is the spier's application error.
+- **`Result<T, String>` is universal**: every dispatch method returns `Result<T, String>`. The tag slot (0/1) distinguishes Ok from Err. The generated tower wrapper decodes the tag and returns `Result<R, String>` — the outer layer is transport errors, the inner is the spier's application error.
 
 ---
 
@@ -232,7 +222,7 @@ The `build.rs` calls `dynspire_codegen::build("src/my.dspi")`, which writes `OUT
 | Output | Used by |
 |--------|---------|
 | `pub trait {Name}Engine: Send + Sync` | Spier + Host |
-| `pub struct {Type}` / `pub enum {Type}` + slot impls | Spier + Host |
+| `pub struct {Type}` / `pub enum {Type}` | Spier + Host |
 | `pub enum {Name}Op` + `impl SpierOp` | Host |
 | `pub const {NAME}_IDL_HASH: u64` | Spier + Host |
 | `pub static IDL: IdlDescriptor` | Host |
@@ -253,18 +243,46 @@ Symbol names are derived from the interface name:
 
 ### Codegen API
 
-The `dynspire-codegen` crate exposes three public functions:
+The `dynspire-codegen` crate exposes:
 
 ```rust
 // build.rs entry point — reads file, parses, generates, writes to OUT_DIR.
 // Emits cargo:rerun-if-changed for the .dspi file. Panics on error.
 pub fn build(dspi_path: &str);
 
+// Shared context for deduplicating types across multiple build() calls.
+// When two .dspi files include the same type fragment, BuildContext
+// skips the duplicate definition (same name + same canonical signature).
+// Conflicting types (same name, different content) are a hard error.
+pub struct BuildContext { /* ... */ }
+impl BuildContext {
+    pub fn new() -> Self;
+    pub fn build(&mut self, dspi_path: &str);
+}
+
 // AST → full Rust source string (for testing or custom build scripts).
 pub fn generate(iface: &Interface) -> String;
 
 // Source text → AST (for tooling, tests, IDE integration).
 pub fn parse(src: &str) -> Result<Interface, ParseError>;
+```
+
+**Single interface** — backward compatible:
+
+```rust
+// build.rs
+fn main() { dynspire_codegen::build("src/my.dspi"); }
+```
+
+**Multiple interfaces sharing types** — use `BuildContext`:
+
+```rust
+// build.rs
+fn main() {
+    let mut ctx = dynspire_codegen::BuildContext::new();
+    ctx.build("src/a.dspi");   // generates SharedHandle
+    ctx.build("src/b.dspi");   // skips SharedHandle (already emitted, same content)
+}
 ```
 
 The AST types (`Interface`, `Method`, `FieldType`, `TypeDecl`, etc.) are re-exported via `dynspire_codegen::ast::*`. The crate has no dependency on the `dynspire` runtime — generated code references `dynspire::*`, but the codegen itself only produces strings.
@@ -359,7 +377,7 @@ let result: Vec<u8> = client.compress(&input[..])?;
 4. Symbol resolution — loads `dynspire_dispatch_{method}` for each method
 5. Instance creation — calls `dynspire_create(config)`
 
-The `SpierOp` trait ensures `call()` only accepts the generated Op enum — raw integers are a compile-time error.
+The `SpierOp` trait ensures `dispatch()` only accepts the generated Op enum — raw integers are a compile-time error.
 
 ---
 

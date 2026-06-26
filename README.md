@@ -193,6 +193,21 @@ let result = client.do_thing(&input[..])?;
 
 The IDL hash is computed from the interface's canonical signature — both sides produce the same hash from the same `.dspi`, so `connect()` accepts the spier.
 
+### Multiple interfaces with shared types
+
+When a host needs to talk to multiple spiers that share type fragments, use `BuildContext` to deduplicate type definitions:
+
+```rust
+// build.rs
+fn main() {
+    let mut ctx = dynspire_codegen::BuildContext::new();
+    ctx.build("src/a.dspi");   // generates SharedHandle
+    ctx.build("src/b.dspi");   // skips SharedHandle (already emitted, same content)
+}
+```
+
+Types with the same name but different content are a hard error at codegen time.
+
 ### Shared IDL crate (optional convenience)
 
 For single-team projects, extract the `.dspi` + `build.rs` into a shared crate that both spier and host depend on. This prevents version skew by construction:
