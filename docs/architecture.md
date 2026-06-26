@@ -175,6 +175,8 @@ The `.dspi` file is the contract. `dynspire-codegen` parses it and generates all
 ### `.dspi` grammar
 
 ```
+include "shared_types.dspi";
+
 interface Rle {
   struct CompressionReport {
     original_size: u64,
@@ -194,6 +196,8 @@ interface Rle {
 }
 ```
 
+`include` directives appear before `interface` and import types from **type fragment** files — files containing only `struct`, `enum`, and `opaque struct` declarations (no `interface` wrapper, no `fn`). Included types are merged into the interface before hashing, so the IDL hash is automatically compositional. Paths resolve relative to the including file. Circular includes are an error; diamond includes (same fragment via different paths) are deduplicated.
+
 Return types are the `Ok` variant — `Result<_, String>` is implicit. The type grammar is a closed set:
 
 | DSL syntax | Rust | Slots | Type table node |
@@ -212,12 +216,13 @@ Return types are the `Ok` variant — `Result<_, String>` is implicit. The type 
 
 The parser enforces these constraints:
 
-- **Keywords**: `interface`, `struct`, `enum`, `opaque`, `fn`, `mut` — cannot be used as identifiers.
+- **Keywords**: `interface`, `struct`, `enum`, `opaque`, `fn`, `mut`, `include` — cannot be used as identifiers.
 - **Comments**: `//` line comments only. No `/* */` block comments.
 - **Interface**: exactly one per file. Must contain at least one method. Trailing tokens after the closing `}` are an error.
+- **Includes**: `include "path";` directives before `interface` import types from fragment files. Fragments contain only type declarations (no `fn` or `interface`). Paths resolve relative to the including file. Fragments can include other fragments (recursive). Circular includes are an error. Diamond includes are deduplicated. Conflict (same type name from different sources) is an error. Each included file triggers `cargo:rerun-if-changed`.
 - **Tuples**: 2–8 elements. Single-element parens `(X)` collapse to `X` (not a tuple).
 - **Borrow constraints**: `&[` accepts only `u8`; `&mut` accepts only `Vec<u8>`. Other borrow types are parse errors.
-- **Named type references**: every named type used in params, returns, struct fields, enum variants, or inside `Vec`/`Option`/`Tuple` must be declared in the same interface. Undeclared references are a parse error.
+- **Named type references**: every named type used in params, returns, struct fields, enum variants, or inside `Vec`/`Option`/`Tuple` must be declared in the same interface or included from a fragment. Undeclared references are a parse error.
 - **Trailing commas**: allowed in struct fields, enum variants, and tuple elements.
 
 ### Generated artifacts

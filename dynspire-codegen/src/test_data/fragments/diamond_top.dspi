@@ -1,0 +1,4 @@
+include "diamond_left.dspi";
+include "diamond_right.dspi";
+
+opaque struct DiamondTop;

@@ -17,6 +17,7 @@ pub enum TokenKind {
     Opaque,
     Fn,
     Mut,
+    Include,
     // Punctuation
     LBrace,
     RBrace,
@@ -33,6 +34,8 @@ pub enum TokenKind {
     Arrow,
     // Identifiers
     Ident(String),
+    // String literal (e.g. include paths)
+    Str(String),
     Eof,
 }
 
@@ -45,6 +48,7 @@ impl TokenKind {
             TokenKind::Opaque => "keyword `opaque`",
             TokenKind::Fn => "keyword `fn`",
             TokenKind::Mut => "keyword `mut`",
+            TokenKind::Include => "keyword `include`",
             TokenKind::LBrace => "`{`",
             TokenKind::RBrace => "`}`",
             TokenKind::LParen => "`(`",
@@ -59,6 +63,7 @@ impl TokenKind {
             TokenKind::Semicolon => "`;`",
             TokenKind::Arrow => "`->`",
             TokenKind::Ident(_) => "identifier",
+            TokenKind::Str(_) => "string literal",
             TokenKind::Eof => "end of file",
         }
     }
@@ -108,6 +113,7 @@ const KEYWORDS: &[(&str, TokenKind)] = &[
     ("opaque", TokenKind::Opaque),
     ("fn", TokenKind::Fn),
     ("mut", TokenKind::Mut),
+    ("include", TokenKind::Include),
 ];
 
 impl<'a> Lexer<'a> {
@@ -201,6 +207,7 @@ impl<'a> Lexer<'a> {
                 TokenKind::Arrow
             }
             b'a'..=b'z' | b'A'..=b'Z' | b'_' => self.read_ident(),
+            b'"' => self.read_string()?,
             _ => {
                 return Err(LexError {
                     line,
@@ -226,6 +233,45 @@ impl<'a> Lexer<'a> {
             }
         }
         TokenKind::Ident(text.to_string())
+    }
+
+    fn read_string(&mut self) -> Result<TokenKind, LexError> {
+        let line = self.line;
+        let col = self.col;
+        self.advance(); // consume opening "
+        let start = self.pos;
+        loop {
+            match self.peek() {
+                None => {
+                    return Err(LexError {
+                        line,
+                        col,
+                        msg: "unterminated string literal".into(),
+                    });
+                }
+                Some(b'\n') => {
+                    return Err(LexError {
+                        line,
+                        col,
+                        msg: "newline in string literal".into(),
+                    });
+                }
+                Some(b'"') => break,
+                Some(_) => {
+                    self.advance();
+                }
+            }
+        }
+        let end = self.pos;
+        self.advance(); // consume closing "
+        let s = std::str::from_utf8(&self.src[start..end])
+            .map_err(|_| LexError {
+                line,
+                col,
+                msg: "invalid UTF-8 in string literal".into(),
+            })?
+            .to_string();
+        Ok(TokenKind::Str(s))
     }
 }
 
@@ -261,10 +307,11 @@ mod tests {
     #[test]
     fn test_keywords() {
         assert_eq!(
-            lex("interface struct enum opaque fn mut"),
+            lex("interface struct enum opaque fn mut include"),
             vec![
                 TokenKind::Interface, TokenKind::Struct, TokenKind::Enum,
                 TokenKind::Opaque, TokenKind::Fn, TokenKind::Mut,
+                TokenKind::Include,
                 TokenKind::Eof,
             ]
         );
@@ -308,6 +355,26 @@ mod tests {
         assert!(err.msg.contains("unexpected character"));
         assert_eq!(err.line, 1);
         assert_eq!(err.col, 1);
+    }
+
+    #[test]
+    fn test_string_literal() {
+        assert_eq!(
+            lex(r#""hello.dspi""#),
+            vec![TokenKind::Str("hello.dspi".into()), TokenKind::Eof],
+        );
+    }
+
+    #[test]
+    fn test_unterminated_string() {
+        let err = Lexer::new(r#""unterminated"#).tokenize().unwrap_err();
+        assert!(err.msg.contains("unterminated"));
+    }
+
+    #[test]
+    fn test_newline_in_string() {
+        let err = Lexer::new("\"bad\n\"").tokenize().unwrap_err();
+        assert!(err.msg.contains("newline"));
     }
 
     #[test]

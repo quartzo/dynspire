@@ -14,6 +14,7 @@ use std::fmt;
 #[derive(Debug, Clone, PartialEq)]
 pub struct Interface {
     pub name: String,
+    pub includes: Vec<String>,
     pub types: Vec<TypeDecl>,
     pub methods: Vec<Method>,
 }

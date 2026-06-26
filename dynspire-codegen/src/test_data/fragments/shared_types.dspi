@@ -1,0 +1,11 @@
+opaque struct SharedHandle;
+
+struct SharedConfig {
+  path: String,
+  readonly: bool,
+}
+
+enum SharedStatus {
+  Ok,
+  Err(u32),
+}

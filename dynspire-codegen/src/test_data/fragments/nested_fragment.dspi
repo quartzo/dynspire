@@ -1,0 +1,3 @@
+include "shared_types.dspi";
+
+opaque struct WrapperHandle;

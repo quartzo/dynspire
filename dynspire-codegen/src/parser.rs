@@ -142,6 +142,29 @@ impl Parser {
 // ---------------------------------------------------------------------------
 
 impl Parser {
+    fn parse_includes(&mut self) -> Result<Vec<String>> {
+        let mut includes = Vec::new();
+        while *self.peek() == TokenKind::Include {
+            self.advance(); // consume 'include'
+            let path = match self.peek() {
+                TokenKind::Str(s) => {
+                    let s = s.clone();
+                    self.advance();
+                    s
+                }
+                other => {
+                    return Err(self.err(format!(
+                        "expected string literal after `include`, found {}",
+                        other.kind_name(),
+                    )));
+                }
+            };
+            self.eat(TokenKind::Semicolon)?;
+            includes.push(path);
+        }
+        Ok(includes)
+    }
+
     fn parse_interface(&mut self) -> Result<Interface> {
         self.eat(TokenKind::Interface)?;
         let name = self.expect_ident()?;
@@ -174,7 +197,7 @@ impl Parser {
             )));
         }
 
-        Ok(Interface { name, types, methods })
+        Ok(Interface { name, includes: Vec::new(), types, methods })
     }
 
     // --- Type declarations ---
@@ -437,6 +460,9 @@ impl Parser {
 // ---------------------------------------------------------------------------
 
 /// Parse a `.dspi` source string into an [`Interface`] AST.
+///
+/// Does **not** validate named type references — call [`validate`] after
+/// include resolution so that included types are visible.
 pub fn parse(src: &str) -> Result<Interface> {
     let tokens = Lexer::new(src)
         .tokenize()
@@ -447,17 +473,57 @@ pub fn parse(src: &str) -> Result<Interface> {
         })?;
 
     let mut parser = Parser::new(tokens);
-    let interface = parser.parse_interface()?;
+    let includes = parser.parse_includes()?;
+    let mut interface = parser.parse_interface()?;
+    interface.includes = includes;
 
     if !parser.at_eof() {
         return Err(parser.err("trailing tokens after interface definition"));
     }
 
-    validate(&interface)?;
     Ok(interface)
 }
 
-fn validate(iface: &Interface) -> Result<()> {
+/// Parse a type fragment file (no `interface` wrapper) into types and includes.
+///
+/// A fragment contains only `struct`, `enum`, and `opaque struct` declarations
+/// plus optional `include` directives. Method declarations are rejected.
+pub fn parse_type_fragment(src: &str) -> Result<(Vec<TypeDecl>, Vec<String>)> {
+    let tokens = Lexer::new(src)
+        .tokenize()
+        .map_err(|e| ParseError {
+            line: e.line,
+            col: e.col,
+            msg: e.msg,
+        })?;
+
+    let mut parser = Parser::new(tokens);
+    let includes = parser.parse_includes()?;
+
+    let mut types = Vec::new();
+    while !parser.at_eof() {
+        match parser.peek() {
+            TokenKind::Struct => types.push(parser.parse_struct()?),
+            TokenKind::Enum => types.push(parser.parse_enum()?),
+            TokenKind::Opaque => types.push(parser.parse_opaque()?),
+            TokenKind::Fn => {
+                return Err(parser.err(
+                    "method declarations (`fn`) are not allowed in type fragments",
+                ));
+            }
+            other => {
+                return Err(parser.err(format!(
+                    "expected type declaration in fragment, found {}",
+                    other.kind_name(),
+                )));
+            }
+        }
+    }
+
+    Ok((types, includes))
+}
+
+pub fn validate(iface: &Interface) -> Result<()> {
     let declared: std::collections::HashSet<&str> = iface.types.iter()
         .map(|t| match t {
             TypeDecl::Struct(s) => s.name.as_str(),
@@ -757,19 +823,22 @@ interface Rle {
 
     #[test]
     fn test_undeclared_type_in_return() {
-        let err = parse("interface Foo { fn a() -> MissingType; }").unwrap_err();
+        let iface = parse("interface Foo { fn a() -> MissingType; }").unwrap();
+        let err = validate(&iface).unwrap_err();
         assert!(err.msg.contains("undeclared type reference: MissingType"));
     }
 
     #[test]
     fn test_undeclared_type_in_param() {
-        let err = parse("interface Foo { fn a(x: MissingType) -> (); }").unwrap_err();
+        let iface = parse("interface Foo { fn a(x: MissingType) -> (); }").unwrap();
+        let err = validate(&iface).unwrap_err();
         assert!(err.msg.contains("undeclared type reference: MissingType"));
     }
 
     #[test]
     fn test_undeclared_type_in_vec() {
-        let err = parse("interface Foo { fn a() -> Vec<MissingType>; }").unwrap_err();
+        let iface = parse("interface Foo { fn a() -> Vec<MissingType>; }").unwrap();
+        let err = validate(&iface).unwrap_err();
         assert!(err.msg.contains("undeclared type reference: MissingType"));
     }
 
@@ -779,7 +848,8 @@ interface Rle {
             enum Bar { Variant(MissingType) }
             fn a() -> Bar;
         }";
-        let err = parse(src).unwrap_err();
+        let iface = parse(src).unwrap();
+        let err = validate(&iface).unwrap_err();
         assert!(err.msg.contains("undeclared type reference: MissingType"));
     }
 
@@ -789,6 +859,79 @@ interface Rle {
             enum Bar { A, B(u64) }
             fn a() -> Bar;
         }";
-        assert!(parse(src).is_ok());
+        let iface = parse(src).unwrap();
+        assert!(validate(&iface).is_ok());
+    }
+
+    #[test]
+    fn test_parse_includes() {
+        let src = r#"
+            include "types.dspi";
+            include "more.dspi";
+
+            interface Foo {
+                fn a() -> ();
+            }
+        "#;
+        let iface = parse(src).unwrap();
+        assert_eq!(iface.includes, vec!["types.dspi", "more.dspi"]);
+    }
+
+    #[test]
+    fn test_no_includes() {
+        let src = "interface Foo { fn a() -> (); }";
+        let iface = parse(src).unwrap();
+        assert!(iface.includes.is_empty());
+    }
+
+    #[test]
+    fn test_include_missing_string() {
+        let err = parse("include not_a_string;\ninterface Foo { fn a() -> (); }").unwrap_err();
+        assert!(err.msg.contains("expected string literal after `include`"));
+    }
+
+    #[test]
+    fn test_type_fragment_basic() {
+        let src = r#"
+            opaque struct Handle;
+            struct Config { path: String, }
+            enum Status { Ok, Err(u32), }
+        "#;
+        let (types, includes) = parse_type_fragment(src).unwrap();
+        assert_eq!(types.len(), 3);
+        assert!(includes.is_empty());
+    }
+
+    #[test]
+    fn test_type_fragment_with_includes() {
+        let src = r#"
+            include "nested.dspi";
+
+            opaque struct Handle;
+        "#;
+        let (types, includes) = parse_type_fragment(src).unwrap();
+        assert_eq!(types.len(), 1);
+        assert_eq!(includes, vec!["nested.dspi"]);
+    }
+
+    #[test]
+    fn test_type_fragment_rejects_methods() {
+        let src = "opaque struct Handle;\nfn do_stuff() -> ();";
+        let err = parse_type_fragment(src).unwrap_err();
+        assert!(err.msg.contains("not allowed in type fragments"));
+    }
+
+    #[test]
+    fn test_type_fragment_rejects_interface() {
+        let src = "interface Foo { fn a() -> (); }";
+        let err = parse_type_fragment(src).unwrap_err();
+        assert!(err.msg.contains("expected type declaration in fragment"));
+    }
+
+    #[test]
+    fn test_type_fragment_empty() {
+        let (types, includes) = parse_type_fragment("").unwrap();
+        assert!(types.is_empty());
+        assert!(includes.is_empty());
     }
 }

@@ -1,0 +1,6 @@
+include "fragments/shared_types.dspi";
+
+interface Demo {
+  fn open(config: SharedConfig) -> SharedHandle;
+  fn status(h: SharedHandle) -> SharedStatus;
+}

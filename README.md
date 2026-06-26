@@ -82,12 +82,13 @@ with load_spier("rle_spier", lib_dir="target/debug").create_handle() as h:
 
 ## DSL Reference
 
-The `.dspi` file declares one `interface` containing type declarations and method signatures. It is the single source of truth — `build.rs` generates all Rust code from it.
+The `.dspi` file declares one `interface` containing type declarations and method signatures. It is the single source of truth — `build.rs` generates all Rust code from it. Type declarations can be shared across interfaces via `include` directives that pull in **type fragment** files.
 
 ### Declarations
 
 | Declaration | Syntax | Notes |
 |-------------|--------|-------|
+| **Include** | `include "path.dspi";` | Imports types from a fragment file (no `interface` wrapper). Paths are relative to the including file. Placed before `interface`. |
 | **Struct** | `struct Name { field: Type, ... }` | Crosses FFI as a boxed pointer (1 slot). Trailing comma allowed. |
 | **Enum** | `enum Name { Variant, Variant(Type, ...), ... }` | Unit variants and tuple variants. Trailing comma allowed. |
 | **Opaque struct** | `opaque struct Name;` | No body — same FFI behavior as `struct` but no field access. Use for handles you only pass around. |
@@ -113,12 +114,13 @@ The `.dspi` file declares one `interface` containing type declarations and metho
 ### Syntax rules
 
 - Comments: `//` line comments only (no `/* */`)
-- Keywords: `interface`, `struct`, `enum`, `opaque`, `fn`, `mut`
+- Keywords: `interface`, `struct`, `enum`, `opaque`, `fn`, `mut`, `include`
 - Trailing commas: allowed in struct fields, enum variants, and tuples
 - Tuple arity: 2–8 elements
 - Borrow constraints: `&[` only accepts `u8`; `&mut` only accepts `Vec<u8>`
-- Named type references: must be declared in the same interface — undeclared types are a parse error
+- Named type references: must be declared in the same interface or included from a fragment — undeclared types are a parse error
 - The interface must have at least one method
+- Includes: `include "path";` directives appear before `interface`, import types from fragment files. Fragments contain only type declarations (no `fn`, no `interface`). Paths resolve relative to the including file. Circular includes are an error; diamond includes (same file via different paths) are deduplicated.
 
 ### Application errors
 

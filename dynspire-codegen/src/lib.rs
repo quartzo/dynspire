@@ -26,4 +26,4 @@ mod parser;
 
 pub use ast::*;
 pub use gen::{build, generate};
-pub use parser::{parse, ParseError};
+pub use parser::{parse, parse_type_fragment, validate, ParseError};

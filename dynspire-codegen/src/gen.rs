@@ -861,19 +861,121 @@ pub fn generate(iface: &Interface) -> String {
 
 /// Entry point for `build.rs`.
 ///
-/// Reads the `.dspi` file, generates Rust source, writes to `OUT_DIR`.
+/// Reads the `.dspi` file, resolves includes, validates, generates Rust
+/// source, and writes to `OUT_DIR`.
 pub fn build(dspi_path: &str) {
     let src = std::fs::read_to_string(dspi_path)
         .unwrap_or_else(|e| panic!("dynspire-codegen: failed to read {dspi_path}: {e}"));
-    let iface = parser::parse(&src)
+    let mut iface = parser::parse(&src)
         .unwrap_or_else(|e| panic!("dynspire-codegen: parse error in {dspi_path}: {e}"));
+
+    let base_dir = std::path::Path::new(dspi_path)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+
+    let mut rerun_paths = vec![dspi_path.to_string()];
+    let mut included_types = Vec::new();
+    let mut stack: Vec<std::path::PathBuf> = Vec::new();
+    let mut processed: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
+
+    resolve_includes(
+        &iface.includes,
+        base_dir,
+        &mut stack,
+        &mut processed,
+        &mut included_types,
+        &mut rerun_paths,
+    );
+
+    merge_types(&mut iface, included_types);
+
+    parser::validate(&iface)
+        .unwrap_or_else(|e| panic!("dynspire-codegen: validation error in {dspi_path}: {e}"));
+
     let code = generate(&iface);
     let out_dir = std::env::var("OUT_DIR")
         .expect("dynspire-codegen: OUT_DIR not set (must be called from build.rs)");
     let file_name = format!("{out_dir}/{}_idl.rs", iface.name.to_lowercase());
     std::fs::write(&file_name, &code)
         .unwrap_or_else(|e| panic!("dynspire-codegen: failed to write {file_name}: {e}"));
-    println!("cargo:rerun-if-changed={dspi_path}");
+
+    for path in &rerun_paths {
+        println!("cargo:rerun-if-changed={path}");
+    }
+}
+
+/// Recursively resolve `include` directives, collecting types from fragments.
+///
+/// - `stack` tracks the current include chain for cycle detection.
+/// - `processed` deduplicates files across the diamond (same file via
+///   different paths is only read once).
+fn resolve_includes(
+    includes: &[String],
+    base_dir: &std::path::Path,
+    stack: &mut Vec<std::path::PathBuf>,
+    processed: &mut std::collections::HashSet<std::path::PathBuf>,
+    collected: &mut Vec<crate::ast::TypeDecl>,
+    rerun_paths: &mut Vec<String>,
+) {
+    for inc_path in includes {
+        let full_path = base_dir.join(inc_path);
+        let canonical = full_path.canonicalize().unwrap_or_else(|e| {
+            panic!("dynspire-codegen: include file not found: {}: {e}", full_path.display())
+        });
+
+        if stack.contains(&canonical) {
+            panic!("dynspire-codegen: circular include detected: {}", canonical.display());
+        }
+        if !processed.insert(canonical.clone()) {
+            continue;
+        }
+
+        rerun_paths.push(full_path.to_string_lossy().into_owned());
+
+        let src = std::fs::read_to_string(&full_path)
+            .unwrap_or_else(|e| panic!("dynspire-codegen: failed to read include {}: {e}", full_path.display()));
+        let (types, sub_includes) = parser::parse_type_fragment(&src)
+            .unwrap_or_else(|e| panic!("dynspire-codegen: parse error in include {}: {e}", full_path.display()));
+
+        collected.extend(types);
+
+        stack.push(canonical);
+        let sub_base = full_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+        resolve_includes(&sub_includes, sub_base, stack, processed, collected, rerun_paths);
+        stack.pop();
+    }
+}
+
+/// Merge included types into the interface's types, checking for conflicts.
+///
+/// Included types are prepended (so they appear first in canonical_sig,
+/// keeping the hash deterministic). Conflicts — same name from two different
+/// sources — are hard errors.
+fn merge_types(iface: &mut crate::ast::Interface, included: Vec<crate::ast::TypeDecl>) {
+    use std::collections::HashSet;
+
+    let mut seen: HashSet<&str> = HashSet::new();
+    for ty in &included {
+        if !seen.insert(ty.name()) {
+            panic!(
+                "dynspire-codegen: conflicting type definitions: `{}` defined in multiple included files",
+                ty.name()
+            );
+        }
+    }
+
+    for local_ty in &iface.types {
+        if seen.contains(local_ty.name()) {
+            panic!(
+                "dynspire-codegen: type `{}` is both declared locally and included from a fragment",
+                local_ty.name()
+            );
+        }
+    }
+
+    let mut merged = included;
+    merged.extend(iface.types.drain(..));
+    iface.types = merged;
 }
 
 // ===========================================================================
@@ -993,5 +1095,160 @@ mod tests {
         let code1 = generate(&iface);
         let code2 = generate(&iface);
         assert_eq!(code1, code2);
+    }
+
+    // --- Include resolution tests ---
+
+    use std::path::{Path, PathBuf};
+    use std::collections::HashSet;
+
+    fn test_data_dir() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/test_data")
+    }
+
+    fn resolve_test(
+        includes: &[String],
+        base_dir: &Path,
+    ) -> (Vec<crate::ast::TypeDecl>, Vec<String>) {
+        let mut collected = Vec::new();
+        let mut rerun = Vec::new();
+        let mut stack = Vec::new();
+        let mut processed = HashSet::new();
+        resolve_includes(
+            includes,
+            base_dir,
+            &mut stack,
+            &mut processed,
+            &mut collected,
+            &mut rerun,
+        );
+        (collected, rerun)
+    }
+
+    #[test]
+    fn test_include_resolves_types() {
+        let base = test_data_dir();
+        let (types, _) = resolve_test(
+            &["fragments/shared_types.dspi".into()],
+            &base,
+        );
+        assert_eq!(types.len(), 3);
+        let names: Vec<&str> = types.iter().map(|t| t.name()).collect();
+        assert!(names.contains(&"SharedHandle"));
+        assert!(names.contains(&"SharedConfig"));
+        assert!(names.contains(&"SharedStatus"));
+    }
+
+    #[test]
+    fn test_include_nested() {
+        let base = test_data_dir();
+        // nested_fragment includes shared_types
+        let (types, _) = resolve_test(
+            &["fragments/nested_fragment.dspi".into()],
+            &base,
+        );
+        assert_eq!(types.len(), 4); // WrapperHandle + 3 shared
+        let names: Vec<&str> = types.iter().map(|t| t.name()).collect();
+        assert!(names.contains(&"WrapperHandle"));
+        assert!(names.contains(&"SharedHandle"));
+    }
+
+    #[test]
+    fn test_include_diamond() {
+        let base = test_data_dir();
+        let (types, _) = resolve_test(
+            &["fragments/diamond_top.dspi".into()],
+            &base,
+        );
+        // DiamondBottom should appear only once despite being included
+        // via both diamond_left and diamond_right
+        let bottom_count = types.iter().filter(|t| t.name() == "DiamondBottom").count();
+        assert_eq!(bottom_count, 1);
+        assert_eq!(types.len(), 4); // top + left + right + bottom(once)
+    }
+
+    #[test]
+    #[should_panic(expected = "circular include detected")]
+    fn test_include_cycle_detection() {
+        let base = test_data_dir();
+        resolve_test(
+            &["fragments/cycle_a.dspi".into()],
+            &base,
+        );
+    }
+
+    #[test]
+    fn test_include_hash_composition() {
+        let base = test_data_dir();
+        let (included_types, _) = resolve_test(
+            &["fragments/shared_types.dspi".into()],
+            &base,
+        );
+        let mut iface = parser::parse(
+            r#"include "fragments/shared_types.dspi";
+               interface Demo {
+                   fn open(config: SharedConfig) -> SharedHandle;
+               }"#,
+        ).unwrap();
+        merge_types(&mut iface, included_types);
+
+        let sig = iface.canonical_sig();
+        assert!(sig.contains("SharedHandle"));
+        assert!(sig.contains("SharedConfig"));
+        assert!(sig.contains("SharedStatus"));
+        assert_ne!(crate::ast::fnv1a_64(sig.as_bytes()), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "both declared locally and included")]
+    fn test_include_conflict_local() {
+        use crate::ast::{OpaqueDecl, TypeDecl};
+        let mut iface = crate::ast::Interface {
+            name: "Foo".into(),
+            includes: vec![],
+            types: vec![TypeDecl::Opaque(OpaqueDecl { name: "Dup".into() })],
+            methods: vec![],
+        };
+        let included = vec![TypeDecl::Opaque(OpaqueDecl { name: "Dup".into() })];
+        merge_types(&mut iface, included);
+    }
+
+    #[test]
+    #[should_panic(expected = "conflicting type definitions")]
+    fn test_include_conflict_between_includes() {
+        use crate::ast::{OpaqueDecl, TypeDecl};
+        let mut iface = crate::ast::Interface {
+            name: "Foo".into(),
+            includes: vec![],
+            types: vec![],
+            methods: vec![],
+        };
+        let included = vec![
+            TypeDecl::Opaque(OpaqueDecl { name: "Dup".into() }),
+            TypeDecl::Opaque(OpaqueDecl { name: "Dup".into() }),
+        ];
+        merge_types(&mut iface, included);
+    }
+
+    #[test]
+    fn test_include_generates_code_for_included_types() {
+        let base = test_data_dir();
+        let (included_types, _) = resolve_test(
+            &["fragments/shared_types.dspi".into()],
+            &base,
+        );
+        let mut iface = parser::parse(
+            r#"include "fragments/shared_types.dspi";
+               interface Demo {
+                   fn open(config: SharedConfig) -> SharedHandle;
+               }"#,
+        ).unwrap();
+        merge_types(&mut iface, included_types);
+        parser::validate(&iface).unwrap();
+
+        let code = generate(&iface);
+        assert!(code.contains("SlotEncode for SharedHandle"));
+        assert!(code.contains("pub struct SharedConfig"));
+        assert!(code.contains("pub enum SharedStatus"));
     }
 }

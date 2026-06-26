@@ -1,0 +1,3 @@
+include "cycle_b.dspi";
+
+opaque struct CycleA;
