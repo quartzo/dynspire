@@ -218,7 +218,7 @@ impl TypeDecl {
         }
     }
 
-    fn canonical(&self) -> String {
+    pub fn canonical(&self) -> String {
         match self {
             TypeDecl::Struct(s) => {
                 let fields: Vec<String> =

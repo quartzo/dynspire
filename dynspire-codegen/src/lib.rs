@@ -10,6 +10,16 @@
 //! }
 //! ```
 //!
+//! For multiple interfaces that share types, use [`BuildContext`] to deduplicate:
+//!
+//! ```ignore
+//! fn main() {
+//!     let mut ctx = dynspire_codegen::BuildContext::new();
+//!     ctx.build("src/a.dspi");
+//!     ctx.build("src/b.dspi"); // shared types from a.dspi are skipped
+//! }
+//! ```
+//!
 //! In your IDL crate's `lib.rs`:
 //!
 //! ```ignore
@@ -25,5 +35,5 @@ mod lexer;
 mod parser;
 
 pub use ast::*;
-pub use gen::{build, generate};
+pub use gen::{build, generate, BuildContext};
 pub use parser::{parse, parse_type_fragment, validate, ParseError};

@@ -10,6 +10,106 @@ use crate::parser;
 use std::collections::HashMap;
 
 // ===========================================================================
+// BuildContext — deduplication across multiple build() calls
+// ===========================================================================
+
+/// Shared context for deduplicating types across multiple [`build`](BuildContext::build) calls.
+///
+/// When two `.dspi` files include the same type fragment, the generated code
+/// would contain duplicate type definitions (e.g. `pub struct SharedHandle`).
+/// `BuildContext` tracks which types have already been emitted and skips
+/// definitions that are identical, or panics if they conflict.
+///
+/// ```ignore
+/// let mut ctx = dynspire_codegen::BuildContext::new();
+/// ctx.build("src/a.dspi");   // generates SharedHandle
+/// ctx.build("src/b.dspi");   // skips SharedHandle (already exists, same content)
+/// ```
+pub struct BuildContext {
+    seen: HashMap<String, String>,
+}
+
+impl BuildContext {
+    pub fn new() -> Self {
+        Self {
+            seen: HashMap::new(),
+        }
+    }
+
+    /// Check if a type has already been emitted. Returns `true` if it should be
+    /// skipped (already seen with matching canonical), panics on conflict.
+    fn check_or_register(&mut self, name: &str, canonical: &str) -> bool {
+        match self.seen.entry(name.to_string()) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(canonical.to_string());
+                false
+            }
+            std::collections::hash_map::Entry::Occupied(e) => {
+                if e.get() != canonical {
+                    panic!(
+                        "dynspire-codegen: conflicting type `{name}`: \
+                         previously defined as `{}`, now `{}`",
+                        e.get(),
+                        canonical,
+                    );
+                }
+                true
+            }
+        }
+    }
+
+    /// Read, parse, resolve includes, validate, generate, and write a `.dspi` file.
+    /// Types already emitted in previous calls are deduplicated.
+    pub fn build(&mut self, dspi_path: &str) {
+        let src = std::fs::read_to_string(dspi_path)
+            .unwrap_or_else(|e| panic!("dynspire-codegen: failed to read {dspi_path}: {e}"));
+        let mut iface = parser::parse(&src)
+            .unwrap_or_else(|e| panic!("dynspire-codegen: parse error in {dspi_path}: {e}"));
+
+        let base_dir = std::path::Path::new(dspi_path)
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+
+        let mut rerun_paths = vec![dspi_path.to_string()];
+        let mut included_types = Vec::new();
+        let mut stack: Vec<std::path::PathBuf> = Vec::new();
+        let mut processed: std::collections::HashSet<std::path::PathBuf> =
+            std::collections::HashSet::new();
+
+        resolve_includes(
+            &iface.includes,
+            base_dir,
+            &mut stack,
+            &mut processed,
+            &mut included_types,
+            &mut rerun_paths,
+        );
+
+        merge_types(&mut iface, included_types);
+
+        parser::validate(&iface)
+            .unwrap_or_else(|e| panic!("dynspire-codegen: validation error in {dspi_path}: {e}"));
+
+        let code = generate_with_ctx(&iface, self);
+        let out_dir = std::env::var("OUT_DIR")
+            .expect("dynspire-codegen: OUT_DIR not set (must be called from build.rs)");
+        let file_name = format!("{out_dir}/{}_idl.rs", iface.name.to_lowercase());
+        std::fs::write(&file_name, &code)
+            .unwrap_or_else(|e| panic!("dynspire-codegen: failed to write {file_name}: {e}"));
+
+        for path in &rerun_paths {
+            println!("cargo:rerun-if-changed={path}");
+        }
+    }
+}
+
+impl Default for BuildContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ===========================================================================
 // TypeTable — flat array of IdlTypeNode entries
 // ===========================================================================
 
@@ -587,10 +687,14 @@ fn gen_trait(iface: &Interface) -> String {
 // gen_types — struct/enum/opaque definitions + slot impls + descriptors
 // ===========================================================================
 
-fn gen_types(iface: &Interface) -> String {
+fn gen_types(iface: &Interface, ctx: &mut BuildContext) -> String {
     let mut out = String::new();
 
     for ty in &iface.types {
+        let canonical = ty.canonical();
+        if ctx.check_or_register(ty.name(), &canonical) {
+            continue;
+        }
         match ty {
             TypeDecl::Struct(s) => {
                 if !s.fields.is_empty() {
@@ -1157,6 +1261,10 @@ macro_rules! {mn} {{
 
 /// Generate a complete Rust source file from an [`Interface`] AST.
 pub fn generate(iface: &Interface) -> String {
+    generate_with_ctx(iface, &mut BuildContext::new())
+}
+
+fn generate_with_ctx(iface: &Interface, ctx: &mut BuildContext) -> String {
     let hash = fnv1a_64(iface.canonical_sig().as_bytes());
     let hcn = hash_const_name(iface);
 
@@ -1164,7 +1272,7 @@ pub fn generate(iface: &Interface) -> String {
     out.push_str("// Auto-generated by dynspire-codegen — do not edit.\n\n");
 
     out.push_str(&gen_trait(iface));
-    out.push_str(&gen_types(iface));
+    out.push_str(&gen_types(iface, ctx));
     out.push_str(&gen_op_enum(iface));
     out.push_str(&format!("pub const {}: u64 = {};\n\n", hcn, hash));
     out.push_str(&format!(
@@ -1186,45 +1294,12 @@ pub fn generate(iface: &Interface) -> String {
 ///
 /// Reads the `.dspi` file, resolves includes, validates, generates Rust
 /// source, and writes to `OUT_DIR`.
+///
+/// For multiple interfaces that may share types, use [`BuildContext::build`]
+/// instead to deduplicate type definitions.
 pub fn build(dspi_path: &str) {
-    let src = std::fs::read_to_string(dspi_path)
-        .unwrap_or_else(|e| panic!("dynspire-codegen: failed to read {dspi_path}: {e}"));
-    let mut iface = parser::parse(&src)
-        .unwrap_or_else(|e| panic!("dynspire-codegen: parse error in {dspi_path}: {e}"));
-
-    let base_dir = std::path::Path::new(dspi_path)
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."));
-
-    let mut rerun_paths = vec![dspi_path.to_string()];
-    let mut included_types = Vec::new();
-    let mut stack: Vec<std::path::PathBuf> = Vec::new();
-    let mut processed: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
-
-    resolve_includes(
-        &iface.includes,
-        base_dir,
-        &mut stack,
-        &mut processed,
-        &mut included_types,
-        &mut rerun_paths,
-    );
-
-    merge_types(&mut iface, included_types);
-
-    parser::validate(&iface)
-        .unwrap_or_else(|e| panic!("dynspire-codegen: validation error in {dspi_path}: {e}"));
-
-    let code = generate(&iface);
-    let out_dir = std::env::var("OUT_DIR")
-        .expect("dynspire-codegen: OUT_DIR not set (must be called from build.rs)");
-    let file_name = format!("{out_dir}/{}_idl.rs", iface.name.to_lowercase());
-    std::fs::write(&file_name, &code)
-        .unwrap_or_else(|e| panic!("dynspire-codegen: failed to write {file_name}: {e}"));
-
-    for path in &rerun_paths {
-        println!("cargo:rerun-if-changed={path}");
-    }
+    let mut ctx = BuildContext::new();
+    ctx.build(dspi_path);
 }
 
 /// Recursively resolve `include` directives, collecting types from fragments.
@@ -1581,5 +1656,100 @@ mod tests {
         assert!(!code.contains("impl dynspire::slots::SlotEncode for SharedHandle"), "no trait impls for DSL types");
         assert!(code.contains("pub struct SharedConfig"));
         assert!(code.contains("pub enum SharedStatus"));
+    }
+
+    // --- BuildContext deduplication tests ---
+
+    #[test]
+    fn test_ctx_dedup_skips_identical_type() {
+        let mut ctx = BuildContext::new();
+        let iface_a = parser::parse(
+            r#"interface A {
+                struct Pair { x: u64, y: u64, }
+                fn get() -> Pair;
+            }"#,
+        ).unwrap();
+        let code_a = generate_with_ctx(&iface_a, &mut ctx);
+        assert!(code_a.contains("pub struct Pair"));
+
+        let iface_b = parser::parse(
+            r#"interface B {
+                struct Pair { x: u64, y: u64, }
+                fn put(p: Pair) -> ();
+            }"#,
+        ).unwrap();
+        let code_b = generate_with_ctx(&iface_b, &mut ctx);
+        assert!(!code_b.contains("pub struct Pair"), "Pair should be skipped — already emitted");
+        assert!(code_b.contains("pub trait BEngine"), "B-specific code still generated");
+    }
+
+    #[test]
+    fn test_ctx_dedup_across_three_interfaces() {
+        let mut ctx = BuildContext::new();
+        let dspi = r#"struct Point { x: u64, y: u64, }"#;
+
+        for name in &["A", "B", "C"] {
+            let iface = parser::parse(&format!(
+                r#"interface {name} {{ {dspi} fn f() -> Point; }}"#
+            )).unwrap();
+            let code = generate_with_ctx(&iface, &mut ctx);
+            if *name == "A" {
+                assert!(code.contains("pub struct Point"));
+            } else {
+                assert!(!code.contains("pub struct Point"), "Point should be skipped in {name}");
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "conflicting type `Handle`")]
+    fn test_ctx_dedup_panics_on_conflict() {
+        let mut ctx = BuildContext::new();
+        let iface_a = parser::parse(
+            r#"interface A { struct Handle { id: u64, } fn f() -> Handle; }"#,
+        ).unwrap();
+        generate_with_ctx(&iface_a, &mut ctx);
+
+        let iface_b = parser::parse(
+            r#"interface B { struct Handle { name: String, } fn f() -> Handle; }"#,
+        ).unwrap();
+        generate_with_ctx(&iface_b, &mut ctx);
+    }
+
+    #[test]
+    fn test_ctx_dedup_skips_enum() {
+        let mut ctx = BuildContext::new();
+        let iface_a = parser::parse(
+            r#"interface A { enum Color { Red, Green, Blue, } fn f() -> Color; }"#,
+        ).unwrap();
+        let code_a = generate_with_ctx(&iface_a, &mut ctx);
+        assert!(code_a.contains("pub enum Color"));
+        assert!(code_a.contains("__ENUM_DESC_Color"));
+
+        let iface_b = parser::parse(
+            r#"interface B { enum Color { Red, Green, Blue, } fn f(c: Color) -> (); }"#,
+        ).unwrap();
+        let code_b = generate_with_ctx(&iface_b, &mut ctx);
+        assert!(!code_b.contains("pub enum Color"), "Color definition should be skipped");
+        assert!(!code_b.contains("__ENUM_TYPES_Color"), "enum sub-statics should be skipped");
+        assert!(!code_b.contains("__ENUM_VARIANTS_Color"), "enum sub-statics should be skipped");
+        assert!(code_b.contains("&__ENUM_DESC_Color"), "schema still references the descriptor from A's scope");
+    }
+
+    #[test]
+    fn test_ctx_dedup_skips_opaque() {
+        let mut ctx = BuildContext::new();
+        let iface_a = parser::parse(
+            r#"interface A { opaque struct Handle; fn f() -> Handle; }"#,
+        ).unwrap();
+        let code_a = generate_with_ctx(&iface_a, &mut ctx);
+        assert!(code_a.contains("__STRUCT_DESC_Handle"));
+
+        let iface_b = parser::parse(
+            r#"interface B { opaque struct Handle; fn f(h: Handle) -> (); }"#,
+        ).unwrap();
+        let code_b = generate_with_ctx(&iface_b, &mut ctx);
+        assert!(!code_b.contains("static __STRUCT_DESC_Handle"), "descriptor definition should be skipped");
+        assert!(code_b.contains("&__STRUCT_DESC_Handle"), "schema still references the descriptor from A's scope");
     }
 }
