@@ -5,9 +5,13 @@ edition = "2021"
 description = "DynSpire spier — RLE compression engine (cdylib, loaded via dlopen)"
 license = "MIT"
 
+build = "build.rs"
+
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
 dynspire = { path = "../../dynspire" }
-rle-idl = { path = "../rle-idl" }
+
+[build-dependencies]
+dynspire-codegen = { path = "../../dynspire-codegen" }

@@ -2,11 +2,19 @@
 //!
 //! ## Quick start
 //!
-//! In your IDL crate's `build.rs`:
+//! In your spier's `build.rs`:
 //!
 //! ```ignore
 //! fn main() {
-//!     dynspire_codegen::build("src/my_interface.dspi");
+//!     dynspire_codegen::build_spier("src/my_interface.dspi");
+//! }
+//! ```
+//!
+//! In your host's `build.rs` (pointing at the same `.dspi`):
+//!
+//! ```ignore
+//! fn main() {
+//!     dynspire_codegen::build_host("../my-spier/src/my_interface.dspi");
 //! }
 //! ```
 //!
@@ -15,19 +23,25 @@
 //! ```ignore
 //! fn main() {
 //!     let mut ctx = dynspire_codegen::BuildContext::new();
-//!     ctx.build("src/a.dspi");
-//!     ctx.build("src/b.dspi"); // shared types from a.dspi are skipped
+//!     ctx.build_spier("src/a.dspi");
+//!     ctx.build_spier("src/b.dspi"); // shared types from a.dspi are skipped
 //! }
 //! ```
 //!
-//! In your IDL crate's `lib.rs`:
+//! In your spier's `lib.rs`:
 //!
 //! ```ignore
-//! include!(concat!(env!("OUT_DIR"), "/my_idl.rs"));
+//! include!(concat!(env!("OUT_DIR"), "/my_spier.rs"));
 //! ```
 //!
-//! The generated code contains the trait, types, Op enum, schema, tower
-//! client wrapper, and spier dispatch macro.
+//! In your host's `lib.rs`:
+//!
+//! ```ignore
+//! include!(concat!(env!("OUT_DIR"), "/my_host.rs"));
+//! ```
+//!
+//! The spier side contains the trait, types, Op enum, hash, and spier dispatch macro.
+//! The host side contains the trait, types, Op enum, hash, IDL descriptor, and tower client.
 
 pub mod ast;
 mod gen;
@@ -35,5 +49,5 @@ mod lexer;
 mod parser;
 
 pub use ast::*;
-pub use gen::{build, generate, BuildContext};
+pub use gen::{build, build_spier, build_host, generate, generate_spier, generate_host, BuildContext};
 pub use parser::{parse, parse_type_fragment, validate, ParseError};

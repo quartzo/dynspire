@@ -1,6 +1,8 @@
+#![allow(non_upper_case_globals)]
+
 use std::collections::HashMap;
 
-use rle_idl::{impl_rle_spier, CompressionReport, RleEngine, Tone};
+include!(concat!(env!("OUT_DIR"), "/rle_spier.rs"));
 
 pub struct RleState;
 

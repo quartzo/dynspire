@@ -1,6 +1,8 @@
+#![allow(non_upper_case_globals)]
+
 use std::collections::HashMap;
 
-use rle_idl::{DynSpireRle, RleEngine};
+include!(concat!(env!("OUT_DIR"), "/rle_host.rs"));
 
 fn hex(bytes: &[u8]) -> String {
     bytes
@@ -21,7 +23,7 @@ fn main() {
 
     println!("=== DynSpire RLE Compression Demo ===");
     println!();
-    println!("  hash   : 0x{:016x}", rle_idl::RLE_IDL_HASH);
+    println!("  hash   : 0x{:016x}", RLE_IDL_HASH);
     println!("  input  : \"{}\" ({} bytes)", String::from_utf8_lossy(input), input.len());
     println!();
 
@@ -75,7 +77,7 @@ fn main() {
     // --- analyze: &[u8] -> Result<CompressionReport, String> ---
     // opaque struct crosses FFI as 1 slot (boxed pointer).
     // Rust host accesses fields natively — no serialization, no navigator.
-    let report: rle_idl::CompressionReport = client.analyze(&input[..]).expect("analyze failed");
+    let report: CompressionReport = client.analyze(&input[..]).expect("analyze failed");
     println!("analyze() -> CompressionReport (opaque box, 1 slot)");
     println!("  original_size  : {}", report.original_size);
     println!("  compressed_size: {}", report.compressed_size);

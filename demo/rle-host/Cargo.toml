@@ -5,9 +5,14 @@ edition = "2021"
 description = "Host binary — loads librle_spier.so at runtime and calls all IDL methods"
 license = "MIT"
 
+build = "build.rs"
+
 [[bin]]
 name = "rle-host"
 path = "src/main.rs"
 
 [dependencies]
-rle-idl = { path = "../rle-idl" }
+dynspire = { path = "../../dynspire" }
+
+[build-dependencies]
+dynspire-codegen = { path = "../../dynspire-codegen" }
