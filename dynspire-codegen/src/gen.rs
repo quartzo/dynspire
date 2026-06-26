@@ -700,15 +700,11 @@ fn gen_types(iface: &Interface, ctx: &mut BuildContext) -> String {
                 if !s.fields.is_empty() {
                     out.push_str(&gen_struct_def(s));
                 }
-                out.push_str(&gen_struct_descriptor(&s.name));
             }
             TypeDecl::Enum(e) => {
                 out.push_str(&gen_enum_def(e));
-                out.push_str(&gen_enum_descriptor(e));
             }
-            TypeDecl::Opaque(o) => {
-                out.push_str(&gen_struct_descriptor(&o.name));
-            }
+            TypeDecl::Opaque(_) => {}
         }
     }
     out
@@ -863,192 +859,6 @@ impl dynspire::SpierOp for {opn} {{
 // gen_schema — type table, method table, DynSpireIdl, dynspire_free
 // ===========================================================================
 
-fn gen_schema(iface: &Interface) -> String {
-    let hcn = hash_const_name(iface);
-    let mut tt = TypeTable::new();
-
-    // Populate enum indices
-    let mut enum_i = 0i32;
-    for ty in &iface.types {
-        if let TypeDecl::Enum(e) = ty {
-            tt.enum_indices.insert(e.name.clone(), enum_i);
-            enum_i += 1;
-        }
-    }
-    // Populate struct indices
-    let mut struct_i = 0i32;
-    for ty in &iface.types {
-        match ty {
-            TypeDecl::Struct(s) if !s.fields.is_empty() => {
-                tt.struct_indices.insert(s.name.clone(), struct_i);
-                struct_i += 1;
-            }
-            TypeDecl::Opaque(o) => {
-                tt.struct_indices.insert(o.name.clone(), struct_i);
-                struct_i += 1;
-            }
-            _ => {}
-        }
-    }
-
-    let enum_count = enum_i as usize;
-    let struct_count = struct_i as usize;
-
-    // Build method entries
-    let mut method_entries: Vec<String> = Vec::new();
-    let mut free_arms: Vec<String> = Vec::new();
-
-    for m in &iface.methods {
-        let mut param_entries: Vec<String> = Vec::new();
-        for p in &m.params {
-            let pidx = tt.add(&p.ty);
-            param_entries.push(format!(
-                "        dynspire::ffi::IdlParam {{ name: b\"{}\\0\".as_ptr(), name_len: {}, type_idx: {} }}",
-                p.name, p.name.len(), pidx,
-            ));
-        }
-        let ret_idx = tt.add(&m.return_type);
-        let pc = param_entries.len();
-
-        let params_field = if pc == 0 {
-            "params: core::ptr::null(), param_count: 0,".to_string()
-        } else {
-            format!("params: [{}].as_ptr(), param_count: {},", param_entries.join(", "), pc)
-        };
-
-        method_entries.push(format!(
-            "    dynspire::ffi::IdlMethod {{ name: b\"{}\\0\".as_ptr(), name_len: {}, {params_field} return_type_idx: {ret}, _pad: [0; 4] }},",
-            m.name, m.name.len(), ret=ret_idx,
-        ));
-
-        let recv_expr = gen_read_receive(&m.return_type, "r", &iface.types);
-        free_arms.push(format!(
-            "            {ret_idx} => {{ let _ = {recv_expr}; }}",
-        ));
-    }
-
-    let type_count = tt.nodes.len();
-    let method_count = method_entries.len();
-
-    // Collect enum descriptor pointers
-    let enum_names: Vec<String> = iface.types.iter()
-        .filter_map(|t| if let TypeDecl::Enum(e) = t { Some(e.name.clone()) } else { None })
-        .collect();
-    let enum_ptr_entries: Vec<String> = enum_names.iter()
-        .map(|n| format!("    &__ENUM_DESC_{n},"))
-        .collect();
-
-    // Collect struct descriptor pointers
-    let struct_names: Vec<String> = iface.types.iter()
-        .filter_map(|t| match t {
-            TypeDecl::Struct(s) if !s.fields.is_empty() => Some(s.name.clone()),
-            TypeDecl::Opaque(o) => Some(o.name.clone()),
-            _ => None,
-        })
-        .collect();
-    let struct_ptr_entries: Vec<String> = struct_names.iter()
-        .map(|n| format!("    &__STRUCT_DESC_{n},"))
-        .collect();
-
-    let enum_ptrs_init = if enum_count == 0 {
-        "core::ptr::null()".to_string()
-    } else {
-        format!("__IDL_ENUM_PTRS.as_ptr()", )
-    };
-    let struct_ptrs_init = if struct_count == 0 {
-        "core::ptr::null()".to_string()
-    } else {
-        "__IDL_STRUCT_PTRS.as_ptr()".to_string()
-    };
-
-    let enum_ptrs_static = if enum_count > 0 {
-        format!(
-            "#[doc(hidden)]\npub static __IDL_ENUM_PTRS: &[&'static dynspire::ffi::EnumDescriptor] = &[\n{}\n];\n\n",
-            enum_ptr_entries.join("\n"),
-        )
-    } else {
-        String::new()
-    };
-
-    let struct_ptrs_static = if struct_count > 0 {
-        format!(
-            "#[doc(hidden)]\npub static __IDL_STRUCT_PTRS: &[&'static dynspire::ffi::StructDescriptor] = &[\n{}\n];\n\n",
-            struct_ptr_entries.join("\n"),
-        )
-    } else {
-        String::new()
-    };
-
-    format!(
-        r#"{enum_ptrs}{struct_ptrs}
-#[doc(hidden)]
-pub static __IDL_TYPE_TABLE: &[dynspire::ffi::IdlTypeNode] = &[
-{tt}];
-
-#[doc(hidden)]
-pub static __IDL_METHODS: &[dynspire::ffi::IdlMethod] = &[
-{me}
-];
-
-pub static __IDL_SCHEMA: dynspire::ffi::DynSpireIdl = dynspire::ffi::DynSpireIdl {{
-    name: b"\0".as_ptr(),
-    name_len: 0,
-    hash: {hcn},
-    type_table: __IDL_TYPE_TABLE.as_ptr(),
-    type_count: {tc},
-    methods: __IDL_METHODS.as_ptr(),
-    method_count: {mc},
-    enum_table: {epi} as *const *const dynspire::ffi::EnumDescriptor,
-    enum_count: {ec},
-    struct_table: {spi} as *const *const dynspire::ffi::StructDescriptor,
-    struct_count: {sc},
-    free_fn: dynspire_free,
-}};
-
-pub fn idl_schema() -> &'static dynspire::ffi::DynSpireIdl {{
-    &__IDL_SCHEMA
-}}
-
-pub unsafe extern "C" fn dynspire_free(
-    type_index: u32,
-    slots: *const u64,
-    slot_count: usize,
-) {{
-    if slots.is_null() || slot_count == 0 {{ return; }}
-    let slice = core::slice::from_raw_parts(slots, slot_count);
-    let mut r = dynspire::slots::SlotReader::new(slice);
-    let tag = r.read_u64();
-    if tag == 1 {{
-        let _ = unsafe {{
-            let __ptr = r.read_u64() as *mut u8;
-            let __len = r.read_u64() as usize;
-            if __ptr.is_null() || __len == 0 {{ String::new() }}
-            else {{ String::from_utf8_unchecked(Box::from_raw(core::ptr::slice_from_raw_parts_mut(__ptr, __len)).into_vec()) }}
-        }};
-        return;
-    }}
-    match type_index {{
-{free}
-        _ => {{}}
-    }}
-}}
-
-"#,
-        enum_ptrs=enum_ptrs_static,
-        struct_ptrs=struct_ptrs_static,
-        tt=tt.emit(),
-        me=method_entries.join("\n"),
-        hcn=hcn,
-        tc=type_count,
-        mc=method_count,
-        epi=enum_ptrs_init,
-        ec=enum_count,
-        spi=struct_ptrs_init,
-        sc=struct_count,
-        free=free_arms.join("\n"),
-    )
-}
-
 // ===========================================================================
 // gen_tower — DynSpireRle client wrapper
 // ===========================================================================
@@ -1112,11 +922,198 @@ impl {tn} for {cn} {{
 // gen_spier_macro — macro_rules! for dispatch + storage
 // ===========================================================================
 
-fn gen_spier_macro(iface: &Interface) -> String {
+fn gen_spier_macro(iface: &Interface, hash: u64) -> String {
     let mn = spier_macro_name(iface);
     let tn = trait_name(iface);
     let types = &iface.types;
 
+    // --- Build type table and schema data (was gen_schema) ---
+    let mut tt = TypeTable::new();
+
+    let mut enum_i = 0i32;
+    for ty in &iface.types {
+        if let TypeDecl::Enum(e) = ty {
+            tt.enum_indices.insert(e.name.clone(), enum_i);
+            enum_i += 1;
+        }
+    }
+    let mut struct_i = 0i32;
+    for ty in &iface.types {
+        match ty {
+            TypeDecl::Struct(s) if !s.fields.is_empty() => {
+                tt.struct_indices.insert(s.name.clone(), struct_i);
+                struct_i += 1;
+            }
+            TypeDecl::Opaque(o) => {
+                tt.struct_indices.insert(o.name.clone(), struct_i);
+                struct_i += 1;
+            }
+            _ => {}
+        }
+    }
+
+    let enum_count = enum_i as usize;
+    let struct_count = struct_i as usize;
+
+    let mut method_entries: Vec<String> = Vec::new();
+    let mut free_arms: Vec<String> = Vec::new();
+
+    for m in &iface.methods {
+        let mut param_entries: Vec<String> = Vec::new();
+        for p in &m.params {
+            let pidx = tt.add(&p.ty);
+            param_entries.push(format!(
+                "        dynspire::ffi::IdlParam {{ name: b\"{}\\0\".as_ptr(), name_len: {}, type_idx: {} }}",
+                p.name, p.name.len(), pidx,
+            ));
+        }
+        let ret_idx = tt.add(&m.return_type);
+        let pc = param_entries.len();
+
+        let params_field = if pc == 0 {
+            "params: core::ptr::null(), param_count: 0,".to_string()
+        } else {
+            format!("params: [{}].as_ptr(), param_count: {},", param_entries.join(", "), pc)
+        };
+
+        method_entries.push(format!(
+            "    dynspire::ffi::IdlMethod {{ name: b\"{}\\0\".as_ptr(), name_len: {}, {params_field} return_type_idx: {ret}, _pad: [0; 4] }},",
+            m.name, m.name.len(), ret=ret_idx,
+        ));
+
+        let recv_expr = gen_read_receive(&m.return_type, "r", &iface.types);
+        free_arms.push(format!(
+            "            {ret_idx} => {{ let _ = {recv_expr}; }}",
+        ));
+    }
+
+    let type_count = tt.nodes.len();
+    let method_count = method_entries.len();
+
+    // Enum descriptor statics + pointer array
+    let mut descriptor_statics = String::new();
+    let mut enum_ptr_entries: Vec<String> = Vec::new();
+    for ty in &iface.types {
+        if let TypeDecl::Enum(e) = ty {
+            descriptor_statics.push_str(&gen_enum_descriptor(e));
+            enum_ptr_entries.push(format!("    &__ENUM_DESC_{},", e.name));
+        }
+    }
+
+    // Struct descriptor statics + pointer array
+    let mut struct_ptr_entries: Vec<String> = Vec::new();
+    for ty in &iface.types {
+        match ty {
+            TypeDecl::Struct(s) if !s.fields.is_empty() => {
+                descriptor_statics.push_str(&gen_struct_descriptor(&s.name));
+                struct_ptr_entries.push(format!("    &__STRUCT_DESC_{},", s.name));
+            }
+            TypeDecl::Opaque(o) => {
+                descriptor_statics.push_str(&gen_struct_descriptor(&o.name));
+                struct_ptr_entries.push(format!("    &__STRUCT_DESC_{},", o.name));
+            }
+            _ => {}
+        }
+    }
+
+    let enum_ptrs_init = if enum_count == 0 {
+        "core::ptr::null()".to_string()
+    } else {
+        "__IDL_ENUM_PTRS.as_ptr()".to_string()
+    };
+    let struct_ptrs_init = if struct_count == 0 {
+        "core::ptr::null()".to_string()
+    } else {
+        "__IDL_STRUCT_PTRS.as_ptr()".to_string()
+    };
+
+    let enum_ptrs_static = if enum_count > 0 {
+        format!(
+            "#[doc(hidden)]\nstatic __IDL_ENUM_PTRS: &[&'static dynspire::ffi::EnumDescriptor] = &[\n{}\n];\n\n",
+            enum_ptr_entries.join("\n"),
+        )
+    } else {
+        String::new()
+    };
+
+    let struct_ptrs_static = if struct_count > 0 {
+        format!(
+            "#[doc(hidden)]\nstatic __IDL_STRUCT_PTRS: &[&'static dynspire::ffi::StructDescriptor] = &[\n{}\n];\n\n",
+            struct_ptr_entries.join("\n"),
+        )
+    } else {
+        String::new()
+    };
+
+    let schema_block = format!(
+        r#"{descriptor_statics}{enum_ptrs}{struct_ptrs}#[doc(hidden)]
+static __IDL_TYPE_TABLE: &[dynspire::ffi::IdlTypeNode] = &[
+{tt}];
+
+#[doc(hidden)]
+static __IDL_METHODS: &[dynspire::ffi::IdlMethod] = &[
+{me}
+];
+
+static __IDL_SCHEMA: dynspire::ffi::DynSpireIdl = dynspire::ffi::DynSpireIdl {{
+    name: b"\0".as_ptr(),
+    name_len: 0,
+    hash: {hash},
+    type_table: __IDL_TYPE_TABLE.as_ptr(),
+    type_count: {tc},
+    methods: __IDL_METHODS.as_ptr(),
+    method_count: {mc},
+    enum_table: {epi} as *const *const dynspire::ffi::EnumDescriptor,
+    enum_count: {ec},
+    struct_table: {spi} as *const *const dynspire::ffi::StructDescriptor,
+    struct_count: {sc},
+    free_fn: dynspire_free,
+}};
+
+fn idl_schema() -> &'static dynspire::ffi::DynSpireIdl {{
+    &__IDL_SCHEMA
+}}
+
+unsafe extern "C" fn dynspire_free(
+    type_index: u32,
+    slots: *const u64,
+    slot_count: usize,
+) {{
+    if slots.is_null() || slot_count == 0 {{ return; }}
+    let slice = core::slice::from_raw_parts(slots, slot_count);
+    let mut r = dynspire::slots::SlotReader::new(slice);
+    let tag = r.read_u64();
+    if tag == 1 {{
+        let _ = unsafe {{
+            let __ptr = r.read_u64() as *mut u8;
+            let __len = r.read_u64() as usize;
+            if __ptr.is_null() || __len == 0 {{ String::new() }}
+            else {{ String::from_utf8_unchecked(Box::from_raw(core::ptr::slice_from_raw_parts_mut(__ptr, __len)).into_vec()) }}
+        }};
+        return;
+    }}
+    match type_index {{
+{free}
+        _ => {{}}
+    }}
+}}
+"#,
+        descriptor_statics=descriptor_statics,
+        enum_ptrs=enum_ptrs_static,
+        struct_ptrs=struct_ptrs_static,
+        tt=tt.emit(),
+        me=method_entries.join("\n"),
+        hash=hash,
+        tc=type_count,
+        mc=method_count,
+        epi=enum_ptrs_init,
+        ec=enum_count,
+        spi=struct_ptrs_init,
+        sc=struct_count,
+        free=free_arms.join("\n"),
+    );
+
+    // --- Dispatch functions ---
     let mut dispatch_fns = String::new();
 
     for m in &iface.methods {
@@ -1205,6 +1202,7 @@ fn gen_spier_macro(iface: &Interface) -> String {
         r#"#[macro_export]
 macro_rules! {mn} {{
     ($state:ty, $init:path, $name:literal) => {{
+{schema}
 {dispatch}
         #[no_mangle]
         pub extern "C" fn dynspire_create(
@@ -1235,7 +1233,7 @@ macro_rules! {mn} {{
 
         #[no_mangle]
         pub extern "C" fn dynspire_idl_hash() -> u64 {{
-            $crate::idl_schema().hash
+            idl_schema().hash
         }}
 
         #[no_mangle]
@@ -1245,12 +1243,13 @@ macro_rules! {mn} {{
 
         #[no_mangle]
         pub extern "C" fn dynspire_idl_schema() -> *const dynspire::ffi::DynSpireIdl {{
-            $crate::idl_schema()
+            idl_schema()
         }}
     }};
 }}
 "#,
         mn=mn,
+        schema=schema_block,
         dispatch=dispatch_fns,
     )
 }
@@ -1283,9 +1282,8 @@ fn generate_with_ctx(iface: &Interface, ctx: &mut BuildContext) -> String {
             .collect::<Vec<_>>()
             .join(", "),
     ));
-    out.push_str(&gen_schema(iface));
     out.push_str(&gen_tower(iface));
-    out.push_str(&gen_spier_macro(iface));
+    out.push_str(&gen_spier_macro(iface, hash));
 
     out
 }
@@ -1731,9 +1729,7 @@ mod tests {
         ).unwrap();
         let code_b = generate_with_ctx(&iface_b, &mut ctx);
         assert!(!code_b.contains("pub enum Color"), "Color definition should be skipped");
-        assert!(!code_b.contains("__ENUM_TYPES_Color"), "enum sub-statics should be skipped");
-        assert!(!code_b.contains("__ENUM_VARIANTS_Color"), "enum sub-statics should be skipped");
-        assert!(code_b.contains("&__ENUM_DESC_Color"), "schema still references the descriptor from A's scope");
+        assert!(code_b.contains("__ENUM_DESC_Color"), "each spier macro has its own descriptors");
     }
 
     #[test]
@@ -1749,7 +1745,6 @@ mod tests {
             r#"interface B { opaque struct Handle; fn f(h: Handle) -> (); }"#,
         ).unwrap();
         let code_b = generate_with_ctx(&iface_b, &mut ctx);
-        assert!(!code_b.contains("static __STRUCT_DESC_Handle"), "descriptor definition should be skipped");
-        assert!(code_b.contains("&__STRUCT_DESC_Handle"), "schema still references the descriptor from A's scope");
+        assert!(code_b.contains("__STRUCT_DESC_Handle"), "each spier macro has its own descriptors");
     }
 }
