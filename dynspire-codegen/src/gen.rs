@@ -1352,21 +1352,6 @@ fn generate_host_suffix(iface: &Interface) -> String {
 ///
 /// For multiple interfaces that may share types, use [`BuildContext::build`]
 /// instead to deduplicate type definitions.
-pub fn build(dspi_path: &str) {
-    let mut ctx = BuildContext::new();
-    ctx.build(dspi_path);
-}
-
-pub fn build_spier(dspi_path: &str) {
-    let mut ctx = BuildContext::new();
-    ctx.build_spier(dspi_path);
-}
-
-pub fn build_host(dspi_path: &str) {
-    let mut ctx = BuildContext::new();
-    ctx.build_host(dspi_path);
-}
-
 /// Recursively resolve `include` directives, collecting types from fragments.
 ///
 /// - `stack` tracks the current include chain for cycle detection.

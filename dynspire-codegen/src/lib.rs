@@ -6,7 +6,8 @@
 //!
 //! ```ignore
 //! fn main() {
-//!     dynspire_codegen::build_spier("src/my_interface.dspi");
+//!     let mut ctx = dynspire_codegen::BuildContext::new();
+//!     ctx.build_spier("src/my_interface.dspi");
 //! }
 //! ```
 //!
@@ -14,11 +15,12 @@
 //!
 //! ```ignore
 //! fn main() {
-//!     dynspire_codegen::build_host("../my-spier/src/my_interface.dspi");
+//!     let mut ctx = dynspire_codegen::BuildContext::new();
+//!     ctx.build_host("../my-spier/src/my_interface.dspi");
 //! }
 //! ```
 //!
-//! For multiple interfaces that share types, use [`BuildContext`] to deduplicate:
+//! For multiple interfaces that share types:
 //!
 //! ```ignore
 //! fn main() {
@@ -49,5 +51,5 @@ mod lexer;
 mod parser;
 
 pub use ast::*;
-pub use gen::{build, build_spier, build_host, generate, generate_spier, generate_host, BuildContext};
+pub use gen::{generate, generate_spier, generate_host, BuildContext};
 pub use parser::{parse, parse_type_fragment, validate, ParseError};

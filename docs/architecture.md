@@ -257,13 +257,19 @@ The `dynspire-codegen` crate exposes:
 ```rust
 // Spier side — reads file, parses, generates spier code, writes to OUT_DIR.
 // Emits cargo:rerun-if-changed for the .dspi file. Panics on error.
-pub fn build_spier(dspi_path: &str);
+impl BuildContext {
+    pub fn build_spier(&mut self, dspi_path: &str);
+}
 
 // Host side — same, but generates host code (IDL + tower, no spier macro).
-pub fn build_host(dspi_path: &str);
+impl BuildContext {
+    pub fn build_host(&mut self, dspi_path: &str);
+}
 
 // Legacy — generates both sides in a single file (backward compatible).
-pub fn build(dspi_path: &str);
+impl BuildContext {
+    pub fn build(&mut self, dspi_path: &str);
+}
 
 // Shared context for deduplicating types across multiple build calls.
 // When two .dspi files include the same type fragment, BuildContext
@@ -277,11 +283,6 @@ impl BuildContext {
     pub fn build_host(&mut self, dspi_path: &str);     // host side only
 }
 
-// AST → Rust source string (for testing or custom build scripts).
-pub fn generate(iface: &Interface) -> String;           // both sides
-pub fn generate_spier(iface: &Interface) -> String;     // spier side only
-pub fn generate_host(iface: &Interface) -> String;      // host side only
-
 // Source text → AST (for tooling, tests, IDE integration).
 pub fn parse(src: &str) -> Result<Interface, ParseError>;
 ```
@@ -290,14 +291,20 @@ pub fn parse(src: &str) -> Result<Interface, ParseError>;
 
 ```rust
 // build.rs
-fn main() { dynspire_codegen::build_spier("src/my.dspi"); }
+fn main() {
+    let mut ctx = dynspire_codegen::BuildContext::new();
+    ctx.build_spier("src/my.dspi");
+}
 ```
 
 **Host crate** — compiles the same `.dspi` by path:
 
 ```rust
 // build.rs
-fn main() { dynspire_codegen::build_host("../my-spier/src/my.dspi"); }
+fn main() {
+    let mut ctx = dynspire_codegen::BuildContext::new();
+    ctx.build_host("../my-spier/src/my.dspi");
+}
 ```
 
 **Multiple interfaces sharing types** — use `BuildContext`:

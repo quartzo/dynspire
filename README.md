@@ -155,7 +155,10 @@ my-spier/                 my-host/
 
 ```rust
 // build.rs
-fn main() { dynspire_codegen::build_spier("src/my.dspi"); }
+fn main() {
+    let mut ctx = dynspire_codegen::BuildContext::new();
+    ctx.build_spier("src/my.dspi");
+}
 ```
 ```rust
 // lib.rs — include the generated spier code
@@ -179,7 +182,10 @@ impl_my_spier!(MyState, init, "my");
 
 ```rust
 // build.rs
-fn main() { dynspire_codegen::build_host("../my-spier/src/my.dspi"); }
+fn main() {
+    let mut ctx = dynspire_codegen::BuildContext::new();
+    ctx.build_host("../my-spier/src/my.dspi");
+}
 ```
 ```rust
 // main.rs — include the generated host code
