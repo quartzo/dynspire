@@ -26,17 +26,15 @@ DynSpire is a plugin architecture with three roles:
 
 | Role | Who | What |
 |------|-----|------|
-| **IDL** | `.dspi` file | A `.dspi` file is the single source of truth. `build.rs` invokes `dynspire_codegen::build()` to generate the trait, types, Op enum, IDL hash, type table, schema, tower client wrapper, and spier dispatch macro. |
-| **Spier** | `cdylib` crate | Compiles the `.dspi` independently. Implements the generated trait. Invokes `impl_{name}_spier!($state, init, "name")` — a generated `macro_rules!` that produces all C-ABI entry points (`dynspire_create`, `dynspire_dispatch_{method}`, `dynspire_destroy`, etc.). No proc macros. |
-| **Host** | Binary or script | Compiles the same `.dspi` independently (or depends on a shared IDL crate — see below). Uses the generated `DynSpire{Name}` client wrapper directly. One import, no boilerplate. Python hosts skip codegen entirely and read the schema at runtime. |
+| **IDL** | `.dspi` file | A `.dspi` file is the single source of truth. The spier crate owns the `.dspi` and calls `build_spier()` in its `build.rs`. The host crate compiles the same `.dspi` by path and calls `build_host()`. Each side gets only the code it needs. |
+| **Spier** | `cdylib` crate | Owns the `.dspi`. Calls `dynspire_codegen::build_spier("src/my.dspi")` in `build.rs`. Implements the generated trait. Invokes `impl_{name}_spier!($state, init, "name")` — a generated `macro_rules!` that produces all C-ABI entry points (`dynspire_create`, `dynspire_dispatch_{method}`, `dynspire_destroy`, etc.) and the IDL schema. No proc macros. |
+| **Host** | Binary or script | Compiles the same `.dspi` by path. Calls `dynspire_codegen::build_host("../my-spier/src/my.dspi")` in `build.rs`. Uses the generated `DynSpire{Name}` client wrapper directly. One import, no boilerplate. Python hosts skip codegen entirely and read the schema at runtime. |
 
 > **The IDL hash is the contract, not the crate dependency.** The spier and host
 > can each compile the `.dspi` independently — both sides produce the same hash
-> from the same interface signature, so `connect()` accepts the spier. A shared
-> IDL crate is a convenience (prevents version skew by construction), not a
-> requirement. The FFI boundary uses raw pointers and slots, never Rust type
-> identity, so independently-compiled types from the same `.dspi` are
-> layout-compatible.
+> from the same interface signature, so `connect()` accepts the spier. The FFI
+> boundary uses raw pointers and slots, never Rust type identity, so
+> independently-compiled types from the same `.dspi` are layout-compatible.
 
 ```
 ┌─────────────────────────────────────────────┐
@@ -217,18 +215,28 @@ The parser enforces these constraints:
 
 ### Generated artifacts
 
-The `build.rs` calls `dynspire_codegen::build("src/my.dspi")`, which writes `OUT_DIR/my_idl.rs`. This single file contains:
+The spier and host each compile the `.dspi` with a different `build.rs` entry point. Each side gets only the code it needs:
+
+**Spier side** — `dynspire_codegen::build_spier("src/my.dspi")` writes `OUT_DIR/my_spier.rs`:
 
 | Output | Used by |
 |--------|---------|
-| `pub trait {Name}Engine: Send + Sync` | Spier + Host |
-| `pub struct {Type}` / `pub enum {Type}` | Spier + Host |
+| `pub trait {Name}Engine: Send + Sync` | Spier (implement) |
+| `pub struct {Type}` / `pub enum {Type}` | Spier |
+| `pub enum {Name}Op` | Spier (dispatch index) |
+| `pub const {NAME}_IDL_HASH: u64` | Spier |
+| `#[macro_export] macro_rules! impl_{name}_spier!` | Spier — expands to dispatch functions, `dynspire_create`/`destroy`, and all IDL schema exports (`__IDL_SCHEMA`, `idl_schema()`, `dynspire_free()`, type/method tables, descriptors) |
+
+**Host side** — `dynspire_codegen::build_host("../my-spier/src/my.dspi")` writes `OUT_DIR/my_host.rs`:
+
+| Output | Used by |
+|--------|---------|
+| `pub trait {Name}Engine: Send + Sync` | Host (trait bounds) |
+| `pub struct {Type}` / `pub enum {Type}` | Host |
 | `pub enum {Name}Op` + `impl SpierOp` | Host |
-| `pub const {NAME}_IDL_HASH: u64` | Spier + Host |
-| `pub static IDL: IdlDescriptor` | Host |
-| `pub fn idl_schema()` + `DynSpireIdl` + `dynspire_free()` | Spier (export) + Python (read) |
+| `pub const {NAME}_IDL_HASH: u64` | Host |
+| `pub static IDL: IdlDescriptor` | Host (connect) |
 | `pub struct DynSpire{Name}` + `impl {Name}Engine` | Host |
-| `#[macro_export] macro_rules! impl_{name}_spier!` | Spier |
 
 Symbol names are derived from the interface name:
 
@@ -239,39 +247,57 @@ Symbol names are derived from the interface name:
 | | `pub struct DynSpire{N}` | `DynSpireMy` |
 | | `pub const {N_UPPER}_IDL_HASH: u64` | `MY_IDL_HASH` |
 | | `macro_rules! impl_{n_lower}_spier!` | `impl_my_spier!` |
-| | output file: `{n_lower}_idl.rs` | `my_idl.rs` |
+| | output file (spier): `{n_lower}_spier.rs` | `my_spier.rs` |
+| | output file (host): `{n_lower}_host.rs` | `my_host.rs` |
 
 ### Codegen API
 
 The `dynspire-codegen` crate exposes:
 
 ```rust
-// build.rs entry point — reads file, parses, generates, writes to OUT_DIR.
+// Spier side — reads file, parses, generates spier code, writes to OUT_DIR.
 // Emits cargo:rerun-if-changed for the .dspi file. Panics on error.
+pub fn build_spier(dspi_path: &str);
+
+// Host side — same, but generates host code (IDL + tower, no spier macro).
+pub fn build_host(dspi_path: &str);
+
+// Legacy — generates both sides in a single file (backward compatible).
 pub fn build(dspi_path: &str);
 
-// Shared context for deduplicating types across multiple build() calls.
+// Shared context for deduplicating types across multiple build calls.
 // When two .dspi files include the same type fragment, BuildContext
 // skips the duplicate definition (same name + same canonical signature).
 // Conflicting types (same name, different content) are a hard error.
 pub struct BuildContext { /* ... */ }
 impl BuildContext {
     pub fn new() -> Self;
-    pub fn build(&mut self, dspi_path: &str);
+    pub fn build(&mut self, dspi_path: &str);          // both sides
+    pub fn build_spier(&mut self, dspi_path: &str);    // spier side only
+    pub fn build_host(&mut self, dspi_path: &str);     // host side only
 }
 
-// AST → full Rust source string (for testing or custom build scripts).
-pub fn generate(iface: &Interface) -> String;
+// AST → Rust source string (for testing or custom build scripts).
+pub fn generate(iface: &Interface) -> String;           // both sides
+pub fn generate_spier(iface: &Interface) -> String;     // spier side only
+pub fn generate_host(iface: &Interface) -> String;      // host side only
 
 // Source text → AST (for tooling, tests, IDE integration).
 pub fn parse(src: &str) -> Result<Interface, ParseError>;
 ```
 
-**Single interface** — backward compatible:
+**Spier crate** — the `.dspi` lives here:
 
 ```rust
 // build.rs
-fn main() { dynspire_codegen::build("src/my.dspi"); }
+fn main() { dynspire_codegen::build_spier("src/my.dspi"); }
+```
+
+**Host crate** — compiles the same `.dspi` by path:
+
+```rust
+// build.rs
+fn main() { dynspire_codegen::build_host("../my-spier/src/my.dspi"); }
 ```
 
 **Multiple interfaces sharing types** — use `BuildContext`:
@@ -280,8 +306,8 @@ fn main() { dynspire_codegen::build("src/my.dspi"); }
 // build.rs
 fn main() {
     let mut ctx = dynspire_codegen::BuildContext::new();
-    ctx.build("src/a.dspi");   // generates SharedHandle
-    ctx.build("src/b.dspi");   // skips SharedHandle (already emitted, same content)
+    ctx.build_spier("src/a.dspi");   // generates SharedHandle
+    ctx.build_spier("src/b.dspi");   // skips SharedHandle (already emitted, same content)
 }
 ```
 
@@ -298,10 +324,10 @@ impl RleEngine for RleState {
     // ...
 }
 
-rle_idl::impl_rle_spier!(RleState, init, "rle");
+impl_rle_spier!(RleState, init, "rle");
 ```
 
-The macro expands to all `dynspire_dispatch_{method}` functions (decoding args from slots, calling the trait method, encoding the result), plus `dynspire_create`, `dynspire_destroy`, `dynspire_idl_hash`, `dynspire_spier_name`, and `dynspire_idl_schema`.
+The macro expands to all `dynspire_dispatch_{method}` functions (decoding args from slots, calling the trait method, encoding the result), plus `dynspire_create`, `dynspire_destroy`, `dynspire_idl_hash`, `dynspire_spier_name`, `dynspire_idl_schema`, and the IDL schema internals (`__IDL_SCHEMA`, `idl_schema()`, `dynspire_free()`, type/method tables, enum/struct descriptors). All schema symbols are scoped inside the macro — no module-scope conflicts when two `.dspi` files are compiled in the same crate.
 
 ### Application errors: use IDL-declared enums
 

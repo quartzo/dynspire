@@ -43,7 +43,7 @@ interface Rle {
 }
 ```
 
-`build.rs` generates the trait, types, Op enum, schema, tower client, and spier dispatch macro. Implement the trait and load it:
+`build.rs` generates the trait, types, Op enum, and spier dispatch macro (spier side) or IDL descriptor and tower client (host side). Implement the trait and load it:
 
 ```rust
 // Spier crate
@@ -52,7 +52,7 @@ impl RleEngine for RleState {
     fn analyze(&self, data: &[u8]) -> Result<CompressionReport, String> { /* ... */ }
     // ...
 }
-rle_idl::impl_rle_spier!(RleState, init, "rle");
+impl_rle_spier!(RleState, init, "rle");
 ```
 
 ```rust
@@ -72,7 +72,7 @@ with load_spier("rle_spier", lib_dir="target/debug").create_handle() as h:
 
 ## Features
 
-- **DSL-driven** — a `.dspi` file is the single source of truth. `build.rs` generates trait, types, Op enum, schema, tower client, and spier dispatch. No proc macros on business code.
+- **DSL-driven** — a `.dspi` file is the single source of truth. `build.rs` generates trait, types, Op enum, and spier dispatch macro (spier side) or IDL descriptor and tower client (host side). No proc macros on business code.
 - **Self-describing** — spiers export their full IDL schema (methods, types, enums) via a C ABI. Hosts discover everything at runtime.
 - **Zero-copy FFI** — borrows (`&[u8]`, `&str`) and mutable out-params (`&mut Vec<u8>`) pass through raw pointers. No serialization overhead. `Vec<T: Clone>` input works for any element type (Rust→Rust).
 - **Type-safe dispatch** — Rust hosts use the generated tower wrapper. No magic numbers, no manual slot encoding.
@@ -140,32 +140,27 @@ The enum's discriminant IS the application-level Ok/Err tag — no `Result<Resul
 
 ## Crate Setup
 
-The spier and host each compile the `.dspi` independently via `build.rs`. The generated IDL hash guarantees compatibility at load time — a shared crate is a convenience, not a requirement.
-
-### Independent compilation (default)
-
-Each crate has its own `.dspi` + `build.rs`:
+The `.dspi` file lives in the spier crate. The host compiles the same file by path reference. Each side uses a different `build.rs` entry point — `build_spier()` for the spier, `build_host()` for the host. The generated IDL hash guarantees compatibility at load time.
 
 ```
-my-spier/           my-host/
-  Cargo.toml          Cargo.toml
-  build.rs            build.rs
+my-spier/                 my-host/
+  Cargo.toml                Cargo.toml
+  build.rs                  build.rs
   src/
-    my.dspi             src/
-    lib.rs                my.dspi
-                           main.rs
+    my.dspi                 src/
+    lib.rs                    main.rs
 ```
 
-**Spier crate** (`Cargo.toml` deps: `dynspire-codegen`, `dynspire`):
+**Spier crate** (`Cargo.toml` deps: `dynspire-codegen` as build-dep, `dynspire`):
 
 ```rust
 // build.rs
-fn main() { dynspire_codegen::build("src/my.dspi"); }
+fn main() { dynspire_codegen::build_spier("src/my.dspi"); }
 ```
 ```rust
-// lib.rs — include the generated code
+// lib.rs — include the generated spier code
 #![allow(non_upper_case_globals)]
-include!(concat!(env!("OUT_DIR"), "/my_idl.rs"));
+include!(concat!(env!("OUT_DIR"), "/my_spier.rs"));
 
 // Implement the generated trait
 impl MyEngine for MyState {
@@ -180,12 +175,16 @@ fn init(_cfg: &HashMap<String, String>) -> Result<MyState, String> {
 impl_my_spier!(MyState, init, "my");
 ```
 
-**Host crate** (same `.dspi`, same `build.rs`):
+**Host crate** (same `.dspi`, referenced by path):
 
 ```rust
-// main.rs — use the generated tower wrapper
+// build.rs
+fn main() { dynspire_codegen::build_host("../my-spier/src/my.dspi"); }
+```
+```rust
+// main.rs — include the generated host code
 #![allow(non_upper_case_globals)]
-include!(concat!(env!("OUT_DIR"), "/my_idl.rs"));
+include!(concat!(env!("OUT_DIR"), "/my_host.rs"));
 
 let client = DynSpireMy::connect("my_spier", &config)?;
 let result = client.do_thing(&input[..])?;
@@ -201,26 +200,12 @@ When a host needs to talk to multiple spiers that share type fragments, use `Bui
 // build.rs
 fn main() {
     let mut ctx = dynspire_codegen::BuildContext::new();
-    ctx.build("src/a.dspi");   // generates SharedHandle
-    ctx.build("src/b.dspi");   // skips SharedHandle (already emitted, same content)
+    ctx.build_spier("src/a.dspi");   // generates SharedHandle
+    ctx.build_spier("src/b.dspi");   // skips SharedHandle (already emitted, same content)
 }
 ```
 
 Types with the same name but different content are a hard error at codegen time.
-
-### Shared IDL crate (optional convenience)
-
-For single-team projects, extract the `.dspi` + `build.rs` into a shared crate that both spier and host depend on. This prevents version skew by construction:
-
-```
-my-idl/             my-spier/          my-host/
-  Cargo.toml          Cargo.toml         Cargo.toml
-  build.rs            src/lib.rs         src/main.rs
-  src/my.dspi         (depends on        (depends on
-  src/lib.rs           my-idl)            my-idl)
-```
-
-The shared crate pattern is used in the [demo](#demo). The demo's `rle-idl/` crate compiles once; `rle-spier/` and `rle-host/` both depend on it.
 
 ### Naming conventions
 
@@ -233,7 +218,8 @@ Symbol names are derived from the interface name in the `.dspi` file:
 | | `pub struct DynSpire{N}` | `DynSpireMy` |
 | | `pub const {N_UPPER}_IDL_HASH: u64` | `MY_IDL_HASH` |
 | | `macro_rules! impl_{n_lower}_spier!` | `impl_my_spier!` |
-| | output file: `{n_lower}_idl.rs` | `my_idl.rs` |
+| | output file (spier): `{n_lower}_spier.rs` | `my_spier.rs` |
+| | output file (host): `{n_lower}_host.rs` | `my_host.rs` |
 
 ### Python host (no codegen)
 
@@ -271,15 +257,12 @@ The FFI overhead per dispatch is ~5x a direct function call — tens of nanoseco
 
 ## Demo
 
-An RLE compression spier showcases the full cycle (shared-crate pattern):
+An RLE compression spier showcases the full cycle:
 
 ```
 demo/
-  rle-idl/       .dspi interface + build.rs (generates trait, types, tower, macro)
-  rle-spier/     cdylib implementation (loaded at runtime)
-  rle-host/      Rust host binary
-  rle_client.py  Python host (PyO3, schema reflection)
-  rle_client2.py Showcase (out-vec auto-tuple, negative index, scalar Option)
+  rle-spier/     .dspi interface + build.rs (generates trait, types, spier macro)
+  rle-host/      build.rs compiles same .dspi (generates trait, types, tower)
 ```
 
 ```bash
@@ -319,10 +302,9 @@ pyproject.toml     uv project root (declares dynspire-py as local dependency)
 dynspire/          Core: arena FFI, slot system, tower client
 dynspire-codegen/  DSL parser + code generator (.dspi → .rs)
 dynspire-py/       Python bindings (PyO3, schema-driven, zero codegen)
-demo/              RLE compression showcase (shared-crate pattern)
-  rle-idl/           .dspi + build.rs (shared by spier and host)
-  rle-spier/         cdylib implementation
-  rle-host/          Rust host binary
+demo/              RLE compression showcase
+  rle-spier/         .dspi + build.rs (generates spier code) + cdylib implementation
+  rle-host/          build.rs compiles same .dspi (generates host code) + binary
 ```
 
 ## How It Works
