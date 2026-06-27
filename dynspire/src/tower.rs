@@ -147,7 +147,7 @@ impl DynSpireLib {
 /// and the response is decoded back to a typed Rust value.
 ///
 /// `Clone` is cheap (inner state is `Arc`-shared). `Drop` calls
-/// `dynspire_destroy` automatically.
+/// `dynspire_destroy` automatically when the last clone is dropped.
 pub struct DynSpireClient {
     lib: Arc<DynSpireLib>,
     handle: Arc<Handle>,
@@ -155,6 +155,15 @@ pub struct DynSpireClient {
 
 unsafe impl Send for DynSpireClient {}
 unsafe impl Sync for DynSpireClient {}
+
+impl Clone for DynSpireClient {
+    fn clone(&self) -> Self {
+        Self {
+            lib: Arc::clone(&self.lib),
+            handle: Arc::clone(&self.handle),
+        }
+    }
+}
 
 impl DynSpireClient {
     /// Loads a spier `.so`, verifies its IDL hash, and creates a client instance.
@@ -221,8 +230,10 @@ impl DynSpireClient {
 
 impl Drop for DynSpireClient {
     fn drop(&mut self) {
-        unsafe {
-            (self.lib.destroy)(self.handle.0);
+        if Arc::strong_count(&self.handle) == 1 {
+            unsafe {
+                (self.lib.destroy)(self.handle.0);
+            }
         }
     }
 }
