@@ -595,7 +595,7 @@ fn gen_write_enum_encode(e: &EnumDecl, expr: &str, w: &str, types: &[TypeDecl]) 
             let mut field_stmts = String::new();
             for (fty, fname) in v.fields.iter().zip(&fnames) {
                 let needs_deref = matches!(fty, FieldType::U8 | FieldType::I8 | FieldType::U16 | FieldType::I16 | FieldType::U32 | FieldType::I32 | FieldType::U64 | FieldType::I64 | FieldType::F32 | FieldType::F64 | FieldType::Bool);
-                let actual_expr = if needs_deref { format!("*{fname}") } else { fname.clone() };
+                let actual_expr = if needs_deref { format!("(*{fname})") } else { fname.clone() };
                 field_stmts.push_str(&gen_write_encode(fty, &actual_expr, w, types));
             }
             arms.push_str(&format!(
