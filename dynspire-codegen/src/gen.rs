@@ -938,15 +938,12 @@ impl {tn} for {cn} {{
 }
 
 // ===========================================================================
-// gen_spier_macro — macro_rules! for dispatch + storage
+// gen_spier_schema — module-scope schema exports (descriptors, type table,
+// method table, __IDL_SCHEMA, idl_schema(), dynspire_free(),
+// dynspire_idl_hash(), dynspire_idl_schema())
 // ===========================================================================
 
-fn gen_spier_macro(iface: &Interface, hash: u64) -> String {
-    let mn = spier_macro_name(iface);
-    let tn = trait_name(iface);
-    let types = &iface.types;
-
-    // --- Build type table and schema data (was gen_schema) ---
+fn gen_spier_schema(iface: &Interface, hash: u64) -> String {
     let mut tt = TypeTable::new();
 
     let mut enum_i = 0i32;
@@ -1009,7 +1006,6 @@ fn gen_spier_macro(iface: &Interface, hash: u64) -> String {
     let type_count = tt.nodes.len();
     let method_count = method_entries.len();
 
-    // Enum descriptor statics + pointer array
     let mut descriptor_statics = String::new();
     let mut enum_ptr_entries: Vec<String> = Vec::new();
     for ty in &iface.types {
@@ -1019,7 +1015,6 @@ fn gen_spier_macro(iface: &Interface, hash: u64) -> String {
         }
     }
 
-    // Struct descriptor statics + pointer array
     let mut struct_ptr_entries: Vec<String> = Vec::new();
     for ty in &iface.types {
         match ty {
@@ -1064,7 +1059,7 @@ fn gen_spier_macro(iface: &Interface, hash: u64) -> String {
         String::new()
     };
 
-    let schema_block = format!(
+    format!(
         r#"{descriptor_statics}{enum_ptrs}{struct_ptrs}#[doc(hidden)]
 static __IDL_TYPE_TABLE: &[dynspire::ffi::IdlTypeNode] = &[
 {tt}];
@@ -1116,6 +1111,17 @@ unsafe extern "C" fn dynspire_free(
         _ => {{}}
     }}
 }}
+
+#[no_mangle]
+pub extern "C" fn dynspire_idl_hash() -> u64 {{
+    idl_schema().hash
+}}
+
+#[no_mangle]
+pub extern "C" fn dynspire_idl_schema() -> *const dynspire::ffi::DynSpireIdl {{
+    idl_schema()
+}}
+
 "#,
         descriptor_statics=descriptor_statics,
         enum_ptrs=enum_ptrs_static,
@@ -1130,9 +1136,18 @@ unsafe extern "C" fn dynspire_free(
         spi=struct_ptrs_init,
         sc=struct_count,
         free=free_arms.join("\n"),
-    );
+    )
+}
 
-    // --- Dispatch functions ---
+// ===========================================================================
+// gen_spier_macro — slim macro: only dispatch + create/destroy/spier_name
+// ===========================================================================
+
+fn gen_spier_macro(iface: &Interface) -> String {
+    let mn = spier_macro_name(iface);
+    let tn = trait_name(iface);
+    let types = &iface.types;
+
     let mut dispatch_fns = String::new();
 
     for m in &iface.methods {
@@ -1221,7 +1236,6 @@ unsafe extern "C" fn dynspire_free(
         r#"#[macro_export]
 macro_rules! {mn} {{
     ($state:ty, $init:path, $name:literal) => {{
-{schema}
 {dispatch}
         #[no_mangle]
         pub extern "C" fn dynspire_create(
@@ -1251,24 +1265,13 @@ macro_rules! {mn} {{
         }}
 
         #[no_mangle]
-        pub extern "C" fn dynspire_idl_hash() -> u64 {{
-            idl_schema().hash
-        }}
-
-        #[no_mangle]
         pub extern "C" fn dynspire_spier_name() -> *const u8 {{
             concat!($name, "\0").as_ptr()
-        }}
-
-        #[no_mangle]
-        pub extern "C" fn dynspire_idl_schema() -> *const dynspire::ffi::DynSpireIdl {{
-            idl_schema()
         }}
     }};
 }}
 "#,
         mn=mn,
-        schema=schema_block,
         dispatch=dispatch_fns,
     )
 }
@@ -1309,7 +1312,8 @@ fn generate_spier_with_ctx(iface: &Interface, ctx: &mut BuildContext) -> String 
     out.push_str(&gen_types(iface, ctx));
     out.push_str(&gen_op_enum(iface));
     out.push_str(&format!("pub const {}: u64 = {};\n\n", hcn, hash));
-    out.push_str(&gen_spier_macro(iface, hash));
+    out.push_str(&gen_spier_schema(iface, hash));
+    out.push_str(&gen_spier_macro(iface));
 
     out
 }
