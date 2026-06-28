@@ -2,14 +2,11 @@
 name = "dynspire-dev"
 version = "0"
 requires-python = ">=3.8"
-dependencies = ["dynspire"]
+dependencies = []
 
 [tool.uv]
 package = false
 dev-dependencies = ["pytest"]
-
-[tool.uv.sources]
-dynspire = { path = "dynspire-py", editable = true }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

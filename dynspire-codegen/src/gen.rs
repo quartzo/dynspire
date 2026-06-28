@@ -1486,6 +1486,329 @@ fn gen_py_method(m: &Method, ret_idx: u32, types: &[TypeDecl]) -> String {
     s
 }
 
+/// Inlined ctypes runtime — emitted verbatim into every generated .py so the
+/// module is fully self-contained (only depends on the Python stdlib).
+const PY_RUNTIME: &str = r#"import ctypes
+import struct
+
+MAX_OUT_SLOTS = 8
+
+
+class DynSpireError(RuntimeError):
+    pass
+
+
+class _VecView(ctypes.Structure):
+    _fields_ = [("ptr", ctypes.c_void_p), ("len", ctypes.c_size_t)]
+
+
+class SlotWriter:
+    def __init__(self):
+        self._vals = []
+        self._keepalive = []
+
+    def write_u64(self, v):
+        self._vals.append(v & 0xFFFFFFFFFFFFFFFF)
+
+    def write_bool(self, b):
+        self.write_u64(1 if b else 0)
+
+    def write_u8(self, v):
+        self.write_u64(v)
+
+    def write_u16(self, v):
+        self.write_u64(v)
+
+    def write_u32(self, v):
+        self.write_u64(v)
+
+    def write_i8(self, v):
+        self.write_u64(v & 0xFF)
+
+    def write_i16(self, v):
+        self.write_u64(v & 0xFFFF)
+
+    def write_i32(self, v):
+        self.write_u64(v & 0xFFFFFFFF)
+
+    def write_i64(self, v):
+        self.write_u64(v & 0xFFFFFFFFFFFFFFFF)
+
+    def write_f32(self, v):
+        self.write_u64(struct.unpack("<I", struct.pack("<f", v))[0])
+
+    def write_f64(self, v):
+        self.write_u64(struct.unpack("<Q", struct.pack("<d", v))[0])
+
+    def write_bytes(self, data):
+        ptr, n = self._pin_bytes(data)
+        self.write_u64(ptr)
+        self.write_u64(n)
+
+    def write_str(self, s):
+        if isinstance(s, str):
+            self.write_bytes(s.encode("utf-8"))
+        else:
+            self.write_bytes(s)
+
+    def write_opaque(self, handle):
+        self.write_u64(handle._ptr)
+
+    def _pin_bytes(self, data):
+        if not isinstance(data, (bytes, bytearray)):
+            raise TypeError("expected bytes, got " + type(data).__name__)
+        n = len(data)
+        if n == 0:
+            return 0, 0
+        arr = (ctypes.c_uint8 * n).from_buffer_copy(bytes(data))
+        self._keepalive.append(arr)
+        return ctypes.addressof(arr), n
+
+    def array(self):
+        if not self._vals:
+            return None
+        return (ctypes.c_uint64 * len(self._vals))(*self._vals)
+
+    def __len__(self):
+        return len(self._vals)
+
+
+class OutReader:
+    def __init__(self, arr, client=None):
+        self._arr = arr
+        self._pos = 0
+        self._client = client
+
+    def read(self):
+        v = self._arr[self._pos]
+        self._pos += 1
+        return v
+
+    def pos(self):
+        return self._pos
+
+    def read_bool(self):
+        return self.read() != 0
+
+    def read_u8(self):
+        return self.read() & 0xFF
+
+    def read_u16(self):
+        return self.read() & 0xFFFF
+
+    def read_u32(self):
+        return self.read() & 0xFFFFFFFF
+
+    def read_u64(self):
+        return self.read()
+
+    def read_i8(self):
+        v = self.read() & 0xFF
+        return v - 0x100 if v >= 0x80 else v
+
+    def read_i16(self):
+        v = self.read() & 0xFFFF
+        return v - 0x10000 if v >= 0x8000 else v
+
+    def read_i32(self):
+        v = self.read() & 0xFFFFFFFF
+        return v - 0x100000000 if v >= 0x80000000 else v
+
+    def read_i64(self):
+        v = self.read()
+        return v - 0x10000000000000000 if v >= 0x8000000000000000 else v
+
+    def read_f32(self):
+        return struct.unpack("<f", struct.pack("<I", self.read() & 0xFFFFFFFF))[0]
+
+    def read_f64(self):
+        return struct.unpack("<d", struct.pack("<Q", self.read()))[0]
+
+    def read_string(self):
+        ptr, n = self.read(), self.read()
+        if not ptr or not n:
+            return ""
+        return ctypes.string_at(ptr, n).decode("utf-8", "replace")
+
+    def read_bytes(self):
+        ptr, n = self.read(), self.read()
+        if not ptr or not n:
+            return b""
+        return ctypes.string_at(ptr, n)
+
+    def read_vec_string(self):
+        ptr, n = self.read(), self.read()
+        if not ptr or not n:
+            return []
+        out = []
+        for i in range(n):
+            view = self._client._vec_view_at_fn(ptr, i)
+            out.append("" if not view.len else ctypes.string_at(view.ptr, view.len).decode("utf-8", "replace"))
+        return out
+
+    def read_vec_bytes(self):
+        ptr, n = self.read(), self.read()
+        if not ptr or not n:
+            return []
+        out = []
+        for i in range(n):
+            view = self._client._vec_view_at_fn(ptr, i)
+            out.append(b"" if not view.len else ctypes.string_at(view.ptr, view.len))
+        return out
+
+
+def new_out_array():
+    return (ctypes.c_uint64 * MAX_OUT_SLOTS)()
+
+
+class OpaqueHandle:
+    __slots__ = ("_client", "_ptr", "_free_idx", "__weakref__")
+
+    def __init__(self, client, ptr, free_idx):
+        self._client = client
+        self._ptr = ptr
+        self._free_idx = free_idx
+
+    @property
+    def type_name(self):
+        return type(self).__name__
+
+    def __repr__(self):
+        return type(self).__name__ + "(ptr=0x" + format(self._ptr, "x") + ")"
+
+    def __del__(self):
+        try:
+            self._client._free_opaque(self._free_idx, self._ptr)
+        except Exception:
+            pass
+
+
+class SpierClient:
+    _spier_name = None
+    _idl_hash_const = 0
+
+    def __init__(self, lib_path, config=None):
+        self._lib = ctypes.CDLL(lib_path)
+        self._configure_symbols()
+        actual = self._idl_hash_fn()
+        expected = self._idl_hash_const
+        if actual != expected:
+            raise DynSpireError(
+                "IDL hash mismatch: host expects 0x{:016x}, spier '{}' has 0x{:016x}".format(expected, self._spier_name, actual)
+            )
+        cfg = _encode_config(config)
+        self._handle = self._create_fn(cfg, len(cfg))
+        if not self._handle:
+            raise DynSpireError("spier '{}' create failed".format(self._spier_name))
+        self._closed = False
+        self._dispatch_cache = {}
+
+    def _configure_symbols(self):
+        f = self._lib.dynspire_create
+        f.restype = ctypes.c_void_p
+        f.argtypes = [ctypes.c_char_p, ctypes.c_size_t]
+        self._create_fn = f
+
+        f = self._lib.dynspire_destroy
+        f.argtypes = [ctypes.c_void_p]
+        self._destroy_fn = f
+
+        f = self._lib.dynspire_idl_hash
+        f.restype = ctypes.c_uint64
+        self._idl_hash_fn = f
+
+        f = self._lib.dynspire_free
+        f.argtypes = [ctypes.c_uint32, ctypes.c_void_p, ctypes.c_size_t]
+        f.restype = None
+        self._free_fn = f
+
+        f = self._lib.dynspire_vec_create
+        f.restype = ctypes.c_void_p
+        self._vec_create_fn = f
+
+        f = self._lib.dynspire_vec_view
+        f.restype = _VecView
+        f.argtypes = [ctypes.c_void_p]
+        self._vec_view_fn = f
+
+        f = self._lib.dynspire_vec_free
+        f.argtypes = [ctypes.c_void_p]
+        self._vec_free_fn = f
+
+        f = self._lib.dynspire_vec_view_at
+        f.restype = _VecView
+        f.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+        self._vec_view_at_fn = f
+
+    def _dispatch_fn(self, method):
+        fn = self._dispatch_cache.get(method)
+        if fn is None:
+            fn = getattr(self._lib, "dynspire_dispatch_" + method)
+            fn.restype = ctypes.c_uint8
+            fn.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_size_t,
+                ctypes.POINTER(ctypes.c_uint64),
+                ctypes.c_size_t,
+            ]
+            self._dispatch_cache[method] = fn
+        return fn
+
+    def _dispatch(self, method, writer, out):
+        in_arr = writer.array()
+        in_ptr = ctypes.cast(in_arr, ctypes.c_void_p) if in_arr is not None else None
+        status = self._dispatch_fn(method)(self._handle, in_ptr, len(writer), out, MAX_OUT_SLOTS)
+        if status == 2:
+            raise DynSpireError("out-slot overflow dispatching '" + method + "'")
+        if status != 0:
+            raise DynSpireError("dispatch '" + method + "' failed (status " + str(status) + ")")
+
+    def free_owned(self, type_idx, out, count):
+        self._free_fn(type_idx, ctypes.cast(out, ctypes.c_void_p), count)
+
+    def _free_opaque(self, free_idx, ptr):
+        if ptr == 0:
+            return
+        slots = (ctypes.c_uint64 * 2)(0, ptr)
+        self._free_fn(free_idx, slots, 2)
+
+    def _new_outvec(self):
+        return self._vec_create_fn()
+
+    def _read_outvec(self, addr):
+        view = self._vec_view_fn(addr)
+        data = ctypes.string_at(view.ptr, view.len) if view.len else b""
+        self._vec_free_fn(addr)
+        return data
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+    def close(self):
+        if getattr(self, "_closed", True):
+            return
+        self._closed = True
+        h = getattr(self, "_handle", None)
+        if h:
+            self._handle = None
+            self._destroy_fn(h)
+
+    def __del__(self):
+        self.close()
+
+
+def _encode_config(config):
+    if not config:
+        return b""
+    import urllib.parse
+    return urllib.parse.urlencode(config).encode("utf-8")
+"#;
+
 /// Generate a complete pure-Python ctypes client module from an [`Interface`].
 pub fn generate_python(iface: &Interface) -> String {
     generate_python_with_ctx(iface, &mut BuildContext::new())
@@ -1512,8 +1835,8 @@ fn generate_python_with_ctx(iface: &Interface, _ctx: &mut BuildContext) -> Strin
     let mut out = String::new();
     out.push_str("# Auto-generated by dynspire-codegen. Do not edit.\n");
     out.push_str("from __future__ import annotations\n\n");
-    out.push_str("from dynspire._runtime import (\n");
-    out.push_str("    DynSpireError,\n    OpaqueHandle,\n    OutReader,\n    SlotWriter,\n    SpierClient,\n    new_out_array,\n)\n\n\n");
+    out.push_str(PY_RUNTIME);
+    out.push_str("\n\n");
     out.push_str(&format!("_IDL_HASH = 0x{:016x}\n\n\n", hash));
     out.push_str(&gen_py_types(iface, &struct_ret));
     out.push_str(&gen_py_client(iface, &ret_indices));

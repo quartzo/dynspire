@@ -17,17 +17,9 @@ wheels = [
 ]
 
 [[package]]
-name = "dynspire"
-version = "0.3.0"
-source = { editable = "dynspire-py" }
-
-[[package]]
 name = "dynspire-dev"
 version = "0"
 source = { virtual = "." }
-dependencies = [
-    { name = "dynspire" },
-]
 
 [package.dev-dependencies]
 dev = [
@@ -37,7 +29,6 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "dynspire", editable = "dynspire-py" }]
 
 [package.metadata.requires-dev]
 dev = [{ name = "pytest" }]
