@@ -9,6 +9,9 @@ wheels/
 # Rust / Cargo
 target/
 
+# Generated Python bindings (emitted by build.rs)
+generated/
+
 # Maturin native extensions
 *.so
 *.pyd

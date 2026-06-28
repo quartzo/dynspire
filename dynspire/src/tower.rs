@@ -7,7 +7,6 @@ use crate::kvmap::serialize_kvmap;
 use crate::slots::MAX_OUT_SLOTS;
 
 type FnIdlHash = unsafe extern "C" fn() -> u64;
-type FnSpierName = unsafe extern "C" fn() -> *const u8;
 type FnCreate = unsafe extern "C" fn(*const u8, usize) -> *mut c_void;
 type FnDestroy = unsafe extern "C" fn(*mut c_void);
 type FnDispatch = unsafe extern "C" fn(
@@ -88,7 +87,6 @@ impl DynSpireLib {
             ));
         }
 
-        let _fn_name: FnSpierName = load_sym(&lib, b"dynspire_spier_name\0")?;
         let fn_create: FnCreate = load_sym(&lib, b"dynspire_create\0")?;
         let fn_destroy: FnDestroy = load_sym(&lib, b"dynspire_destroy\0")?;
 

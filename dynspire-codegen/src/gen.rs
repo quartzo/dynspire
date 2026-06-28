@@ -74,41 +74,39 @@ impl BuildContext {
         self.build_with(dspi_path, "host", generate_host_with_ctx);
     }
 
+    /// Generate a pure-Python ctypes client module and write it to
+    /// `py_out_path` (relative to `CARGO_MANIFEST_DIR`).
+    ///
+    /// The Python consumer never needs a Rust toolchain — the `.py` is emitted
+    /// at the spier's build time, alongside the compiled `.so`. There is no
+    /// runtime schema reflection: the slot layout and `dynspire_free` type
+    /// indices are baked in as constants.
+    pub fn build_python(&mut self, dspi_path: &str, py_out_path: &str) {
+        let (iface, rerun_paths) = load_interface(dspi_path);
+        let code = generate_python_with_ctx(&iface, &mut BuildContext::new());
+
+        let dir = match std::env::var("CARGO_MANIFEST_DIR") {
+            Ok(manifest) if !manifest.is_empty() => format!("{manifest}/{py_out_path}"),
+            _ => py_out_path.to_string(),
+        };
+        if let Some(parent) = std::path::Path::new(&dir).parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        std::fs::write(&dir, &code)
+            .unwrap_or_else(|e| panic!("dynspire-codegen: failed to write {dir}: {e}"));
+
+        for path in &rerun_paths {
+            println!("cargo:rerun-if-changed={path}");
+        }
+    }
+
     fn build_with(
         &mut self,
         dspi_path: &str,
         suffix: &str,
         gen_fn: fn(&Interface, &mut BuildContext) -> String,
     ) {
-        let src = std::fs::read_to_string(dspi_path)
-            .unwrap_or_else(|e| panic!("dynspire-codegen: failed to read {dspi_path}: {e}"));
-        let mut iface = parser::parse(&src)
-            .unwrap_or_else(|e| panic!("dynspire-codegen: parse error in {dspi_path}: {e}"));
-
-        let base_dir = std::path::Path::new(dspi_path)
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."));
-
-        let mut rerun_paths = vec![dspi_path.to_string()];
-        let mut included_types = Vec::new();
-        let mut stack: Vec<std::path::PathBuf> = Vec::new();
-        let mut processed: std::collections::HashSet<std::path::PathBuf> =
-            std::collections::HashSet::new();
-
-        resolve_includes(
-            &iface.includes,
-            base_dir,
-            &mut stack,
-            &mut processed,
-            &mut included_types,
-            &mut rerun_paths,
-        );
-
-        merge_types(&mut iface, included_types);
-
-        parser::validate(&iface)
-            .unwrap_or_else(|e| panic!("dynspire-codegen: validation error in {dspi_path}: {e}"));
-
+        let (iface, rerun_paths) = load_interface(dspi_path);
         let code = gen_fn(&iface, self);
         let out_dir = std::env::var("OUT_DIR")
             .expect("dynspire-codegen: OUT_DIR not set (must be called from build.rs)");
@@ -128,103 +126,84 @@ impl Default for BuildContext {
     }
 }
 
-// ===========================================================================
-// TypeTable — flat array of IdlTypeNode entries
-// ===========================================================================
+/// Parse a `.dspi`, resolve includes, merge, and validate. Shared by
+/// [`BuildContext::build_with`] and [`BuildContext::build_python`].
+fn load_interface(dspi_path: &str) -> (Interface, Vec<String>) {
+    let src = std::fs::read_to_string(dspi_path)
+        .unwrap_or_else(|e| panic!("dynspire-codegen: failed to read {dspi_path}: {e}"));
+    let mut iface = parser::parse(&src)
+        .unwrap_or_else(|e| panic!("dynspire-codegen: parse error in {dspi_path}: {e}"));
 
-struct TypeNode {
-    kind: &'static str,
-    size: u32,
-    children: Vec<i32>,
+    let base_dir = std::path::Path::new(dspi_path)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+
+    let mut rerun_paths = vec![dspi_path.to_string()];
+    let mut included_types = Vec::new();
+    let mut stack: Vec<std::path::PathBuf> = Vec::new();
+    let mut processed: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
+
+    resolve_includes(
+        &iface.includes,
+        base_dir,
+        &mut stack,
+        &mut processed,
+        &mut included_types,
+        &mut rerun_paths,
+    );
+    merge_types(&mut iface, included_types);
+    parser::validate(&iface)
+        .unwrap_or_else(|e| panic!("dynspire-codegen: validation error in {dspi_path}: {e}"));
+
+    (iface, rerun_paths)
 }
 
+// ===========================================================================
+// TypeTable — assigns sequential type indices (mirrors gen_spier_schema)
+// ===========================================================================
+
 struct TypeTable {
-    nodes: Vec<TypeNode>,
-    enum_indices: HashMap<String, i32>,
-    struct_indices: HashMap<String, i32>,
+    counter: u32,
 }
 
 impl TypeTable {
     fn new() -> Self {
-        Self {
-            nodes: Vec::new(),
-            enum_indices: HashMap::new(),
-            struct_indices: HashMap::new(),
-        }
+        Self { counter: 0 }
     }
 
     fn add(&mut self, ty: &FieldType) -> u32 {
-        let node = match ty {
-            FieldType::Unit => mk("IDL_UNIT", 0, &[]),
-            FieldType::Bool => mk("IDL_BOOL", 0, &[]),
-            FieldType::U8 | FieldType::I8 => mk("IDL_U8", 0, &[]),
-            FieldType::U16 | FieldType::I16 | FieldType::U32 | FieldType::I32 => {
-                mk("IDL_U32", 0, &[])
-            }
-            FieldType::U64 | FieldType::I64 => mk("IDL_U64", 0, &[]),
-            FieldType::F32 => mk("IDL_F32", 0, &[]),
-            FieldType::F64 => mk("IDL_F64", 0, &[]),
-            FieldType::Str => mk("IDL_STR", 0, &[]),
+        match ty {
             FieldType::U8Slice => {
-                let child = self.add(&FieldType::U8) as i32;
-                mk("IDL_SLICE", 0, &[child])
+                self.add(&FieldType::U8);
+                self.next()
             }
-            FieldType::OutU8Vec => mk("IDL_OUT_VEC", 0, &[]),
-            FieldType::String => mk("IDL_STRING", 0, &[]),
             FieldType::Vec(inner) => {
-                let child = self.add(inner) as i32;
-                mk("IDL_VEC", 0, &[child])
+                self.add(inner);
+                self.next()
             }
             FieldType::Option(inner) => {
-                let child = self.add(inner) as i32;
-                mk("IDL_OPTION", 0, &[child])
+                self.add(inner);
+                self.next()
             }
             FieldType::Tuple(elems) => {
-                let children: Vec<i32> = elems.iter().map(|e| self.add(e) as i32).collect();
-                mk("IDL_TUPLE", 0, &children)
-            }
-            FieldType::Array(inner, len) => {
-                let child = self.add(inner) as i32;
-                mk("IDL_ARRAY", *len as u32, &[child])
-            }
-            FieldType::Named(name) => {
-                if self.enum_indices.contains_key(name) {
-                    let ei = self.enum_indices[name];
-                    mk("IDL_ENUM", 0, &[ei])
-                } else {
-                    let si = {
-                        let len = self.struct_indices.len() as i32;
-                        *self.struct_indices.entry(name.clone()).or_insert(len)
-                    };
-                    mk("IDL_STRUCT", 0, &[si])
+                for e in elems {
+                    self.add(e);
                 }
+                self.next()
             }
-        };
-        let idx = self.nodes.len() as u32;
-        self.nodes.push(node);
+            FieldType::Array(inner, _) => {
+                self.add(inner);
+                self.next()
+            }
+            _ => self.next(),
+        }
+    }
+
+    fn next(&mut self) -> u32 {
+        let idx = self.counter;
+        self.counter += 1;
         idx
     }
-
-    fn emit(&self) -> String {
-        let mut out = String::new();
-        for n in &self.nodes {
-            let mut children = [-1i32; 8];
-            for (i, &c) in n.children.iter().enumerate().take(8) {
-                children[i] = c;
-            }
-            out.push_str(&format!(
-                "    dynspire::ffi::IdlTypeNode {{ kind: dynspire::ffi::{}, child_count: {}, _pad: [0; 2], size: {}, children: [{}, {}, {}, {}, {}, {}, {}, {}] }},\n",
-                n.kind, n.children.len(), n.size,
-                children[0], children[1], children[2], children[3],
-                children[4], children[5], children[6], children[7],
-            ));
-        }
-        out
-    }
-}
-
-fn mk(kind: &'static str, size: u32, children: &[i32]) -> TypeNode {
-    TypeNode { kind, size, children: children.to_vec() }
 }
 
 // ===========================================================================
@@ -760,87 +739,8 @@ fn gen_enum_def(e: &EnumDecl) -> String {
     out
 }
 
-fn gen_struct_descriptor(name: &str) -> String {
-    format!(
-        r#"#[doc(hidden)]
-#[allow(non_upper_case_globals)]
-pub static __STRUCT_DESC_{n}: dynspire::ffi::StructDescriptor = dynspire::ffi::StructDescriptor {{
-    name: b"{n}\0".as_ptr(),
-    name_len: {len},
-}};
-
-"#,
-        n = name,
-        len = name.len(),
-    )
-}
-
-fn gen_enum_descriptor(e: &EnumDecl) -> String {
-    let n = &e.name;
-    let var_count = e.variants.len();
-
-    let mut tt = TypeTable::new();
-    let mut all_field_indices: Vec<u32> = Vec::new();
-    let mut variant_entries: Vec<String> = Vec::new();
-
-    let mut disc: u32 = 0;
-    for v in &e.variants {
-        let field_offset = all_field_indices.len() as u32;
-        let field_types: Vec<u32> = v.fields.iter().map(|t| tt.add(t)).collect();
-        let field_count = field_types.len() as u32;
-        all_field_indices.extend(field_types);
-
-        variant_entries.push(format!(
-            "    dynspire::ffi::EnumVariantDesc {{ disc: {d}, name: b\"{vn}\\0\".as_ptr(), name_len: {vnl}, field_count: {fc}, field_type_offset: {fo} }},",
-            d=disc, vn=v.name, vnl=v.name.len(), fc=field_count, fo=field_offset,
-        ));
-        disc += 1;
-    }
-
-    let type_count = tt.nodes.len();
-    let field_type_count = all_field_indices.len();
-
-    format!(
-        r#"#[doc(hidden)]
-#[allow(non_upper_case_globals)]
-pub static __ENUM_TYPES_{n}: &[dynspire::ffi::IdlTypeNode] = &[
-{tt}];
-
-#[doc(hidden)]
-#[allow(non_upper_case_globals)]
-pub static __ENUM_FIELD_TYPES_{n}: &[u32] = &[{ft}];
-
-#[doc(hidden)]
-#[allow(non_upper_case_globals)]
-pub static __ENUM_VARIANTS_{n}: &[dynspire::ffi::EnumVariantDesc] = &[
-{ve}
-];
-
-#[doc(hidden)]
-#[allow(non_upper_case_globals)]
-pub static __ENUM_DESC_{n}: dynspire::ffi::EnumDescriptor = dynspire::ffi::EnumDescriptor {{
-    name: b"{n}\0".as_ptr(),
-    name_len: {nl},
-    variant_count: {vc},
-    variants: __ENUM_VARIANTS_{n}.as_ptr(),
-    type_table: __ENUM_TYPES_{n}.as_ptr(),
-    type_count: {tc},
-    field_types: __ENUM_FIELD_TYPES_{n}.as_ptr(),
-    field_type_count: {ftc},
-}};
-
-"#,
-        n=n,
-        tt=tt.emit(),
-        ft=all_field_indices.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", "),
-        ve=variant_entries.join("\n"),
-        nl=n.len(),
-        vc=var_count,
-        tc=type_count,
-        ftc=field_type_count,
-    )
-}
-
+// ===========================================================================
+// gen_op_enum
 // ===========================================================================
 // gen_op_enum
 // ===========================================================================
@@ -883,10 +783,6 @@ impl dynspire::SpierOp for {opn} {{
         arms=from_u8_arms.join("\n"),
     )
 }
-
-// ===========================================================================
-// gen_schema — type table, method table, DynSpireIdl, dynspire_free
-// ===========================================================================
 
 // ===========================================================================
 // gen_tower — DynSpireRle client wrapper
@@ -948,160 +844,27 @@ impl {tn} for {cn} {{
 }
 
 // ===========================================================================
-// gen_spier_schema — module-scope schema exports (descriptors, type table,
-// method table, __IDL_SCHEMA, idl_schema(), dynspire_free(),
-// dynspire_idl_hash(), dynspire_idl_schema())
+// gen_spier_exports — module-scope C exports: dynspire_free + dynspire_idl_hash
 // ===========================================================================
 
-fn gen_spier_schema(iface: &Interface, hash: u64) -> String {
+fn gen_spier_exports(iface: &Interface, hash: u64) -> String {
     let mut tt = TypeTable::new();
 
-    let mut enum_i = 0i32;
-    for ty in &iface.types {
-        if let TypeDecl::Enum(e) = ty {
-            tt.enum_indices.insert(e.name.clone(), enum_i);
-            enum_i += 1;
-        }
-    }
-    let mut struct_i = 0i32;
-    for ty in &iface.types {
-        match ty {
-            TypeDecl::Struct(s) if !s.fields.is_empty() => {
-                tt.struct_indices.insert(s.name.clone(), struct_i);
-                struct_i += 1;
-            }
-            TypeDecl::Opaque(o) => {
-                tt.struct_indices.insert(o.name.clone(), struct_i);
-                struct_i += 1;
-            }
-            _ => {}
-        }
-    }
-
-    let enum_count = enum_i as usize;
-    let struct_count = struct_i as usize;
-
-    let mut method_entries: Vec<String> = Vec::new();
     let mut free_arms: Vec<String> = Vec::new();
-
     for m in &iface.methods {
-        let mut param_entries: Vec<String> = Vec::new();
         for p in &m.params {
-            let pidx = tt.add(&p.ty);
-            param_entries.push(format!(
-                "        dynspire::ffi::IdlParam {{ name: b\"{}\\0\".as_ptr(), name_len: {}, type_idx: {} }}",
-                p.name, p.name.len(), pidx,
-            ));
+            tt.add(&p.ty);
         }
         let ret_idx = tt.add(&m.return_type);
-        let pc = param_entries.len();
-
-        let params_field = if pc == 0 {
-            "params: core::ptr::null(), param_count: 0,".to_string()
-        } else {
-            format!("params: [{}].as_ptr(), param_count: {},", param_entries.join(", "), pc)
-        };
-
-        method_entries.push(format!(
-            "    dynspire::ffi::IdlMethod {{ name: b\"{}\\0\".as_ptr(), name_len: {}, {params_field} return_type_idx: {ret}, _pad: [0; 4] }},",
-            m.name, m.name.len(), ret=ret_idx,
-        ));
-
         let recv_expr = gen_read_receive(&m.return_type, "r", &iface.types);
         free_arms.push(format!(
             "            {ret_idx} => {{ let _ = {recv_expr}; }}",
         ));
     }
 
-    let type_count = tt.nodes.len();
-    let method_count = method_entries.len();
-
-    let mut descriptor_statics = String::new();
-    let mut enum_ptr_entries: Vec<String> = Vec::new();
-    for ty in &iface.types {
-        if let TypeDecl::Enum(e) = ty {
-            descriptor_statics.push_str(&gen_enum_descriptor(e));
-            enum_ptr_entries.push(format!("    &__ENUM_DESC_{},", e.name));
-        }
-    }
-
-    let mut struct_ptr_entries: Vec<String> = Vec::new();
-    for ty in &iface.types {
-        match ty {
-            TypeDecl::Struct(s) if !s.fields.is_empty() => {
-                descriptor_statics.push_str(&gen_struct_descriptor(&s.name));
-                struct_ptr_entries.push(format!("    &__STRUCT_DESC_{},", s.name));
-            }
-            TypeDecl::Opaque(o) => {
-                descriptor_statics.push_str(&gen_struct_descriptor(&o.name));
-                struct_ptr_entries.push(format!("    &__STRUCT_DESC_{},", o.name));
-            }
-            _ => {}
-        }
-    }
-
-    let enum_ptrs_init = if enum_count == 0 {
-        "core::ptr::null()".to_string()
-    } else {
-        "__IDL_ENUM_PTRS.as_ptr()".to_string()
-    };
-    let struct_ptrs_init = if struct_count == 0 {
-        "core::ptr::null()".to_string()
-    } else {
-        "__IDL_STRUCT_PTRS.as_ptr()".to_string()
-    };
-
-    let enum_ptrs_static = if enum_count > 0 {
-        format!(
-            "#[doc(hidden)]\n#[allow(non_upper_case_globals)]\nstatic __IDL_ENUM_PTRS: &[&'static dynspire::ffi::EnumDescriptor] = &[\n{}\n];\n\n",
-            enum_ptr_entries.join("\n"),
-        )
-    } else {
-        String::new()
-    };
-
-    let struct_ptrs_static = if struct_count > 0 {
-        format!(
-            "#[doc(hidden)]\n#[allow(non_upper_case_globals)]\nstatic __IDL_STRUCT_PTRS: &[&'static dynspire::ffi::StructDescriptor] = &[\n{}\n];\n\n",
-            struct_ptr_entries.join("\n"),
-        )
-    } else {
-        String::new()
-    };
-
     format!(
-        r#"{descriptor_statics}{enum_ptrs}{struct_ptrs}#[doc(hidden)]
-#[allow(non_upper_case_globals)]
-static __IDL_TYPE_TABLE: &[dynspire::ffi::IdlTypeNode] = &[
-{tt}];
-
-#[doc(hidden)]
-#[allow(non_upper_case_globals)]
-static __IDL_METHODS: &[dynspire::ffi::IdlMethod] = &[
-{me}
-];
-
-#[allow(non_upper_case_globals)]
-static __IDL_SCHEMA: dynspire::ffi::DynSpireIdl = dynspire::ffi::DynSpireIdl {{
-    name: b"\0".as_ptr(),
-    name_len: 0,
-    hash: {hash},
-    type_table: __IDL_TYPE_TABLE.as_ptr(),
-    type_count: {tc},
-    methods: __IDL_METHODS.as_ptr(),
-    method_count: {mc},
-    enum_table: {epi} as *const *const dynspire::ffi::EnumDescriptor,
-    enum_count: {ec},
-    struct_table: {spi} as *const *const dynspire::ffi::StructDescriptor,
-    struct_count: {sc},
-    free_fn: dynspire_free,
-}};
-
-fn idl_schema() -> &'static dynspire::ffi::DynSpireIdl {{
-    &__IDL_SCHEMA
-}}
-
-unsafe extern "C" fn dynspire_free(
+        r#"#[no_mangle]
+pub unsafe extern "C" fn dynspire_free(
     type_index: u32,
     slots: *const u64,
     slot_count: usize,
@@ -1127,28 +890,12 @@ unsafe extern "C" fn dynspire_free(
 
 #[no_mangle]
 pub extern "C" fn dynspire_idl_hash() -> u64 {{
-    idl_schema().hash
-}}
-
-#[no_mangle]
-pub extern "C" fn dynspire_idl_schema() -> *const dynspire::ffi::DynSpireIdl {{
-    idl_schema()
+    {hash}
 }}
 
 "#,
-        descriptor_statics=descriptor_statics,
-        enum_ptrs=enum_ptrs_static,
-        struct_ptrs=struct_ptrs_static,
-        tt=tt.emit(),
-        me=method_entries.join("\n"),
-        hash=hash,
-        tc=type_count,
-        mc=method_count,
-        epi=enum_ptrs_init,
-        ec=enum_count,
-        spi=struct_ptrs_init,
-        sc=struct_count,
-        free=free_arms.join("\n"),
+        hash = hash,
+        free = free_arms.join("\n"),
     )
 }
 
@@ -1327,7 +1074,7 @@ fn generate_spier_with_ctx(iface: &Interface, ctx: &mut BuildContext) -> String 
     out.push_str(&gen_types(iface, ctx));
     out.push_str(&gen_op_enum(iface));
     out.push_str(&format!("pub const {}: u64 = {};\n\n", hcn, hash));
-    out.push_str(&gen_spier_schema(iface, hash));
+    out.push_str(&gen_spier_exports(iface, hash));
     out.push_str(&gen_spier_macro(iface));
 
     out
@@ -1361,6 +1108,416 @@ fn generate_host_suffix(iface: &Interface) -> String {
             .join(", "),
     ));
     out.push_str(&gen_tower(iface));
+    out
+}
+
+// ===========================================================================
+// generate_python — emit a pure-Python ctypes client module
+// ===========================================================================
+//
+// Mirrors the Rust host codec (`gen_write_encode` / `gen_read_receive`) but
+// emits Python targeting the `dynspire._runtime` ctypes helpers. One compiler,
+// two back-ends: the parser/AST/hash stay singular; only the emission has a
+// Python twin, so there is no risk of hash drift.
+
+/// Whether an owned return must be freed immediately after being copied into
+/// Python (as opposed to boxed structs/opaques, which are freed lazily by the
+/// `OpaqueHandle` wrapper on GC).
+fn is_immediate_owned(ft: &FieldType, types: &[TypeDecl]) -> bool {
+    use FieldType::*;
+    match ft {
+        String | Vec(_) => true,
+        Option(inner) => is_immediate_owned(inner, types),
+        Tuple(elems) => elems.iter().any(|e| is_immediate_owned(e, types)),
+        Named(name) => match find_type(types, name) {
+            TypeDecl::Enum(e) => e
+                .variants
+                .iter()
+                .any(|v| v.fields.iter().any(|f| is_immediate_owned(f, types))),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Compute the per-method `dynspire_free` type index. The construction order of
+/// the `TypeTable` MUST match `gen_spier_schema` exactly so the indices line up
+/// with the spier's `free` match arms.
+fn compute_ret_indices(iface: &Interface) -> Vec<u32> {
+    let mut tt = TypeTable::new();
+    let mut out = Vec::new();
+    for m in &iface.methods {
+        for p in &m.params {
+            let _ = tt.add(&p.ty);
+        }
+        out.push(tt.add(&m.return_type));
+    }
+    out
+}
+
+// --- encode: Python value -> slot stream (mirrors gen_write_encode) ---
+
+fn gen_py_write(ft: &FieldType, expr: &str, w: &str, types: &[TypeDecl], indent: usize) -> std::string::String {
+    use FieldType::*;
+    let pad = " ".repeat(indent);
+    let inpad = " ".repeat(indent + 4);
+    match ft {
+        Unit => std::string::String::new(),
+        Bool => format!("{pad}{w}.write_bool({expr})\n"),
+        U8 => format!("{pad}{w}.write_u8({expr})\n"),
+        U16 => format!("{pad}{w}.write_u16({expr})\n"),
+        U32 => format!("{pad}{w}.write_u32({expr})\n"),
+        U64 => format!("{pad}{w}.write_u64({expr})\n"),
+        I8 => format!("{pad}{w}.write_i8({expr})\n"),
+        I16 => format!("{pad}{w}.write_i16({expr})\n"),
+        I32 => format!("{pad}{w}.write_i32({expr})\n"),
+        I64 => format!("{pad}{w}.write_i64({expr})\n"),
+        F32 => format!("{pad}{w}.write_f32({expr})\n"),
+        F64 => format!("{pad}{w}.write_f64({expr})\n"),
+        Str | String => format!("{pad}{w}.write_str({expr})\n"),
+        U8Slice => format!("{pad}{w}.write_bytes({expr})\n"),
+        OutU8Vec => unreachable!("OutU8Vec handled by gen_py_method"),
+        Vec(inner) => {
+            if matches!(inner.as_ref(), FieldType::U8) {
+                format!("{pad}{w}.write_bytes({expr})\n")
+            } else {
+                panic!(
+                    "dynspire-codegen: Vec<{}> input param is not supported in Python codegen",
+                    inner.canonical()
+                )
+            }
+        }
+        Option(inner) => {
+            let inner_w = gen_py_write(inner, expr, w, types, indent + 4);
+            format!(
+                "{pad}if {expr} is None:\n{inpad}{w}.write_u64(0)\n{pad}else:\n{inpad}{w}.write_u64(1)\n{inner_w}"
+            )
+        }
+        Tuple(elems) => {
+            let mut s = std::string::String::new();
+            for (i, e) in elems.iter().enumerate() {
+                s.push_str(&gen_py_write(e, &format!("{expr}[{i}]"), w, types, indent));
+            }
+            s
+        }
+        Array(inner, len) => {
+            if matches!(inner.as_ref(), FieldType::U8) && *len % 8 == 0 {
+                let mut s = std::string::String::new();
+                for i in 0..*len / 8 {
+                    let start = i * 8;
+                    s.push_str(&format!(
+                        "{pad}{w}.write_u64(int.from_bytes({expr}[{start}..{}], 'little'))\n",
+                        start + 8
+                    ));
+                }
+                s
+            } else {
+                let mut s = std::string::String::new();
+                for i in 0..*len {
+                    s.push_str(&gen_py_write(inner, &format!("{expr}[{i}]"), w, types, indent));
+                }
+                s
+            }
+        }
+        Named(name) => match find_type(types, name) {
+            TypeDecl::Struct(_) | TypeDecl::Opaque(_) => format!("{pad}{w}.write_opaque({expr})\n"),
+            TypeDecl::Enum(e) => gen_py_enum_write(e, expr, w, types, indent),
+        },
+    }
+}
+
+fn gen_py_enum_write(e: &EnumDecl, expr: &str, w: &str, types: &[TypeDecl], indent: usize) -> String {
+    let pad = " ".repeat(indent);
+    let inpad = " ".repeat(indent + 4);
+    let n = &e.name;
+    let mut s = String::new();
+    for (i, v) in e.variants.iter().enumerate() {
+        let kw = if i == 0 { "if" } else { "elif" };
+        s.push_str(&format!("{pad}{kw} {expr}.variant == '{vn}':\n", vn = v.name));
+        s.push_str(&format!("{inpad}{w}.write_u64({i})\n"));
+        for (fi, fty) in v.fields.iter().enumerate() {
+            s.push_str(&gen_py_write(fty, &format!("{expr}.fields[{fi}]"), w, types, indent + 4));
+        }
+    }
+    s.push_str(&format!(
+        "{pad}else:\n{inpad}raise ValueError('invalid {n} variant: ' + repr({expr}.variant))\n"
+    ));
+    s
+}
+
+// --- decode: slot stream -> Python value (mirrors gen_read_receive) ---
+//
+// `gen_py_read_expr` yields a single Python expression (safe to inline). Enum
+// and empty-struct returns need statement blocks and are handled by
+// `gen_py_decode_block`.
+
+fn gen_py_read_expr(ft: &FieldType, r: &str, types: &[TypeDecl], ret_idx: u32) -> std::string::String {
+    use FieldType::*;
+    match ft {
+        Unit => "None".into(),
+        Bool => format!("{r}.read_bool()"),
+        U8 => format!("{r}.read_u8()"),
+        U16 => format!("{r}.read_u16()"),
+        U32 => format!("{r}.read_u32()"),
+        U64 => format!("{r}.read_u64()"),
+        I8 => format!("{r}.read_i8()"),
+        I16 => format!("{r}.read_i16()"),
+        I32 => format!("{r}.read_i32()"),
+        I64 => format!("{r}.read_i64()"),
+        F32 => format!("{r}.read_f32()"),
+        F64 => format!("{r}.read_f64()"),
+        Str | U8Slice => format!("{r}.read_bytes()"),
+        String => format!("{r}.read_string()"),
+        Vec(inner) => {
+            if matches!(inner.as_ref(), FieldType::U8) {
+                format!("{r}.read_bytes()")
+            } else if matches!(inner.as_ref(), FieldType::String) {
+                format!("{r}.read_vec_string()")
+            } else if matches!(inner.as_ref(), FieldType::Vec(ref b) if matches!(b.as_ref(), FieldType::U8)) {
+                format!("{r}.read_vec_bytes()")
+            } else {
+                panic!(
+                    "dynspire-codegen: Vec<{}> return is not supported in Python codegen",
+                    inner.canonical()
+                )
+            }
+        }
+        OutU8Vec => "None".into(),
+        Option(inner) => format!("None if {r}.read() == 0 else {}", gen_py_read_expr(inner, r, types, ret_idx)),
+        Tuple(elems) => {
+            let parts: std::vec::Vec<std::string::String> = elems.iter().map(|e| gen_py_read_expr(e, r, types, ret_idx)).collect();
+            format!("({})", parts.join(", "))
+        }
+        Array(inner, len) => {
+            if matches!(inner.as_ref(), FieldType::U8) && *len % 8 == 0 {
+                let parts: std::vec::Vec<std::string::String> = (0..*len / 8)
+                    .map(|_| format!("{r}.read_u64().to_bytes(8, 'little')"))
+                    .collect();
+                format!("b''.join([{parts}])", parts = parts.join(", "))
+            } else {
+                let parts: std::vec::Vec<std::string::String> = (0..*len)
+                    .map(|_| gen_py_read_expr(inner, r, types, ret_idx))
+                    .collect();
+                format!("[{}]", parts.join(", "))
+            }
+        }
+        Named(name) => match find_type(types, name) {
+            TypeDecl::Struct(s) if s.fields.is_empty() => {
+                panic!("dynspire-codegen: empty struct '{name}' return is not supported in Python codegen")
+            }
+            TypeDecl::Struct(_) | TypeDecl::Opaque(_) => {
+                format!("{name}(self, {r}.read(), {ret_idx})")
+            }
+            TypeDecl::Enum(_) => panic!("dynspire-codegen: enum decode must go through gen_py_decode_block"),
+        },
+    }
+}
+
+/// Statements (at `indent`) that decode the Ok payload into a local `_v`.
+/// Empty for `Unit` (caller returns `None` directly).
+fn gen_py_decode_block(ft: &FieldType, r: &str, types: &[TypeDecl], ret_idx: u32, indent: usize) -> String {
+    let pad = " ".repeat(indent);
+    match ft {
+        FieldType::Unit => String::new(),
+        FieldType::Named(name) => match find_type(types, name) {
+            TypeDecl::Enum(e) => gen_py_enum_read_block(e, r, types, indent),
+            TypeDecl::Struct(_) | TypeDecl::Opaque(_) => {
+                format!("{pad}_v = {name}(self, {r}.read(), {ret_idx})\n")
+            }
+        },
+        _ => format!("{pad}_v = {}\n", gen_py_read_expr(ft, r, types, ret_idx)),
+    }
+}
+
+fn gen_py_enum_read_block(e: &EnumDecl, r: &str, _types: &[TypeDecl], indent: usize) -> String {
+    let pad = " ".repeat(indent);
+    let inpad = " ".repeat(indent + 4);
+    let n = &e.name;
+    let mut s = format!("{pad}_disc = {r}.read()\n");
+    for (i, v) in e.variants.iter().enumerate() {
+        let kw = if i == 0 { "if" } else { "elif" };
+        s.push_str(&format!("{pad}{kw} _disc == {i}:\n"));
+        if v.fields.is_empty() {
+            s.push_str(&format!("{inpad}_v = {n}('{vn}')\n", vn = v.name));
+        } else {
+            let args: Vec<String> = v.fields.iter().map(|fty| gen_py_read_expr(fty, r, _types, 0)).collect();
+            s.push_str(&format!("{inpad}_v = {n}('{vn}', {args})\n", vn = v.name, args = args.join(", ")));
+        }
+    }
+    s.push_str(&format!(
+        "{pad}else:\n{inpad}raise DynSpireError('invalid {n} discriminant ' + str(_disc))\n"
+    ));
+    s
+}
+
+// --- type classes ---
+
+fn gen_py_types(iface: &Interface, struct_ret: &HashMap<String, u32>) -> String {
+    let mut s = String::from("# --- Types ---\n\n");
+    for ty in &iface.types {
+        match ty {
+            TypeDecl::Struct(st) => {
+                let idx = struct_ret.get(&st.name).copied().unwrap_or(0);
+                s.push_str(&format!("class {name}(OpaqueHandle):\n    _free_idx = {idx}\n\n\n", name = st.name, idx = idx));
+            }
+            TypeDecl::Opaque(o) => {
+                let idx = struct_ret.get(&o.name).copied().unwrap_or(0);
+                s.push_str(&format!("class {name}(OpaqueHandle):\n    _free_idx = {idx}\n\n\n", name = o.name, idx = idx));
+            }
+            TypeDecl::Enum(e) => s.push_str(&gen_py_enum_class(e)),
+        }
+    }
+    s
+}
+
+fn gen_py_enum_class(e: &EnumDecl) -> String {
+    let n = &e.name;
+    let mut s = format!("class {n}:\n");
+    s.push_str("    __slots__ = ('variant', 'fields')\n\n");
+    s.push_str("    def __init__(self, variant, *fields):\n");
+    s.push_str("        self.variant = variant\n");
+    s.push_str("        self.fields = fields\n\n");
+    s.push_str("    def __eq__(self, other):\n");
+    s.push_str(&format!("        return isinstance(other, {n}) and self.variant == other.variant and self.fields == other.fields\n\n"));
+    s.push_str("    def __hash__(self):\n");
+    s.push_str("        return hash((self.variant, self.fields))\n\n");
+    s.push_str("    def __repr__(self):\n");
+    s.push_str("        if self.fields:\n");
+    s.push_str("            inner = ', '.join(repr(f) for f in self.fields)\n");
+    s.push_str(&format!("            return '{n}.' + self.variant + '(' + inner + ')'\n"));
+    s.push_str(&format!("        return '{n}.' + self.variant\n\n"));
+    for v in &e.variants {
+        if v.fields.is_empty() {
+            s.push_str(&format!("    @classmethod\n    def {vn}(cls):\n        return cls('{vn}')\n\n", vn = v.name));
+        } else {
+            let args: Vec<String> = (0..v.fields.len()).map(|i| format!("_f{i}")).collect();
+            let pass = args.join(", ");
+            s.push_str(&format!(
+                "    @classmethod\n    def {vn}(cls, {args}):\n        return cls('{vn}', {pass})\n\n",
+                vn = v.name,
+                args = pass,
+                pass = pass
+            ));
+        }
+    }
+    s.push('\n');
+    s
+}
+
+// --- client class ---
+
+fn gen_py_client(iface: &Interface, ret_indices: &[u32]) -> String {
+    let cn = &iface.name;
+    let mut methods = String::new();
+    for (m, &ret_idx) in iface.methods.iter().zip(ret_indices.iter()) {
+        methods.push_str(&gen_py_method(m, ret_idx, &iface.types));
+    }
+    format!(
+        "# --- Client ---\n\nclass {cn}(SpierClient):\n    _spier_name = '{name}'\n    _idl_hash_const = _IDL_HASH\n\n{methods}",
+        cn = cn,
+        name = iface.name.to_lowercase(),
+        methods = methods
+    )
+}
+
+fn gen_py_method(m: &Method, ret_idx: u32, types: &[TypeDecl]) -> String {
+    let inpad = "        ";
+    let mut s = String::new();
+
+    let user_params: Vec<&str> = m
+        .params
+        .iter()
+        .filter(|p| !matches!(p.ty, FieldType::OutU8Vec))
+        .map(|p| p.name.as_str())
+        .collect();
+    let sig = if user_params.is_empty() {
+        String::new()
+    } else {
+        format!(", {}", user_params.join(", "))
+    };
+    s.push_str(&format!("    def {}(self{}):\n", m.name, sig));
+    s.push_str(&format!("{inpad}_w = SlotWriter()\n"));
+
+    let mut ov_count = 0usize;
+    for p in &m.params {
+        match &p.ty {
+            FieldType::OutU8Vec => {
+                s.push_str(&format!("{inpad}_ov{ov_count} = self._new_outvec()\n"));
+                s.push_str(&format!("{inpad}_w.write_u64(_ov{ov_count})\n"));
+                ov_count += 1;
+            }
+            _ => s.push_str(&gen_py_write(&p.ty, &p.name, "_w", types, 8)),
+        }
+    }
+
+    s.push_str(&format!("{inpad}_out = new_out_array()\n"));
+    s.push_str(&format!("{inpad}self._dispatch('{}', _w, _out)\n", m.name));
+    s.push_str(&format!("{inpad}_r = OutReader(_out, self)\n"));
+    s.push_str(&format!("{inpad}_tag = _r.read()\n"));
+    s.push_str(&format!("{inpad}if _tag == 1:\n"));
+    s.push_str(&format!("{inpad}    _err = _r.read_string()\n"));
+    s.push_str(&format!("{inpad}    self.free_owned({}, _out, _r.pos())\n", ret_idx));
+    s.push_str(&format!("{inpad}    raise DynSpireError(_err)\n"));
+
+    let is_unit = matches!(m.return_type, FieldType::Unit);
+    let owned = is_immediate_owned(&m.return_type, types);
+
+    if !is_unit {
+        s.push_str(&gen_py_decode_block(&m.return_type, "_r", types, ret_idx, 8));
+        if owned {
+            s.push_str(&format!("{inpad}self.free_owned({}, _out, _r.pos())\n", ret_idx));
+        }
+    }
+
+    if ov_count > 0 {
+        let lst: Vec<String> = (0..ov_count).map(|i| format!("self._read_outvec(_ov{i})")).collect();
+        s.push_str(&format!("{inpad}_outs = [{}]\n", lst.join(", ")));
+        if is_unit {
+            s.push_str(&format!("{inpad}return None, _outs\n"));
+        } else {
+            s.push_str(&format!("{inpad}return _v, _outs\n"));
+        }
+    } else if is_unit {
+        s.push_str(&format!("{inpad}return None\n"));
+    } else {
+        s.push_str(&format!("{inpad}return _v\n"));
+    }
+    s.push('\n');
+    s
+}
+
+/// Generate a complete pure-Python ctypes client module from an [`Interface`].
+pub fn generate_python(iface: &Interface) -> String {
+    generate_python_with_ctx(iface, &mut BuildContext::new())
+}
+
+fn generate_python_with_ctx(iface: &Interface, _ctx: &mut BuildContext) -> String {
+    let hash = fnv1a_64(iface.canonical_sig().as_bytes());
+    let types = &iface.types;
+    let ret_indices = compute_ret_indices(iface);
+
+    // Representative free index per boxed struct/opaque type (any method that
+    // returns it works — every matching free arm reconstructs the same type).
+    let mut struct_ret: HashMap<String, u32> = HashMap::new();
+    for (m, &ridx) in iface.methods.iter().zip(ret_indices.iter()) {
+        if let FieldType::Named(name) = &m.return_type {
+            if let Some(t) = types.iter().find(|t| t.name() == name.as_str()) {
+                if matches!(t, TypeDecl::Struct(_) | TypeDecl::Opaque(_)) {
+                    struct_ret.entry(name.clone()).or_insert(ridx);
+                }
+            }
+        }
+    }
+
+    let mut out = String::new();
+    out.push_str("# Auto-generated by dynspire-codegen. Do not edit.\n");
+    out.push_str("from __future__ import annotations\n\n");
+    out.push_str("from dynspire._runtime import (\n");
+    out.push_str("    DynSpireError,\n    OpaqueHandle,\n    OutReader,\n    SlotWriter,\n    SpierClient,\n    new_out_array,\n)\n\n\n");
+    out.push_str(&format!("_IDL_HASH = 0x{:016x}\n\n\n", hash));
+    out.push_str(&gen_py_types(iface, &struct_ret));
+    out.push_str(&gen_py_client(iface, &ret_indices));
+    out.push('\n');
     out
 }
 
@@ -1487,14 +1644,14 @@ mod tests {
     }
 
     #[test]
-    fn generated_code_contains_schema() {
+    fn generated_code_contains_free_and_hash() {
         let iface = parse_rle();
         let code = generate(&iface);
-        assert!(code.contains("__IDL_TYPE_TABLE"));
-        assert!(code.contains("__IDL_METHODS"));
-        assert!(code.contains("__IDL_SCHEMA"));
-        assert!(code.contains("idl_schema()"));
         assert!(code.contains("dynspire_free"));
+        assert!(code.contains("dynspire_idl_hash"));
+        assert!(!code.contains("__IDL_SCHEMA"), "schema statics removed");
+        assert!(!code.contains("idl_schema()"), "idl_schema() accessor removed");
+        assert!(!code.contains("__IDL_TYPE_TABLE"), "type table removed");
     }
 
     #[test]
@@ -1526,12 +1683,12 @@ mod tests {
     }
 
     #[test]
-    fn generated_code_contains_enum_descriptor() {
+    fn generated_code_no_enum_descriptors() {
         let iface = parse_rle();
         let code = generate(&iface);
-        assert!(code.contains("__ENUM_DESC_Tone"));
-        assert!(code.contains("EnumVariantDesc"));
-        assert!(!code.contains("SlotEnumDescriptor for Tone"), "SlotEnumDescriptor trait impls removed");
+        assert!(!code.contains("__ENUM_DESC"), "enum descriptors removed");
+        assert!(!code.contains("EnumVariantDesc"), "EnumVariantDesc removed");
+        assert!(!code.contains("__STRUCT_DESC"), "struct descriptors removed");
     }
 
     #[test]
@@ -1568,7 +1725,6 @@ mod tests {
             "interface Foo { fn a(id: [u8; 16]) -> [u8; 16]; }",
         ).unwrap();
         let code = generate(&iface);
-        assert!(code.contains("IDL_ARRAY"));
         assert!(code.contains("fn a(&self, id: [u8; 16]) -> Result<[u8; 16], String>"));
     }
 
@@ -1793,29 +1949,27 @@ mod tests {
         ).unwrap();
         let code_a = generate_with_ctx(&iface_a, &mut ctx);
         assert!(code_a.contains("pub enum Color"));
-        assert!(code_a.contains("__ENUM_DESC_Color"));
 
         let iface_b = parser::parse(
             r#"interface B { enum Color { Red, Green, Blue, } fn f(c: Color) -> (); }"#,
         ).unwrap();
         let code_b = generate_with_ctx(&iface_b, &mut ctx);
         assert!(!code_b.contains("pub enum Color"), "Color definition should be skipped");
-        assert!(code_b.contains("__ENUM_DESC_Color"), "each spier macro has its own descriptors");
     }
 
     #[test]
     fn test_ctx_dedup_skips_opaque() {
         let mut ctx = BuildContext::new();
         let iface_a = parser::parse(
-            r#"interface A { opaque struct Handle; fn f() -> Handle; }"#,
+            r#"interface A { struct Handle { id: u64, } fn f() -> Handle; }"#,
         ).unwrap();
         let code_a = generate_with_ctx(&iface_a, &mut ctx);
-        assert!(code_a.contains("__STRUCT_DESC_Handle"));
+        assert!(code_a.contains("pub struct Handle"));
 
         let iface_b = parser::parse(
-            r#"interface B { opaque struct Handle; fn f(h: Handle) -> (); }"#,
+            r#"interface B { struct Handle { id: u64, } fn f(h: Handle) -> (); }"#,
         ).unwrap();
         let code_b = generate_with_ctx(&iface_b, &mut ctx);
-        assert!(code_b.contains("__STRUCT_DESC_Handle"), "each spier macro has its own descriptors");
+        assert!(!code_b.contains("pub struct Handle"), "Handle definition should be skipped");
     }
 }

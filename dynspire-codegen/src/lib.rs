@@ -51,5 +51,5 @@ mod lexer;
 mod parser;
 
 pub use ast::*;
-pub use gen::{generate, generate_spier, generate_host, BuildContext};
+pub use gen::{generate, generate_host, generate_python, generate_spier, BuildContext};
 pub use parser::{parse, parse_type_fragment, validate, ParseError};

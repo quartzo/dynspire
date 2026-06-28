@@ -10,8 +10,9 @@ step invokes `dynspire_codegen::build()` to generate all Rust code:
 - **Spier crate**: compiles the `.dspi` via its own `build.rs`.
   Implements the generated trait, then invokes
   `impl_{name}_spier!($state, init, "name")` — a `macro_rules!` that
-  generates all C-ABI dispatch functions, create/destroy, and schema
-  exports.
+  generates all C-ABI dispatch functions, create/destroy, and name
+  exports. The `build.rs` also emits a typed Python client (`.py`) via
+  `BuildContext::build_python()`.
 - **Host crate**: compiles the same `.dspi` (independently or via a
   shared IDL crate). Uses the generated `DynSpire{Name}` client wrapper
   directly. No handwritten boilerplate.
@@ -53,3 +54,4 @@ dynspire-codegen/ ← .dspi → .rs
 | `#[spier_dispatch]` proc macro | Generated `macro_rules! impl_{name}_spier!` |
 | `#[spier_storage]` proc macro | Absorbed into `impl_{name}_spier!` |
 | Handwritten tower wrapper | Generated `DynSpire{Name}` struct |
+| PyO3 runtime reflection | Codegen-emitted typed Python (`.py`) via `build_python()` |

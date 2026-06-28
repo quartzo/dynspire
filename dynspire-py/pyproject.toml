@@ -1,14 +1,13 @@
 [build-system]
-requires = ["maturin>=1.5,<2.0"]
-build-backend = "maturin"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [project]
 name = "dynspire"
-version = "0.2.0"
-description = "PyO3 engine for DynSpire spiers — schema reflection, zero codegen"
+version = "0.3.0"
+description = "Pure-Python ctypes runtime for DynSpire spiers — bindings are code-generated, no Rust toolchain needed"
 requires-python = ">=3.8"
 license = "MIT"
 
-[tool.maturin]
-# extension-module prevents linking libpython on unix; maturin handles it.
-features = ["pyo3/extension-module"]
+[tool.hatch.build.targets.wheel]
+packages = ["src/dynspire"]
