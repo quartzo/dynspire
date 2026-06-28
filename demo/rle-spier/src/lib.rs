@@ -1,5 +1,3 @@
-#![allow(non_upper_case_globals)]
-
 use std::collections::HashMap;
 
 include!(concat!(env!("OUT_DIR"), "/rle_spier.rs"));

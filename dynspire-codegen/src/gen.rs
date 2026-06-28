@@ -758,6 +758,7 @@ fn gen_enum_def(e: &EnumDecl) -> String {
 fn gen_struct_descriptor(name: &str) -> String {
     format!(
         r#"#[doc(hidden)]
+#[allow(non_upper_case_globals)]
 pub static __STRUCT_DESC_{n}: dynspire::ffi::StructDescriptor = dynspire::ffi::StructDescriptor {{
     name: b"{n}\0".as_ptr(),
     name_len: {len},
@@ -796,18 +797,22 @@ fn gen_enum_descriptor(e: &EnumDecl) -> String {
 
     format!(
         r#"#[doc(hidden)]
+#[allow(non_upper_case_globals)]
 pub static __ENUM_TYPES_{n}: &[dynspire::ffi::IdlTypeNode] = &[
 {tt}];
 
 #[doc(hidden)]
+#[allow(non_upper_case_globals)]
 pub static __ENUM_FIELD_TYPES_{n}: &[u32] = &[{ft}];
 
 #[doc(hidden)]
+#[allow(non_upper_case_globals)]
 pub static __ENUM_VARIANTS_{n}: &[dynspire::ffi::EnumVariantDesc] = &[
 {ve}
 ];
 
 #[doc(hidden)]
+#[allow(non_upper_case_globals)]
 pub static __ENUM_DESC_{n}: dynspire::ffi::EnumDescriptor = dynspire::ffi::EnumDescriptor {{
     name: b"{n}\0".as_ptr(),
     name_len: {nl},
@@ -1043,7 +1048,7 @@ fn gen_spier_schema(iface: &Interface, hash: u64) -> String {
 
     let enum_ptrs_static = if enum_count > 0 {
         format!(
-            "#[doc(hidden)]\nstatic __IDL_ENUM_PTRS: &[&'static dynspire::ffi::EnumDescriptor] = &[\n{}\n];\n\n",
+            "#[doc(hidden)]\n#[allow(non_upper_case_globals)]\nstatic __IDL_ENUM_PTRS: &[&'static dynspire::ffi::EnumDescriptor] = &[\n{}\n];\n\n",
             enum_ptr_entries.join("\n"),
         )
     } else {
@@ -1052,7 +1057,7 @@ fn gen_spier_schema(iface: &Interface, hash: u64) -> String {
 
     let struct_ptrs_static = if struct_count > 0 {
         format!(
-            "#[doc(hidden)]\nstatic __IDL_STRUCT_PTRS: &[&'static dynspire::ffi::StructDescriptor] = &[\n{}\n];\n\n",
+            "#[doc(hidden)]\n#[allow(non_upper_case_globals)]\nstatic __IDL_STRUCT_PTRS: &[&'static dynspire::ffi::StructDescriptor] = &[\n{}\n];\n\n",
             struct_ptr_entries.join("\n"),
         )
     } else {
@@ -1061,14 +1066,17 @@ fn gen_spier_schema(iface: &Interface, hash: u64) -> String {
 
     format!(
         r#"{descriptor_statics}{enum_ptrs}{struct_ptrs}#[doc(hidden)]
+#[allow(non_upper_case_globals)]
 static __IDL_TYPE_TABLE: &[dynspire::ffi::IdlTypeNode] = &[
 {tt}];
 
 #[doc(hidden)]
+#[allow(non_upper_case_globals)]
 static __IDL_METHODS: &[dynspire::ffi::IdlMethod] = &[
 {me}
 ];
 
+#[allow(non_upper_case_globals)]
 static __IDL_SCHEMA: dynspire::ffi::DynSpireIdl = dynspire::ffi::DynSpireIdl {{
     name: b"\0".as_ptr(),
     name_len: 0,
@@ -1212,8 +1220,8 @@ fn gen_spier_macro(iface: &Interface) -> String {
             r#"        #[no_mangle]
         pub unsafe extern "C" fn {fn_name}(
             state_handle: *mut std::ffi::c_void,
-            in_slots: *const u64,
-            in_count: usize,
+            {in_slots_name}: *const u64,
+            {in_count_name}: usize,
             out_slots: *mut u64,
             out_capacity: usize,
         ) -> u8 {{
@@ -1223,6 +1231,8 @@ fn gen_spier_macro(iface: &Interface) -> String {
         }}
 "#,
             fn_name=fn_name,
+            in_slots_name=if m.params.is_empty() { "_in_slots" } else { "in_slots" },
+            in_count_name=if m.params.is_empty() { "_in_count" } else { "in_count" },
             null_check=null_check,
             state_cast=state_cast,
             decode=decode_block,
