@@ -1315,16 +1315,34 @@ fn gen_py_read_expr(ft: &FieldType, r: &str, types: &[TypeDecl], ret_idx: u32) -
 
 /// Statements (at `indent`) that decode the Ok payload into a local `_v`.
 /// Empty for `Unit` (caller returns `None` directly).
-fn gen_py_decode_block(ft: &FieldType, r: &str, types: &[TypeDecl], ret_idx: u32, indent: usize) -> String {
+/// `free_prefix` accumulates Option Some-tags so nested `Option<Struct>`
+/// OpaqueHandles pass the correct slot layout to `dynspire_free`.
+fn gen_py_decode_block(ft: &FieldType, r: &str, types: &[TypeDecl], ret_idx: u32, indent: usize, free_prefix: &[u64]) -> String {
     let pad = " ".repeat(indent);
     match ft {
         FieldType::Unit => String::new(),
         FieldType::Named(name) => match find_type(types, name) {
             TypeDecl::Enum(e) => gen_py_enum_read_block(e, r, types, indent),
             TypeDecl::Struct(_) | TypeDecl::Opaque(_) => {
-                format!("{pad}_v = {name}(self, {r}.read(), {ret_idx})\n")
+                let pfx = if free_prefix.is_empty() {
+                    String::new()
+                } else {
+                    format!(", ({},)", free_prefix.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", "))
+                };
+                format!("{pad}_v = {name}(self, {r}.read(), {ret_idx}{pfx})\n")
             }
         },
+        FieldType::Option(inner) => {
+            let inpad = " ".repeat(indent + 4);
+            let mut new_prefix = free_prefix.to_vec();
+            new_prefix.push(1);
+            let mut s = format!("{pad}_opt = {r}.read()\n");
+            s.push_str(&format!("{pad}if _opt == 0:\n"));
+            s.push_str(&format!("{inpad}_v = None\n"));
+            s.push_str(&format!("{pad}else:\n"));
+            s.push_str(&gen_py_decode_block(inner, r, types, ret_idx, indent + 4, &new_prefix));
+            s
+        }
         _ => format!("{pad}_v = {}\n", gen_py_read_expr(ft, r, types, ret_idx)),
     }
 }
@@ -1463,7 +1481,7 @@ fn gen_py_method(m: &Method, ret_idx: u32, types: &[TypeDecl]) -> String {
     let owned = is_immediate_owned(&m.return_type, types);
 
     if !is_unit {
-        s.push_str(&gen_py_decode_block(&m.return_type, "_r", types, ret_idx, 8));
+        s.push_str(&gen_py_decode_block(&m.return_type, "_r", types, ret_idx, 8, &[]));
         if owned {
             s.push_str(&format!("{inpad}self.free_owned({}, _out, _r.pos())\n", ret_idx));
         }
@@ -1662,12 +1680,13 @@ def new_out_array():
 
 
 class OpaqueHandle:
-    __slots__ = ("_client", "_ptr", "_free_idx", "__weakref__")
+    __slots__ = ("_client", "_ptr", "_free_idx", "_free_slots", "__weakref__")
 
-    def __init__(self, client, ptr, free_idx):
+    def __init__(self, client, ptr, free_idx, free_slots=()):
         self._client = client
         self._ptr = ptr
         self._free_idx = free_idx
+        self._free_slots = free_slots
 
     @property
     def type_name(self):
@@ -1678,7 +1697,7 @@ class OpaqueHandle:
 
     def __del__(self):
         try:
-            self._client._free_opaque(self._free_idx, self._ptr)
+            self._client._free_opaque(self._free_idx, self._ptr, self._free_slots)
         except Exception:
             pass
 
@@ -1767,11 +1786,12 @@ class SpierClient:
     def free_owned(self, type_idx, out, count):
         self._free_fn(type_idx, ctypes.cast(out, ctypes.c_void_p), count)
 
-    def _free_opaque(self, free_idx, ptr):
+    def _free_opaque(self, free_idx, ptr, free_slots=()):
         if ptr == 0:
             return
-        slots = (ctypes.c_uint64 * 2)(0, ptr)
-        self._free_fn(free_idx, slots, 2)
+        n = 2 + len(free_slots)
+        slots = (ctypes.c_uint64 * n)(0, *free_slots, ptr)
+        self._free_fn(free_idx, slots, n)
 
     def _new_outvec(self):
         return self._vec_create_fn()

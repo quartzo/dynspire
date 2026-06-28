@@ -173,6 +173,37 @@ class TestEnum:
 
 
 # ---------------------------------------------------------------------------
+# Option<Enum> and Option<Struct> returns
+# ---------------------------------------------------------------------------
+
+class TestOptionReturns:
+    def test_try_classify_some(self, c):
+        tone = c.try_classify(DATA)
+        assert tone is not None
+        assert tone.variant == "Loud"
+
+    def test_try_classify_none(self, c):
+        assert c.try_classify(b"") is None
+
+    def test_try_analyze_some(self, c):
+        report = c.try_analyze(DATA)
+        assert isinstance(report, CompressionReport)
+        summary = c.report_summary(report)
+        assert "original=29" in summary
+
+    def test_try_analyze_none(self, c):
+        assert c.try_analyze(b"") is None
+
+    def test_try_analyze_gc_frees(self, c):
+        """Option<Struct> OpaqueHandle must survive GC without crashing."""
+        import gc
+        report = c.try_analyze(DATA)
+        assert report is not None
+        del report
+        gc.collect()
+
+
+# ---------------------------------------------------------------------------
 # Lifecycle
 # ---------------------------------------------------------------------------
 

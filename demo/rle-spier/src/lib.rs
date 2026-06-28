@@ -131,6 +131,22 @@ impl RleEngine for RleState {
         })
     }
 
+    fn try_classify(&self, data: &[u8]) -> Result<Option<Tone>, String> {
+        if data.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(self.classify(data)?))
+        }
+    }
+
+    fn try_analyze(&self, data: &[u8]) -> Result<Option<CompressionReport>, String> {
+        if data.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(self.analyze(data)?))
+        }
+    }
+
     fn delay(&self, ms: u64) -> Result<(), String> {
         std::thread::sleep(std::time::Duration::from_millis(ms));
         Ok(())
