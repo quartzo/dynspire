@@ -314,10 +314,9 @@ stats()
 ## Project Layout
 
 ```
-pyproject.toml     uv project root (declares dynspire-py as local dependency)
+pyproject.toml     uv project root
 dynspire/          Core: arena FFI, slot system, tower client
 dynspire-codegen/  DSL parser + code generator (.dspi → .rs)
-dynspire-py/       Python runtime (pure-Python ctypes, consumed by generated clients)
 demo/              RLE compression showcase
   rle-spier/         .dspi + build.rs (generates spier code) + cdylib implementation
   rle-host/          build.rs compiles same .dspi (generates host code) + binary
@@ -352,9 +351,9 @@ The spier's `build.rs` emits a pure-Python ctypes client (`.py`) alongside
 the Rust code. Python users import the generated module directly — no PyO3,
 no maturin, no Rust toolchain required on the consuming side.
 
-The generated module imports runtime primitives from the `dynspire` package
-(`SlotWriter`, `OutReader`, `SpierClient`, etc.) and provides a typed class
-per interface:
+The generated module is self-contained — it inlines the ctypes primitives
+(`SlotWriter`, `SpierClient`, `OpaqueHandle`, etc.) and provides a typed
+class per interface:
 
 ```python
 from rle import Rle, Tone, CompressionReport
@@ -375,10 +374,11 @@ with Rle("target/debug/librle_spier.so") as c:
     summary = c.report_summary(report)      # "original=12 ..."
 ```
 
-The runtime package (`dynspire-py`) provides the ctypes primitives:
-`SlotWriter` (encodes args into `u64[]`), `OutReader` (decodes results),
-`SpierClient` (loads `.so`, verifies IDL hash, dispatches), `OpaqueHandle`
-(GC-managed boxed pointer), and out-vec helpers.
+The generated module inlines all runtime primitives: `SlotWriter`
+(encodes args into `u64[]`), `SpierClient` (loads `.so`, verifies IDL
+hash, dispatches), `OpaqueHandle` (GC-managed boxed pointer), and
+out-vec helpers. No external package dependency — only `ctypes` from
+the Python stdlib.
 
 ## License
 

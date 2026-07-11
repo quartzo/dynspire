@@ -1,15 +1,14 @@
 # DynSpire Architecture
 
-This document covers the internals of the DynSpire plugin framework: the slot system, FFI conventions, IDL schema export, DSL codegen, and the Python PyO3 adapter.
+This document covers the internals of the DynSpire plugin framework: the slot system, FFI conventions, DSL codegen, and the Python ctypes client.
 
 ## Table of Contents
 
 - [Overview](#overview)
 - [Slot System](#slot-system)
-- [IDL Schema Export](#idl-schema-export)
 - [DSL Codegen](#dsl-codegen)
 - [Tower Client](#tower-client)
-- [Python PyO3 Adapter](#python-pyo3-adapter)
+- [Python Client](#python-client)
 - [Path Resolution](#path-resolution)
 
 ---
@@ -21,7 +20,7 @@ DynSpire is a plugin architecture with three roles:
 > **Read this first — DynSpire is an in-process plugin ABI, not an RPC framework.** A spier is a `cdylib` loaded into the host via `dlopen`; host and spier run in **the same process and the same address space**. Crossing the boundary means a **C ABI call with a flat `u64[]` slot convention** — there is no network, no IPC, no wire format. Consequences that follow from this and *do not* hold under an RPC mental model:
 >
 > - **Opaque pointers are valid across the boundary.** DSL-declared structs pass `Box::into_raw` → 1 slot (the raw address); the receiver does `Box::from_raw` or dereferences directly. The struct is **not serialized** — it stays live, with whatever state machine, lock, or inner reference it holds. Both sides alias the same memory.
-> - **"IDL" / "schema" = in-process ABI contract + runtime type table**, exposed via `dynspire_idl_schema()`. Not a serialization descriptor, not a protobuf schema. The IDL hash gates **binary/link compatibility** between two `.so`s compiled against the same trait — not message-level versioning.
+> - **"IDL" / "schema" = in-process ABI contract.** Not a serialization descriptor, not a protobuf schema. The IDL hash gates **binary/link compatibility** between two `.so`s compiled against the same interface — not message-level versioning.
 > - **The boundary is compile/link, not process.** Borrows (`&[u8]`, `&str`), out-params (`&mut Vec<u8>`), and ownership-transfer (`Vec<T>` via `Box::into_raw`) are all sound precisely because caller and callee share one heap. None of this is possible across a process boundary; all of it is routine here.
 
 | Role | Who | What |
@@ -40,13 +39,13 @@ DynSpire is a plugin architecture with three roles:
 ┌─────────────────────────────────────────────┐
 │  Host (Rust binary or Python script)        │
 │                                             │
-│  DynSpireClient / SpierHandle               │
+│  DynSpireClient                              │
 │    .dispatch(Op, in_slots, out_slots)        │
 │    → SlotWriter encodes args as u64[]       │
 │    → dispatch via FFI                       │
 │    → SlotReader decodes response u64[]      │
 └──────────────────┬──────────────────────────┘
-                   │ libloading / PyO3
+                   │ libloading / ctypes
                    ▼
 ┌─────────────────────────────────────────────┐
 │  Spier .so (cdylib)                         │
@@ -59,7 +58,6 @@ DynSpire is a plugin architecture with three roles:
 │  dynspire_destroy(state)                    │
 │                                             │
 │  dynspire_idl_hash() → u64                  │
-│  dynspire_idl_schema() → &DynSpireIdl       │
 └─────────────────────────────────────────────┘
 ```
 
@@ -113,46 +111,6 @@ impl<'a> SlotReader<'a> {
 - **Ownership transfer on returns**: `Vec<T>` is moved across the boundary via `Box::into_raw` / `forget` on the spier side, `Box::from_raw` on the host side. No copy.
 - **`Vec<T: Clone>` input**: the caller sends `(ptr, len)` pointing to its own heap memory. The spier clones elements via `slice::from_raw_parts(ptr, len).to_vec()`. Elements are never individually slot-encoded — always 2 slots regardless of count or element complexity. Rust→Rust only; Python callers serialize complex Vecs to `&[u8]`.
 - **`Result<T, String>` is universal**: every dispatch method returns `Result<T, String>`. The tag slot (0/1) distinguishes Ok from Err. The generated tower wrapper decodes the tag and returns `Result<R, String>` — the outer layer is transport errors, the inner is the spier's application error.
-
----
-
-## IDL Schema Export
-
-Every spier exports a static `DynSpireIdl` struct via `dynspire_idl_schema()`:
-
-```rust
-#[repr(C)]
-pub struct DynSpireIdl {
-    pub name: *const u8,
-    pub name_len: usize,
-    pub hash: u64,
-    pub type_table: *const IdlTypeNode,
-    pub type_count: usize,
-    pub methods: *const IdlMethod,
-    pub method_count: usize,
-    pub enum_table: *const *const EnumDescriptor,
-    pub enum_count: usize,
-}
-```
-
-This allows any caller (Rust or Python) to discover at runtime:
-- The IDL hash (for compatibility verification)
-- All methods, their names, parameter names/types, and return types
-- All enum variants with their field types
-
-The type table uses a node-based representation:
-
-```rust
-#[repr(C)]
-pub struct IdlTypeNode {
-    pub kind: u8,           // IDL_U8, IDL_SLICE, IDL_VEC, IDL_TUPLE, ...
-    pub child_count: u8,    // Number of valid children (0-8)
-    pub size: u32,          // Array length (for IDL_ARRAY)
-    pub children: [i32; 8], // Indices into type_table, or -1
-}
-```
-
-Composite types are built recursively: `Vec<u8>` is `IDL_VEC` with `children[0]` pointing to `IDL_U8`. `Option<(String, u64)>` is `IDL_OPTION` with `children[0]` pointing to `IDL_TUPLE(String, U64)`. Tuples of up to 8 elements are supported (matching the 8-slot FFI limit).
 
 ---
 
@@ -225,7 +183,7 @@ The spier and host each compile the `.dspi` with a different `build.rs` entry po
 | `pub struct {Type}` / `pub enum {Type}` | Spier |
 | `pub enum {Name}Op` | Spier (dispatch index) |
 | `pub const {NAME}_IDL_HASH: u64` | Spier |
-| `#[macro_export] macro_rules! impl_{name}_spier!` | Spier — expands to dispatch functions, `dynspire_create`/`destroy`, and all IDL schema exports (`__IDL_SCHEMA`, `idl_schema()`, `dynspire_free()`, type/method tables, descriptors) |
+| `#[macro_export] macro_rules! impl_{name}_spier!` | Spier — expands to dispatch functions, `dynspire_create`/`destroy`, `dynspire_free()`, and `dynspire_idl_hash` |
 
 **Host side** — `dynspire_codegen::build_host("../my-spier/src/my.dspi")` writes `OUT_DIR/my_host.rs`:
 
@@ -334,7 +292,7 @@ impl RleEngine for RleState {
 impl_rle_spier!(RleState, init, "rle");
 ```
 
-The macro expands to all `dynspire_dispatch_{method}` functions (decoding args from slots, calling the trait method, encoding the result), plus `dynspire_create`, `dynspire_destroy`, `dynspire_idl_hash`, `dynspire_spier_name`, `dynspire_idl_schema`, and the IDL schema internals (`__IDL_SCHEMA`, `idl_schema()`, `dynspire_free()`, type/method tables, enum/struct descriptors). All schema symbols are scoped inside the macro — no module-scope conflicts when two `.dspi` files are compiled in the same crate.
+The macro expands to all `dynspire_dispatch_{method}` functions (decoding args from slots, calling the trait method, encoding the result), plus `dynspire_create`, `dynspire_destroy`, `dynspire_spier_name`, `dynspire_idl_hash`, and `dynspire_free()`. All symbols are scoped inside the macro — no module-scope conflicts when two `.dspi` files are compiled in the same crate.
 
 ### Application errors: use IDL-declared enums
 
@@ -414,67 +372,48 @@ The `SpierOp` trait ensures `dispatch()` only accepts the generated Op enum — 
 
 ---
 
-## Python PyO3 Adapter
+## Python Client
 
-The Python adapter (crate `dynspire-py`, package `dynspire`) is a compiled PyO3 extension that provides the same capabilities as the Rust tower client. Decode runs in Rust — owned `Vec`/`String` reconstruction uses `Box::from_raw` natively, so there is no stride arithmetic and no per-call `dynspire_free` for data returns.
-
-### Schema Reflection
-
-```python
-lib = load_spier("rle_spier", lib_dir="target/debug")
-schema = lib.schema()
-
-# Methods — returns SpierMethod objects with .name, .params, .return_type, .index
-for m in schema.methods:
-    print(schema.method_sig(m))
-    # compress(data: Slice<U8>) -> Result<Vec<U8>, String>
-
-# Detailed introspection
-m = schema.method("compress")        # SpierMethod
-p = m.params[0]                      # SpierParam (.name, .type_idx)
-ti = schema.type_at(p.type_idx)      # SpierTypeInfo (.kind_name)
-enum = schema.enum_by_name("Tone")   # SpierEnumSchema (.name, .variant_names)
-EnumCls = enum.create_enum_class()   # SpierEnumClass — VariantName(payload) → SpierEnumValue
-
-assert lib.idl_hash() == schema.hash
-```
-
-The engine reads the `DynSpireIdl` C struct via `libloading`, walking the type table and method table to build an in-memory `SchemaData` (method descriptors, type nodes, enum descriptors). All schema objects (`SpierMethod`, `SpierParam`, `SpierTypeInfo`, `SpierEnumSchema`) are lightweight snapshots constructed on demand from this shared `Arc<SchemaData>`.
+The spier's `build.rs` emits a self-contained Python ctypes client (`.py`) alongside the Rust code. The generated module inlines all runtime primitives (`SlotWriter`, `SpierClient`, `OpaqueHandle`, out-vec helpers) — no external package dependency, only `ctypes` from the Python stdlib. Python users import the generated module directly; no PyO3, no maturin, no Rust toolchain required on the consuming side.
 
 ### Calling Convention
 
 ```python
-with lib.create_handle() as h:
-    # Attribute access (recommended)
-    compressed = h.compress(input_data)
+from rle import Rle, Tone, CompressionReport
 
-    # Escape hatch for dynamic method names
-    compressed = h.call("compress", input_data)
+with Rle("target/debug/librle_spier.so") as c:
+    compressed = c.compress(b"AAAABBBBCCCC")
 
-    # Out-vec methods (&mut Vec<u8>) auto-return (ret_val, list[bytes])
-    ok, outs = h.compress_into_checked(input_data)
+    # Out-vec methods (&mut Vec<u8>) return (ret_val, list[bytes])
+    ok, outs = c.compress_into_checked(b"AAAABBBBCCCC")
+
+    # Enums are typed Python objects
+    tone = c.classify(b"AAAABBBBCCCC")     # Tone.Loud(71)
+    desc = c.describe_tone(Tone.Quiet())    # "silence"
+
+    # Opaque structs are boxed handles (freed on GC)
+    report = c.analyze(b"AAAABBBBCCCC")     # CompressionReport
+    summary = c.report_summary(report)      # "original=12 ..."
 ```
 
-Attribute access (`h.compress(data)`) returns a `BoundMethod` that dispatches through the same unified path as `h.call("compress", data)`. The engine auto-detects out-vec parameters from the schema — no separate `call_with_outs` is needed. When a method has `&mut Vec<u8>` params, the call returns `(ret_val, list[bytes])`; otherwise it returns the decoded value directly.
+The generated client handles:
 
-The engine handles:
-
-- **Borrows** (`&[u8]`, `&str`): borrows Python memory directly (GIL is held during the call, so the borrow is sound)
-- **Owned returns** (`Vec<u8>`, `String`, tuples, enums): reconstructed in Rust via `Box::from_raw` and converted to Python objects; dropped normally
-- **Opaque struct returns**: wrapped in `OpaqueHandle` (holds the boxed pointer, frees via `dynspire_free` on GC; can be passed back as an input)
+- **Borrows** (`&[u8]`, `&str`): copies Python bytes into a ctypes array pinned for the call duration, passes `(ptr, len)` slots
+- **Owned returns** (`Vec<u8>`, `String`): copied into Python `bytes`/`str` via `ctypes.string_at`, then freed immediately via `dynspire_free`
+- **Opaque struct returns**: wrapped in `OpaqueHandle` (holds the boxed pointer, frees via `dynspire_free` on `__del__`; can be passed back as an input)
 - **OutVec** (`&mut Vec<u8>`): creates a Rust `Vec` via `dynspire_vec_create()`, passes the handle, snapshots contents via `dynspire_vec_view()`, frees via `dynspire_vec_free()`
-- **Enums** (DSL `enum`): decoded to `SpierEnumValue` (variant name + payload tuple); can be passed back as an input
+- **Enums** (DSL `enum`): decoded to typed Python classes generated at codegen time; can be passed back as an input
 - **Result<T, String>**: reads the tag slot, decodes the Ok value or raises `RuntimeError` with the error string
 
 ### Lifecycle
 
 ```python
-with lib.create_handle() as h:
-    h.compress(data)
-    # destroy() called automatically on __exit__
+with Rle("target/debug/librle_spier.so") as c:
+    c.compress(data)
+    # dynspire_destroy() called automatically on __exit__
 ```
 
-`SpierHandle` implements `Drop` — calls `dynspire_destroy()` if the `with` block wasn't used. The `.so` stays mapped (`Arc<Library>`) until the last handle, `OpaqueHandle`, or `BoundMethod` referencing it is dropped, so `f = h.compress; del h; f(data)` is safe.
+`SpierClient` is its own context manager — calls `dynspire_destroy()` on `__exit__` or `__del__`. The `.so` stays mapped via `ctypes.CDLL` for the lifetime of the client object (ctypes does not call `dlclose`).
 
 ---
 
