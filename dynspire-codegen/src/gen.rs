@@ -264,6 +264,27 @@ fn gen_write_encode(ft: &FieldType, expr: &str, w: &str, types: &[TypeDecl]) -> 
                 s
             }
         }
+        FieldType::DStr | FieldType::DSlice(_) => {
+            format!("{w}.write_u64({expr}.ptr as u64); {w}.write_u64({expr}.len as u64);")
+        }
+        FieldType::DString => {
+            format!(
+                "{w}.write_u64({expr}.allocator as u64); {w}.write_u64({expr}.ptr as u64); \
+                 {w}.write_u64({expr}.len as u64); {w}.write_u64({expr}.cap as u64);"
+            )
+        }
+        FieldType::DVec(_) => {
+            format!(
+                "{w}.write_u64({expr}.allocator as u64); {w}.write_u64({expr}.ptr as u64); \
+                 {w}.write_u64({expr}.len as u64); {w}.write_u64({expr}.cap as u64);"
+            )
+        }
+        FieldType::DOption(inner) => {
+            let some = gen_write_encode(inner, "__v", w, types);
+            format!(
+                "if {expr}.tag == 0 {{ {w}.write_u64(0); }} else {{ let __v = {expr}.value; {w}.write_u64(1); {some} }}"
+            )
+        }
         FieldType::Named(name) => {
             let ty = find_type(types, name);
             match ty {
@@ -315,6 +336,32 @@ fn gen_write_return(ft: &FieldType, expr: &str, w: &str, types: &[TypeDecl]) -> 
                  core::ptr::copy_nonoverlapping({expr}.as_ptr() as *const u8, __data, __nbytes); \
                  {w}.write_u64(__data as u64); \
                  {w}.write_u64(__len as u64); }} }}"
+            )
+        }
+        FieldType::DStr => format!(
+            "{w}.write_u64({expr}.ptr as u64); {w}.write_u64({expr}.len as u64);"
+        ),
+        FieldType::DSlice(inner) => {
+            let rt = inner.rust_type();
+            format!(
+                "{w}.write_u64({expr}.ptr as *const {rt} as u64); {w}.write_u64({expr}.len as u64);"
+            )
+        }
+        FieldType::DString => format!(
+            "{w}.write_u64({expr}.allocator as u64); {w}.write_u64({expr}.ptr as u64); \
+             {w}.write_u64({expr}.len as u64); {w}.write_u64({expr}.cap as u64);"
+        ),
+        FieldType::DVec(inner) => {
+            let rt = inner.rust_type();
+            format!(
+                "{w}.write_u64({expr}.allocator as u64); {w}.write_u64({expr}.ptr as u64); \
+                 {w}.write_u64({expr}.len as u64); {w}.write_u64({expr}.cap as u64);"
+            )
+        }
+        FieldType::DOption(inner) => {
+            let some = gen_write_return(inner, "__v", w, types);
+            format!(
+                "if {expr}.tag == 0 {{ {w}.write_u64(0); }} else {{ let __v = {expr}.value; {w}.write_u64(1); {some} }}"
             )
         }
         FieldType::Option(inner) => {
@@ -396,6 +443,35 @@ fn gen_read_decode(ft: &FieldType, r: &str, types: &[TypeDecl]) -> String {
                  else {{ core::slice::from_raw_parts(__p, __l).to_vec() }} }}"
             )
         }
+        FieldType::DStr => format!(
+            "dynspire::managed::DStr {{ ptr: {r}.read_u64() as *const u8, len: {r}.read_u64() as usize }}"
+        ),
+        FieldType::DSlice(inner) => {
+            let rt = inner.rust_type();
+            format!(
+                "dynspire::managed::DSlice::<{rt}> {{ ptr: {r}.read_u64() as *const {rt}, len: {r}.read_u64() as usize }}"
+            )
+        }
+        FieldType::DString => format!(
+            "dynspire::managed::DString {{ \
+             allocator: {r}.read_u64() as *mut dynspire::managed::DynSpireAllocator, \
+             ptr: {r}.read_u64() as *mut u8, len: {r}.read_u64() as usize, cap: {r}.read_u64() as usize }}"
+        ),
+        FieldType::DVec(inner) => {
+            let rt = inner.rust_type();
+            format!(
+                "dynspire::managed::DVec::<{rt}> {{ \
+                 allocator: {r}.read_u64() as *mut dynspire::managed::DynSpireAllocator, \
+                 ptr: {r}.read_u64() as *mut {rt}, len: {r}.read_u64() as usize, cap: {r}.read_u64() as usize }}"
+            )
+        }
+        FieldType::DOption(inner) => {
+            let rt = inner.rust_type();
+            let inner_decode = gen_read_decode(inner, r, types);
+            format!(
+                "{{ let __tag = {r}.read_u64(); if __tag == 0 {{ dynspire::managed::DOption::<{rt}>::none() }} else {{ dynspire::managed::DOption::<{rt}>::some({inner_decode}) }} }}"
+            )
+        }
         FieldType::Option(inner) => {
             let inner_decode = gen_read_decode(inner, r, types);
             format!(
@@ -473,6 +549,37 @@ fn gen_read_receive(ft: &FieldType, r: &str, types: &[TypeDecl]) -> String {
                  let __len = {r}.read_u64() as usize; \
                  if __ptr.is_null() || __len == 0 {{ Vec::new() }} \
                  else {{ let __v = core::slice::from_raw_parts(__ptr, __len).to_vec(); dynspire::managed::dynspire_release(__ptr as *mut u8); __v }} }}"
+            )
+        }
+        FieldType::DStr => format!(
+            "dynspire::managed::DStr {{ ptr: {r}.read_u64() as *const u8, len: {r}.read_u64() as usize }}"
+        ),
+        FieldType::DSlice(inner) => {
+            let rt = inner.rust_type();
+            format!(
+                "dynspire::managed::DSlice::<{rt}> {{ ptr: {r}.read_u64() as *const {rt}, len: {r}.read_u64() as usize }}"
+            )
+        }
+        FieldType::DString => format!(
+            "{{ let __alloc = {r}.read_u64() as *mut dynspire::managed::DynSpireAllocator; \
+              let __ptr = {r}.read_u64() as *mut u8; let __len = {r}.read_u64() as usize; \
+              let __cap = {r}.read_u64() as usize; \
+              dynspire::managed::OwnedDString::from_raw(dynspire::managed::DString {{ allocator: __alloc, ptr: __ptr, len: __len, cap: __cap }}) }}"
+        ),
+        FieldType::DVec(inner) => {
+            let rt = inner.rust_type();
+            format!(
+                "{{ let __alloc = {r}.read_u64() as *mut dynspire::managed::DynSpireAllocator; \
+                 let __ptr = {r}.read_u64() as *mut {rt}; let __len = {r}.read_u64() as usize; \
+                 let __cap = {r}.read_u64() as usize; \
+                  dynspire::managed::OwnedDVec::<{rt}>::from_raw(dynspire::managed::DVec::<{rt}> {{ allocator: __alloc, ptr: __ptr, len: __len, cap: __cap }}) }}"
+            )
+        }
+        FieldType::DOption(inner) => {
+            let rt = inner.rust_type();
+            let inner_recv = gen_read_receive(inner, r, types);
+            format!(
+                "{{ let __tag = {r}.read_u64(); if __tag == 0 {{ dynspire::managed::DOption::<{rt}>::none() }} else {{ dynspire::managed::DOption::<{rt}>::some({inner_recv}) }} }}"
             )
         }
         FieldType::Option(inner) => {
@@ -633,13 +740,13 @@ fn gen_trait(iface: &Interface) -> String {
 
     for m in &iface.methods {
         let params: Vec<String> = std::iter::once("&self".to_string())
-            .chain(m.params.iter().map(|p| format!("{}: {}", p.name, p.ty.rust_type())))
+            .chain(m.params.iter().map(|p| format!("{}: {}", p.name, p.ty.rust_input_type())))
             .collect();
         out.push_str(&format!(
             "    fn {}({}) -> Result<{}, String>;\n",
             m.name,
             params.join(", "),
-            m.return_type.rust_type(),
+            m.return_type.rust_output_type(),
         ));
     }
     out.push_str("}\n\n");
@@ -769,7 +876,7 @@ fn gen_tower(iface: &Interface) -> String {
             if matches!(p.ty, FieldType::OutU8Vec) {
                 let n = &p.name;
                 encode_stmts.push_str(&format!(
-                    "        let mut __ov_{n}: dynspire::managed::DVec<u8> = dynspire::managed::DVec {{ allocator: self.client.alloc_ptr(), ptr: std::ptr::null_mut(), len: 0, cap: 0 }};\n\
+                    "        let mut __ov_{n}: dynspire::managed::DVec<u8> = dynspire::managed::DVec::<u8> {{ allocator: self.client.alloc_ptr(), ptr: std::ptr::null_mut(), len: 0, cap: 0 }};\n\
                      __w.write_u64(&mut __ov_{n} as *mut dynspire::managed::DVec<u8> as u64);\n",
                 ));
                 post_stmts.push_str(&format!(
@@ -800,7 +907,7 @@ fn gen_tower(iface: &Interface) -> String {
              }}\n",
             name = m.name,
             params = params.join(", "),
-            ret = m.return_type.rust_type(),
+            ret = m.return_type.rust_output_type(),
             opn = opn,
             pascal = pascal(&m.name),
             result_recv = result_recv,
@@ -824,6 +931,19 @@ impl {cn} {{
     /// created with `debug = true`.
     pub fn allocator_report(&self) -> dynspire::managed::DynSpireAllocatorReport {{
         self.client.allocator_report()
+    }}
+
+    /// Allocate an owning `DVec` in the host allocator (for passing owned
+    /// buffers into spier methods that take a `DVec` parameter). Released when
+    /// the returned guard is dropped.
+    pub fn new_dvec<T: dynspire::managed::ReprC>(&self, cap: usize) -> dynspire::managed::OwnedDVec<T> {{
+        dynspire::managed::OwnedDVec::new_in(unsafe {{ &*self.client.alloc_ptr() }}, cap)
+    }}
+
+    /// Allocate an owning `DString` in the host allocator. Released when the
+    /// returned guard is dropped.
+    pub fn new_dstring(&self, s: &str) -> dynspire::managed::OwnedDString {{
+        dynspire::managed::OwnedDString::new_in(unsafe {{ &*self.client.alloc_ptr() }}, s)
     }}
 }}
 
@@ -929,7 +1049,9 @@ fn gen_spier_macro(iface: &Interface) -> String {
             .collect();
         let call_args = format!("({})", param_names.join(", "));
 
-        let ok_return = gen_write_return(&m.return_type, "__v", "__w", types);
+        let guarded = m.return_type.is_guarded_return();
+        let ok_var = if guarded { "__raw" } else { "__v" };
+        let ok_return = gen_write_return(&m.return_type, ok_var, "__w", types);
         let err_return = gen_write_return(&FieldType::String, "__e", "__w", types);
         let write_out = gen_write_out_epilogue("__w", "out_slots", "out_capacity");
 
@@ -937,6 +1059,13 @@ fn gen_spier_macro(iface: &Interface) -> String {
             format!(
                 "match _result {{\n\
                  Ok(__v) => {{ __w.write_u64(0); }}\n\
+                 Err(__e) => {{ __w.write_u64(1); {err_return} }}\n\
+                 }}\n"
+            )
+        } else if guarded {
+            format!(
+                "match _result {{\n\
+                 Ok(__v) => {{ let __raw = __v.into_raw(); __w.write_u64(0); {ok_return} }}\n\
                  Err(__e) => {{ __w.write_u64(1); {err_return} }}\n\
                  }}\n"
             )
@@ -985,6 +1114,17 @@ macro_rules! {mn} {{
             #[allow(dead_code)]
             allocator: *mut dynspire::managed::DynSpireAllocator,
             inner: $state,
+        }}
+
+        // Recover the host allocator from `&self` in a spier trait method.
+        // `__SpierState` wraps `$state`; `state` (the `&self` the trait method
+        // receives) points at `inner`, so we step back by `inner`'s offset.
+        impl dynspire::managed::DynSpireStateExt for $state {{
+            fn __dynspire_alloc(&self) -> *mut dynspire::managed::DynSpireAllocator {{
+                let __off = ::core::mem::offset_of!(__SpierState, inner);
+                let __p = unsafe {{ (self as *const $state as *const u8).sub(__off) as *const __SpierState }};
+                unsafe {{ (*__p).allocator }}
+            }}
         }}
 
         #[no_mangle]
@@ -1163,6 +1303,18 @@ fn gen_py_write(ft: &FieldType, expr: &str, w: &str, types: &[TypeDecl], indent:
                 )
             }
         }
+        DStr | DSlice(_) => format!(
+            "{pad}{w}.write_u64(int({expr}.ptr));\n{pad}{w}.write_u64(int({expr}.len))\n"
+        ),
+        DString | DVec(_) => format!(
+            "{pad}{w}.write_u64(int({expr}.allocator));\n{pad}{w}.write_u64(int({expr}.ptr));\n{pad}{w}.write_u64(int({expr}.len));\n{pad}{w}.write_u64(int({expr}.cap))\n"
+        ),
+        DOption(inner) => {
+            let inner_w = gen_py_write(inner, expr, w, types, indent + 4);
+            format!(
+                "{pad}if {expr} is None:\n{inpad}{w}.write_u64(0)\n{pad}else:\n{inpad}{w}.write_u64(1)\n{inner_w}"
+            )
+        }
         Option(inner) => {
             let inner_w = gen_py_write(inner, expr, w, types, indent + 4);
             format!(
@@ -1277,6 +1429,19 @@ fn gen_py_read_expr(ft: &FieldType, r: &str, types: &[TypeDecl]) -> std::string:
                 format!("[{}]", parts.join(", "))
             }
         }
+        DStr => format!(
+            "(lambda __p, __n: ctypes.string_at(__p, __n).decode('utf-8', 'replace') if __p else \"\")({r}.read(), {r}.read())"
+        ),
+        DSlice(_) => format!(
+            "(lambda __p, __n: ctypes.string_at(__p, __n) if __p else b\"\")({r}.read(), {r}.read())"
+        ),
+        DString => format!(
+            "(lambda __a, __p, __n, __c: DStringHandle(self, __p, __n, __a))({r}.read(), {r}.read(), {r}.read(), {r}.read())"
+        ),
+        DVec(_) => format!(
+            "(lambda __a, __p, __n, __c: OwnedDVec(self, __p, __n, __a))({r}.read(), {r}.read(), {r}.read(), {r}.read())"
+        ),
+        DOption(inner) => format!("None if {r}.read() == 0 else {}", gen_py_read_expr(inner, r, types)),
         Named(name) => match find_type(types, name) {
             TypeDecl::Struct(s) if s.fields.is_empty() => {
                 panic!("dynspire-codegen: empty struct '{name}' return is not supported in Python codegen")
@@ -1513,6 +1678,106 @@ class DynSpireAllocatorReport(ctypes.Structure):
         )
 
 
+class DStr(ctypes.Structure):
+    _fields_ = [
+        ("ptr", ctypes.c_void_p),
+        ("len", ctypes.c_size_t),
+    ]
+
+
+class DSlice(ctypes.Structure):
+    _fields_ = [
+        ("ptr", ctypes.c_void_p),
+        ("len", ctypes.c_size_t),
+    ]
+
+
+class DString(ctypes.Structure):
+    _fields_ = [
+        ("allocator", ctypes.c_void_p),
+        ("ptr", ctypes.c_void_p),
+        ("len", ctypes.c_size_t),
+        ("cap", ctypes.c_size_t),
+    ]
+
+
+class DVec(ctypes.Structure):
+    _fields_ = [
+        ("allocator", ctypes.c_void_p),
+        ("ptr", ctypes.c_void_p),
+        ("len", ctypes.c_size_t),
+        ("cap", ctypes.c_size_t),
+    ]
+
+
+class DOption(ctypes.Structure):
+    _fields_ = [
+        ("tag", ctypes.c_uint8),
+        ("_pad", ctypes.c_uint8 * 7),
+        ("value", ctypes.c_uint64),
+    ]
+
+
+class OwnedDVec:
+    """Owning view of a `DVec<u8>` returned/crated across the FFI boundary.
+
+    Holds the raw pointer; releases it on `__del__`. Provides zero-copy
+    access via `as_bytes()` / `memoryview`.
+    """
+
+    __slots__ = ("_client", "allocator", "ptr", "len", "cap")
+
+    def __init__(self, client, ptr, length, alloc, cap=None):
+        self._client = client
+        self.allocator = alloc
+        self.ptr = ptr
+        self.len = length
+        self.cap = cap if cap is not None else length
+
+    def as_bytes(self):
+        if not self.ptr:
+            return b""
+        return ctypes.string_at(self.ptr, int(self.len))
+
+    def __len__(self):
+        return int(self.len)
+
+    def __del__(self):
+        try:
+            if self.ptr:
+                self._client._release_fn(self.ptr)
+        except Exception:
+            pass
+
+
+class DStringHandle:
+    """Owning view of a `DString` returned across the FFI boundary."""
+
+    __slots__ = ("_client", "allocator", "ptr", "len", "cap")
+
+    def __init__(self, client, ptr, length, alloc, cap=None):
+        self._client = client
+        self.allocator = alloc
+        self.ptr = ptr
+        self.len = length
+        self.cap = cap if cap is not None else length
+
+    def as_str(self):
+        if not self.ptr:
+            return ""
+        return ctypes.string_at(self.ptr, int(self.len)).decode("utf-8", "replace")
+
+    def __len__(self):
+        return int(self.len)
+
+    def __del__(self):
+        try:
+            if self.ptr:
+                self._client._release_fn(self.ptr)
+        except Exception:
+            pass
+
+
 class SlotWriter:
     def __init__(self):
         self._vals = []
@@ -1735,6 +2000,11 @@ class SpierClient:
         f.argtypes = []
         self._alloc_fn = f
 
+        f = self._lib.dynspire_alloc
+        f.restype = ctypes.c_void_p
+        f.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t]
+        self._raw_alloc_fn = f
+
         f = self._lib.dynspire_debug_allocator
         f.restype = ctypes.c_void_p
         f.argtypes = []
@@ -1813,6 +2083,25 @@ class SpierClient:
         returns all zeros.
         """
         return self._report_fn(self._alloc_ptr)
+
+    def _alloc(self, size, align):
+        return self._raw_alloc_fn(self._alloc_ptr, size, align)
+
+    def new_dvec(self, cap):
+        """Allocate an owning `DVec<u8>` in the host allocator (for passing
+        owned buffers into spier methods that take a `DVec` parameter)."""
+        ptr = self._alloc(cap, 1) if cap > 0 else None
+        return OwnedDVec(self, ptr, 0, self._alloc_ptr, cap)
+
+    def new_dstring(self, s):
+        """Allocate an owning `DString` in the host allocator."""
+        b = s.encode("utf-8") if isinstance(s, str) else bytes(s)
+        n = len(b)
+        ptr = self._alloc(n, 1) if n > 0 else None
+        if ptr:
+            arr = (ctypes.c_uint8 * n).from_buffer_copy(b)
+            ctypes.memmove(ptr, ctypes.addressof(arr), n)
+        return DStringHandle(self, ptr, n, self._alloc_ptr, n)
 
     def __enter__(self):
         return self
@@ -2077,6 +2366,45 @@ mod tests {
         assert!(code.contains("let mut __w = dynspire::slots::SlotWriter::new()"));
         assert!(code.contains("let mut __r = dynspire::slots::SlotReader::new(&__out)"));
     }
+
+    #[test]
+    fn generated_dtype_methods() {
+        let iface = parse_rle();
+        let code = generate(&iface);
+        // Spier trait declares owning guards for owned-DType returns.
+        assert!(code.contains("fn echo_bytes(&self, data: &[u8]) -> Result<dynspire::managed::OwnedDVec<u8>, String>"));
+        assert!(code.contains("fn consume_dvec(&self, data: dynspire::managed::DVec<u8>) -> Result<u64, String>"));
+        // Host client matches the trait via rust_output_type (guarded return).
+        assert!(code.contains("fn echo_bytes(&self, data: &[u8]) -> Result<dynspire::managed::OwnedDVec<u8>, String>"));
+        // DView params are passed by value (no Copy needed).
+        assert!(code.contains("fn view_slice(&self, data: dynspire::managed::DSlice<u8>) -> Result<u64, String>"));
+        // DOption is a managed struct on both sides, not Rust Option.
+        assert!(code.contains("fn probe(&self, data: &[u8]) -> Result<dynspire::managed::DOption<u8>, String>"));
+        // The spier dispatch converts owned guards to raw (into_raw) before write.
+        assert!(code.contains("into_raw()"), "owned returns must hand raw DType to host");
+        // The host receive path reconstructs an owning guard.
+        assert!(code.contains("OwnedDVec::<u8>::from_raw"), "host must reconstruct OwnedDVec");
+        assert!(code.contains("OwnedDString::from_raw"), "host must reconstruct OwnedDString");
+        // DOption decode writes a tag, not a Rust Some/None pattern, on spier side.
+        assert!(code.contains(".tag == 0"), "DOption decode must branch on tag field");
+    }
+
+    #[test]
+    fn generated_python_dtype_methods() {
+        let iface = parse_rle();
+        let py = generate_python(&iface);
+        assert!(py.contains("def echo_bytes(self, data)"), "python client must expose DVec return");
+        assert!(py.contains("def consume_dvec(self, data)"), "python client must accept DVec");
+        assert!(py.contains("def view_slice(self, data)"), "python client must accept DSlice");
+        assert!(py.contains("def probe(self, data)"), "python client must return DOption");
+        assert!(py.contains("class OwnedDVec"), "python must define owning DVec wrapper");
+        assert!(py.contains("class DStringHandle"), "python must define owning DString wrapper");
+        assert!(py.contains("def new_dvec(self, cap)"), "python client must expose allocator helper");
+        assert!(py.contains("def new_dstring(self, s)"), "python client must expose allocator helper");
+        // DOption (IDL) decode maps to None or the inner value, not a struct.
+        assert!(py.contains("None if"), "python DOption must map to None/value");
+    }
+
 
     #[test]
     fn generated_code_is_deterministic() {

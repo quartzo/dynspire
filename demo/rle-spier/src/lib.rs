@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use dynspire::managed::DynSpireStateExt;
+
 include!(concat!(env!("OUT_DIR"), "/rle_spier.rs"));
 
 pub struct RleState;
@@ -150,6 +152,53 @@ impl RleEngine for RleState {
     fn delay(&self, ms: u64) -> Result<(), String> {
         std::thread::sleep(std::time::Duration::from_millis(ms));
         Ok(())
+    }
+
+    // --- Optional managed types (zero-copy) ---
+
+    fn echo_bytes(&self, data: &[u8]) -> Result<dynspire::managed::OwnedDVec<u8>, String> {
+        let mut out = self.new_dvec(data.len());
+        for &b in data {
+            out.push(b);
+        }
+        Ok(out)
+    }
+
+    fn build_string(&self, data: &[u8]) -> Result<dynspire::managed::OwnedDString, String> {
+        let s = String::from_utf8_lossy(data);
+        Ok(self.new_dstring(&s))
+    }
+
+    fn consume_dvec(&self, data: dynspire::managed::DVec<u8>) -> Result<u64, String> {
+        Ok(data.len() as u64)
+    }
+
+    fn consume_dstring(&self, s: dynspire::managed::DString) -> Result<u64, String> {
+        Ok(s.len() as u64)
+    }
+
+    fn view_len(&self, s: dynspire::managed::DStr) -> Result<u64, String> {
+        Ok(s.len() as u64)
+    }
+
+    fn view_slice(&self, data: dynspire::managed::DSlice<u8>) -> Result<u64, String> {
+        Ok(data.len() as u64)
+    }
+
+    fn probe(&self, data: &[u8]) -> Result<dynspire::managed::DOption<u8>, String> {
+        if data.is_empty() {
+            Ok(None::<u8>.into())
+        } else {
+            Ok(Some(data[0]).into())
+        }
+    }
+
+    fn opt_classify(&self, data: &[u8]) -> Result<dynspire::managed::DOption<u8>, String> {
+        if data.is_empty() {
+            Ok(None::<u8>.into())
+        } else {
+            Ok(Some(*data.iter().max().unwrap()).into())
+        }
     }
 }
 

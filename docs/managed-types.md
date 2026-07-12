@@ -16,6 +16,7 @@ while preserving the zero-copy borrow fast-path that exists today.
 - [Allocator Lifecycle](#allocator-lifecycle)
 - [C-ABI Evolution](#c-abi-evolution)
 - [Cross-Language Projection](#cross-language-projection)
+- [IDL DType Support (Implemented)](#idl-dtype-support-implemented)
 - [Codegen Changes](#codegen-changes)
 - [Implementation Phases](#implementation-phases)
 
@@ -669,6 +670,99 @@ Every target language projects DynSpire types via its own C FFI:
 
 ---
 
+## IDL DType Support (Implemented)
+
+The managed types from the design above are exposed as **first-class, opt-in
+types in the `.dspi` IDL**. A spier/host may use them alongside the ordinary
+Rust-style types (`String`, `Vec<T>`, `&str`, `&[u8]`, `Option<T>`). There is
+no automatic conversion: if you write `DVec<u8>` in the IDL you get the managed
+`DVec<u8>` across the boundary — zero-copy, owner-tracked, FFI-stable.
+
+### IDL syntax
+
+| IDL type | Meaning | Wire (slots) |
+|---|---|---|
+| `DStr` | immutable `&str`-like view | `ptr: u64, len: u64` |
+| `DSlice<T>` | immutable `&[T]`-like view | `ptr: u64, len: u64` |
+| `DString` | owned string (carries allocator) | `allocator, ptr, len, cap` (4 slots) |
+| `DVec<T>` | owned `Vec<T>` (carries allocator) | `allocator, ptr, len, cap` (4 slots) |
+| `DOption<T>` | managed `Option<T>` (tag + value) | `tag: u64` + value slots |
+
+Views (`DStr`, `DSlice<T>`) are non-owning — they alias caller memory, never an
+allocator pointer. Owned types (`DString`, `DVec<T>`) carry their allocator as
+the first field, so the receiver can later release the buffer through the inline
+RC header.
+
+### Authoring ergonomics — no allocator parameter
+
+The allocator is configured once at `dynspire_create` and lives inside the
+spier's `State` (see [Allocator Lifecycle](#allocator-lifecycle)). Codegen
+recovers it from the trait's `&self` via `offset_of!(State, inner)`, so **no
+extra allocator parameter appears in the IDL or the trait**:
+
+```rust
+// spier side — author writes plain Rust, allocator hidden:
+fn echo_bytes(&self, data: &[u8]) -> Result<OwnedDVec<u8>, String> {
+    let mut out = self.new_dvec(data.len());   // DynSpireStateExt::new_dvec
+    for &b in data { out.push(b); }
+    Ok(out)                                     // into_raw() hands buffer to host
+}
+```
+
+The generated `impl_{name}_spier!` macro injects a `DynSpireStateExt` impl for
+the state type that exposes `new_dvec`/`new_dstring` (backed by the recovered
+allocator). On the host, the generated `DynSpire{Name}` client exposes the same
+helpers:
+
+```rust
+// host side:
+let echoed = client.echo_bytes(&input[..]).unwrap();   // OwnedDVec<u8>
+let copied = echoed.as_slice().to_vec();                 // copy out if needed
+// release happens on Drop of `echoed`
+```
+
+### Trait signatures & ownership
+
+Rust-side trait signatures use the managed types for owned values:
+
+- `DVec<T>` / `DString` **returns** materialize as `OwnedDVec<T>` /
+  `OwnedDString` — owning guards whose `Drop` calls `dynspire_release`, so the
+  host is the sole owner. The spier side returns an `OwnedD*`; the generated
+  dispatch converts it with `into_raw()` *before* writing the slots, so the
+  buffer is **not** released on the spier side.
+- `DVec<T>` / `DString` **parameters** are received by value as `DVec<T>` /
+  `DString` (the managed value, `Copy`). The spier only reads them; the host
+  retains ownership and releases on its side.
+- `DStr` / `DSlice<T>` parameters are received by value as the managed view
+  (`ptr` + `len`); zero-copy over host memory.
+- `DOption<T>` is the managed `DOption<T>` struct (`tag` + `value`) on **both**
+  sides — never a Rust `Option<T>`. Python projects it to `None` / the inner
+  value.
+
+### Python projection
+
+The generated `SpierClient` emits `ctypes` classes for every managed type
+(`DStr`, `DSlice`, `DString`, `DVec`, `DOption`) plus owning wrappers
+(`OwnedDVec`, `DStringHandle`) that call `dynspire_release` on `__del__`, and
+`new_dvec` / `new_dstring` helpers backed by the host allocator. `DOption`
+returns map to `None` or the inner Python value.
+
+```python
+dv = c.echo_bytes(input_data)        # OwnedDVec
+copied = dv.as_bytes()                # zero-copy view
+n = c.consume_dvec(dv)               # pass the (Copy) view back
+# freed on GC via __del__
+```
+
+### Status
+
+Implemented in `dynspire` (`src/managed.rs`), `dynspire-codegen` (`ast.rs`,
+`parser.rs`, `gen.rs`), and exercised end-to-end by the RLE demo spier/host
+(Rust) and `demo/rle_client.py` (Python). Allocated returns, view borrows, and
+`DOption` all round-trip across the FFI boundary.
+
+---
+
 ## Codegen Changes
 
 ### Struct/enum definitions
@@ -742,18 +836,31 @@ dispatch table is removed. Drop logic moves to the RC header:
 
 ### Trait signatures
 
-The spier trait continues to use Rust stdlib types:
+For the ordinary Rust-style types, the spier trait continues to use stdlib
+types (`String`, `Vec<T>`, `&str`, `&[u8]`, `Option<T>`); the dispatch layer
+handles conversion to/from DTypes. For **owned managed types**, the trait
+exposes the managed types directly — the IDL type *is* the boundary type:
+
 ```rust
 pub trait RleEngine: Send + Sync {
     fn compress(&self, data: &[u8]) -> Result<Vec<u8>, String>;
     fn analyze(&self, data: &[u8]) -> Result<CompressionReport, String>;
-    // ...
+    // owned managed returns expose the DType guard:
+    fn echo_bytes(&self, data: &[u8]) -> Result<OwnedDVec<u8>, String>;
+    fn build_string(&self, data: &[u8]) -> Result<DString, String>;
+    // owned managed params arrive as the managed value (Copy):
+    fn consume_dvec(&self, data: DVec<u8>) -> Result<u64, String>;
+    // views are zero-copy over caller memory:
+    fn view_slice(&self, data: DSlice<u8>) -> Result<u64, String>;
+    // DOption stays a managed struct on both sides (not Rust Option):
+    fn probe(&self, data: &[u8]) -> Result<DOption<u8>, String>;
 }
 ```
 
-The dispatch layer (generated) handles conversion between stdlib and DTypes.
-Existing Rust spiers need minimal changes — primarily recompilation against
-the updated codegen.
+The dispatch layer (generated) handles the `into_raw()` conversion for owned
+returns and the `from_raw` reconstruction on the host, plus the allocator
+recovery from `State`. The author never sees an allocator parameter — `self`
+(spier) / `client` (host) provides `new_dvec` / `new_dstring`.
 
 ---
 

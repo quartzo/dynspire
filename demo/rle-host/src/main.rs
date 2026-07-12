@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use dynspire::managed::{DOption, DSlice, DStr, DVec};
+
 include!(concat!(env!("OUT_DIR"), "/rle_host.rs"));
 
 fn hex(bytes: &[u8]) -> String {
@@ -90,6 +92,78 @@ fn main() {
         .expect("report_summary failed");
     println!("report_summary(CompressionReport)");
     println!("  -> \"{summary}\"");
+    println!();
+
+    // --- Optional managed types (DVec / DString) ---
+    // echo_bytes allocates a DVec in the spier allocator (owned return). The host
+    // receives an OwnedDVec and is the sole owner: it frees the buffer on drop.
+    let echoed = client.echo_bytes(&input[..]).expect("echo_bytes failed");
+    println!("echo_bytes(&[u8]) -> DVec<u8> (owned, zero-copy)");
+    println!(
+        "  -> [{}] ({} bytes)",
+        hex(&echoed.as_slice()),
+        echoed.len()
+    );
+    println!();
+
+    // consume_dvec takes the raw DVec back (Copy view); spier only reads it, the
+    // host still owns and frees it. This exercises the full round-trip.
+    let dv: DVec<u8> = *echoed;
+    let consumed = client.consume_dvec(dv).expect("consume_dvec failed");
+    println!("consume_dvec(DVec<u8>)");
+    println!("  -> {consumed} (host still owns the buffer, freed on drop)");
+    println!();
+
+    // build_string allocates a DString in the spier allocator (owned return).
+    let built = client.build_string(&input[..]).expect("build_string failed");
+    println!("build_string(&[u8]) -> DString (owned, zero-copy)");
+    println!("  -> \"{}\" ({} bytes)", built.as_str(), built.len());
+    println!();
+
+    let ds: dynspire::managed::DString = *built;
+    let consumed_s = client.consume_dstring(ds).expect("consume_dstring failed");
+    println!("consume_dstring(DString)");
+    println!("  -> {consumed_s} (host still owns the buffer, freed on drop)");
+    println!();
+
+    // Views: pass a DStr / DSlice pointing at host-owned memory (no copy).
+    let dstr = DStr {
+        ptr: input.as_ptr(),
+        len: input.len(),
+    };
+    let view_n = client.view_len(dstr).expect("view_len failed");
+    println!("view_len(DStr)");
+    println!("  -> {view_n} (zero-copy view over host memory)");
+    println!();
+
+    let dslice = DSlice::<u8> {
+        ptr: input.as_ptr(),
+        len: input.len(),
+    };
+    let view_s = client.view_slice(dslice).expect("view_slice failed");
+    println!("view_slice(DSlice<u8>)");
+    println!("  -> {view_s} (zero-copy view over host memory)");
+    println!();
+
+    // DOption return: managed tag+value, no boxing.
+    let present = client.probe(&input[..]).expect("probe failed");
+    let maxv = client
+        .opt_classify(&input[..])
+        .expect("opt_classify failed");
+    let show = |o: DOption<u8>| -> String {
+        if o.tag == 0 {
+            "None".to_string()
+        } else {
+            format!("Some({})", o.value)
+        }
+    };
+    println!("probe(&[u8]) / opt_classify(&[u8]) -> DOption<u8>");
+    println!("  probe        -> {}", show(present));
+    println!("  opt_classify -> {} (max byte)", show(maxv));
+    println!();
+
+    println!("Done. Spier was loaded, verified, and dispatched entirely at runtime.");
+    println!();
 
     println!();
     println!("Done. Spier was loaded, verified, and dispatched entirely at runtime.");

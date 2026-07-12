@@ -108,6 +108,16 @@ pub enum FieldType {
     Vec(Box<FieldType>),
     /// `Option<T>`.
     Option(Box<FieldType>),
+    /// `DStr` — non-owning view (`dynspire::managed::DStr`). Zero-copy.
+    DStr,
+    /// `DSlice<T>` — non-owning view (`dynspire::managed::DSlice<T>`). Zero-copy.
+    DSlice(Box<FieldType>),
+    /// `DString` — owned managed string (`dynspire::managed::DString`).
+    DString,
+    /// `DVec<T>` — owned managed vec (`dynspire::managed::DVec<T>`).
+    DVec(Box<FieldType>),
+    /// `DOption<T>` — managed option (`dynspire::managed::DOption<T>`).
+    DOption(Box<FieldType>),
     /// `(A, B, C)` — 2+ elements only.
     Tuple(Vec<FieldType>),
     /// `[u8; N]` — fixed-size byte array.
@@ -138,6 +148,11 @@ impl FieldType {
             FieldType::String => "String".into(),
             FieldType::Vec(t) => format!("Vec<{}>", t.canonical()),
             FieldType::Option(t) => format!("Option<{}>", t.canonical()),
+            FieldType::DStr => "DStr".into(),
+            FieldType::DSlice(t) => format!("DSlice<{}>", t.canonical()),
+            FieldType::DString => "DString".into(),
+            FieldType::DVec(t) => format!("DVec<{}>", t.canonical()),
+            FieldType::DOption(t) => format!("DOption<{}>", t.canonical()),
             FieldType::Tuple(ts) => {
                 let parts: Vec<String> = ts.iter().map(|t| t.canonical()).collect();
                 format!("({})", parts.join(","))
@@ -145,6 +160,44 @@ impl FieldType {
             FieldType::Array(inner, len) => format!("[{};{}]", inner.canonical(), len),
             FieldType::Named(n) => n.clone(),
         }
+    }
+
+    /// Rust source type for a **by-value** appearance of this type (struct
+    /// fields, and DType inputs, which are non-owning `Copy` views).
+    pub fn rust_value_type(&self) -> String {
+        match self {
+            FieldType::DStr => "dynspire::managed::DStr".into(),
+            FieldType::DSlice(t) => format!("dynspire::managed::DSlice<{}>", t.rust_type()),
+            FieldType::DString => "dynspire::managed::DString".into(),
+            FieldType::DVec(t) => format!("dynspire::managed::DVec<{}>", t.rust_type()),
+            FieldType::DOption(t) => format!("dynspire::managed::DOption<{}>", t.rust_type()),
+            other => other.rust_type(),
+        }
+    }
+
+    /// Rust source type for a method **input parameter**. DTypes are passed
+    /// by value as `Copy` views (the spier reads them without releasing).
+    pub fn rust_input_type(&self) -> String {
+        self.rust_value_type()
+    }
+
+    /// Rust source type for a method **return value**. Owned `DVec`/`DString`
+    /// are wrapped in an `OwnedDVec`/`OwnedDString` guard so the receiver
+    /// releases the buffer exactly once; views/inline DTypes are returned by
+    /// value.
+    pub fn rust_output_type(&self) -> String {
+        match self {
+            FieldType::DVec(t) => format!("dynspire::managed::OwnedDVec<{}>", t.rust_type()),
+            FieldType::DString => "dynspire::managed::OwnedDString".into(),
+            other => other.rust_value_type(),
+        }
+    }
+
+    /// Whether this return type is wrapped in an owning guard (`OwnedDVec` /
+    /// `OwnedDString`) on the spier side, requiring `into_raw` before writing
+    /// slots.
+    pub fn is_guarded_return(&self) -> bool {
+        matches!(self, FieldType::DVec(_) | FieldType::DString)
     }
 
     /// Rust source type as it should appear in the generated trait signature.
@@ -168,6 +221,11 @@ impl FieldType {
             FieldType::String => "String".into(),
             FieldType::Vec(t) => format!("Vec<{}>", t.rust_type()),
             FieldType::Option(t) => format!("Option<{}>", t.rust_type()),
+            FieldType::DStr => "dynspire::managed::DStr".into(),
+            FieldType::DSlice(t) => format!("dynspire::managed::DSlice<{}>", t.rust_type()),
+            FieldType::DString => "dynspire::managed::DString".into(),
+            FieldType::DVec(t) => format!("dynspire::managed::DVec<{}>", t.rust_type()),
+            FieldType::DOption(t) => format!("dynspire::managed::DOption<{}>", t.rust_type()),
             FieldType::Tuple(ts) => {
                 let parts: Vec<String> = ts.iter().map(|t| t.rust_type()).collect();
                 format!("({})", parts.join(", "))
@@ -180,7 +238,10 @@ impl FieldType {
     /// Whether this type is passed by reference (borrow) as an input parameter.
     /// The spier decode path differs for borrows vs owned.
     pub fn is_borrow(&self) -> bool {
-        matches!(self, FieldType::Str | FieldType::U8Slice | FieldType::OutU8Vec)
+        matches!(
+            self,
+            FieldType::Str | FieldType::U8Slice | FieldType::OutU8Vec | FieldType::DStr | FieldType::DSlice(_)
+        )
     }
 }
 

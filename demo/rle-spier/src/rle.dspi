@@ -28,4 +28,14 @@ interface Rle {
   fn try_classify(data: &[u8]) -> Option<Tone>;
   fn try_analyze(data: &[u8]) -> Option<CompressionReport>;
   fn delay(ms: u64) -> ();
+
+  // --- Optional managed types (zero-copy) ---
+  fn echo_bytes(data: &[u8]) -> DVec<u8>;
+  fn build_string(data: &[u8]) -> DString;
+  fn consume_dvec(data: DVec<u8>) -> u64;
+  fn consume_dstring(s: DString) -> u64;
+  fn view_len(s: DStr) -> u64;
+  fn view_slice(data: DSlice<u8>) -> u64;
+  fn probe(data: &[u8]) -> DOption<u8>;
+  fn opt_classify(data: &[u8]) -> DOption<u8>;
 }

@@ -628,6 +628,351 @@ unsafe impl<T: ReprC> ReprC for DVec<T> {}
 unsafe impl<T: ReprC> ReprC for DOption<T> {}
 
 // ---------------------------------------------------------------------------
+// DType constructors + owning guards
+//
+// `DVec`/`DString` own a host-allocator buffer. The low-level constructors
+// (`DVec::new_in` / `DString::new_in`) allocate through a `*mut
+// DynSpireAllocator` and are the single allocation path used by both the
+// spier (via `DynSpireStateExt::new_dvec`) and the host (via the generated
+// client `new_dvec`). The owning `OwnedDVec`/`OwnedDString` guards wrap the
+// raw managed struct and release the buffer on `Drop`, so a returned DType is
+// freed exactly once — by the side that received it.
+// ---------------------------------------------------------------------------
+
+impl<T: ReprC> DVec<T> {
+    /// Allocate a `DVec` with `cap` element slots in `alloc`.
+    ///
+    /// The backing buffer carries a DynSpire RC header (see [`dyn_alloc`]), so
+    /// it can be returned across the FFI boundary and released by the receiver
+    /// via `dynspire_release`.
+    pub fn new_in(alloc: &DynSpireAllocator, cap: usize) -> DVec<T> {
+        let nbytes = cap * std::mem::size_of::<T>();
+        let ptr = unsafe { dynspire_alloc(alloc as *const _ as *mut _, nbytes, std::mem::align_of::<T>()) };
+        DVec {
+            allocator: alloc as *const _ as *mut _,
+            ptr: ptr as *mut T,
+            len: 0,
+            cap,
+        }
+    }
+
+    /// Append `value`, growing the buffer (host allocator) as needed.
+    pub fn push(&mut self, value: T) {
+        if self.len == self.cap {
+            let new_cap = if self.cap == 0 { 4 } else { self.cap * 2 };
+            let old_nbytes = self.len * std::mem::size_of::<T>();
+            let new_nbytes = new_cap * std::mem::size_of::<T>();
+            let new_ptr = unsafe {
+                dynspire_realloc(
+                    self.allocator,
+                    self.ptr as *mut u8,
+                    old_nbytes,
+                    new_nbytes,
+                    std::mem::align_of::<T>(),
+                )
+            };
+            if new_ptr.is_null() {
+                panic!("DVec::push: realloc failed");
+            }
+            self.ptr = new_ptr as *mut T;
+            self.cap = new_cap;
+        }
+        unsafe { std::ptr::write(self.ptr.add(self.len), value) };
+        self.len += 1;
+    }
+
+    /// Number of elements.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the vector is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// View the contents without copying.
+    pub fn as_slice(&self) -> &[T] {
+        if self.ptr.is_null() || self.len == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+        }
+    }
+}
+
+impl DString {
+    /// Allocate a `DString` holding `s` in `alloc`.
+    pub fn new_in(alloc: &DynSpireAllocator, s: &str) -> DString {
+        let len = s.len();
+        let ptr = unsafe { dynspire_alloc(alloc as *const _ as *mut _, len, 1) };
+        if !ptr.is_null() && len > 0 {
+            unsafe { std::ptr::copy_nonoverlapping(s.as_ptr(), ptr, len) };
+        }
+        DString {
+            allocator: alloc as *const _ as *mut _,
+            ptr,
+            len,
+            cap: len,
+        }
+    }
+
+    /// Number of bytes.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the string is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// View the contents as `&str` without copying.
+    pub fn as_str(&self) -> &str {
+        if self.ptr.is_null() || self.len == 0 {
+            ""
+        } else {
+            unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(self.ptr, self.len)) }
+        }
+    }
+}
+
+impl DStr {
+    /// Number of bytes.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the view is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// View the contents as `&str` without copying.
+    pub fn as_str(&self) -> &str {
+        if self.ptr.is_null() || self.len == 0 {
+            ""
+        } else {
+            unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(self.ptr, self.len)) }
+        }
+    }
+}
+
+impl<T: ReprC> DSlice<T> {
+    /// Number of elements.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the view is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// View the contents without copying.
+    pub fn as_slice(&self) -> &[T] {
+        if self.ptr.is_null() || self.len == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+        }
+    }
+}
+
+impl<T: ReprC> DOption<T> {
+    /// A present optional value.
+    pub fn some(value: T) -> Self {
+        DOption {
+            tag: 1,
+            _pad: [0u8; 7],
+            value,
+        }
+    }
+
+    /// An absent optional value.
+    pub fn none() -> Self {
+        DOption {
+            tag: 0,
+            _pad: [0u8; 7],
+            value: unsafe { std::mem::zeroed() },
+        }
+    }
+}
+
+impl<T: ReprC> From<Option<T>> for DOption<T> {
+    fn from(o: Option<T>) -> Self {
+        match o {
+            Some(v) => DOption::some(v),
+            None => DOption::none(),
+        }
+    }
+}
+
+/// Owning guard around [`DVec`]. Releases the backing buffer on `Drop`.
+///
+/// Spier methods return this type (built via `DynSpireStateExt::new_dvec`); the
+/// generated dispatch converts it to a raw `DVec` (`into_raw`) before writing
+/// the slots, so the buffer is *not* released on the spier side. The host
+/// reconstructs an `OwnedDVec` from the received raw struct and releases it on
+/// `Drop` — the single owner is the host caller.
+pub struct OwnedDVec<T: ReprC> {
+    inner: DVec<T>,
+}
+
+impl<T: ReprC> OwnedDVec<T> {
+    /// Allocate a new owning vector in `alloc`.
+    pub fn new_in(alloc: &DynSpireAllocator, cap: usize) -> Self {
+        OwnedDVec {
+            inner: DVec::new_in(alloc, cap),
+        }
+    }
+
+    /// Consume the guard, returning the raw [`DVec`] without releasing it.
+    ///
+    /// Used by the spier dispatch to hand ownership to the host without a
+    /// double-free.
+    pub fn into_raw(self) -> DVec<T> {
+        let d = self.inner;
+        std::mem::forget(self);
+        d
+    }
+
+    /// Wrap a raw [`DVec`] (received from the spier) into an owning guard.
+    pub fn from_raw(inner: DVec<T>) -> Self {
+        OwnedDVec { inner }
+    }
+
+    /// Number of elements.
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// Whether the vector is empty.
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    /// View the contents without copying.
+    pub fn as_slice(&self) -> &[T] {
+        self.inner.as_slice()
+    }
+}
+
+impl<T: ReprC> From<DVec<T>> for OwnedDVec<T> {
+    fn from(inner: DVec<T>) -> Self {
+        OwnedDVec { inner }
+    }
+}
+
+impl<T: ReprC> std::ops::Deref for OwnedDVec<T> {
+    type Target = DVec<T>;
+    fn deref(&self) -> &DVec<T> {
+        &self.inner
+    }
+}
+
+impl<T: ReprC> std::ops::DerefMut for OwnedDVec<T> {
+    fn deref_mut(&mut self) -> &mut DVec<T> {
+        &mut self.inner
+    }
+}
+
+impl<T: ReprC> Drop for OwnedDVec<T> {
+    fn drop(&mut self) {
+        unsafe { dynspire_release(self.inner.ptr as *mut u8) };
+    }
+}
+
+/// Owning guard around [`DString`]. Releases the backing buffer on `Drop`.
+pub struct OwnedDString {
+    inner: DString,
+}
+
+impl OwnedDString {
+    /// Allocate a new owning string in `alloc`.
+    pub fn new_in(alloc: &DynSpireAllocator, s: &str) -> Self {
+        OwnedDString {
+            inner: DString::new_in(alloc, s),
+        }
+    }
+
+    /// Consume the guard, returning the raw [`DString`] without releasing it.
+    pub fn into_raw(self) -> DString {
+        let d = self.inner;
+        std::mem::forget(self);
+        d
+    }
+
+    /// Wrap a raw [`DString`] (received from the spier) into an owning guard.
+    pub fn from_raw(inner: DString) -> Self {
+        OwnedDString { inner }
+    }
+
+    /// Number of bytes.
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// Whether the string is empty.
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    /// View the contents as `&str` without copying.
+    pub fn as_str(&self) -> &str {
+        self.inner.as_str()
+    }
+}
+
+impl From<DString> for OwnedDString {
+    fn from(inner: DString) -> Self {
+        OwnedDString { inner }
+    }
+}
+
+impl std::ops::Deref for OwnedDString {
+    type Target = DString;
+    fn deref(&self) -> &DString {
+        &self.inner
+    }
+}
+
+impl std::ops::DerefMut for OwnedDString {
+    fn deref_mut(&mut self) -> &mut DString {
+        &mut self.inner
+    }
+}
+
+impl Drop for OwnedDString {
+    fn drop(&mut self) {
+        unsafe { dynspire_release(self.inner.ptr) };
+    }
+}
+
+/// Ergonomic access to the host allocator and DType constructors from within a
+/// spier trait method.
+///
+/// Implemented for the spier state by the generated `impl_*_spier!` macro,
+/// which recovers the allocator from the enclosing `__SpierState` (see the
+/// macro for the `offset_of!` trick). Spier authors call `self.new_dvec(..)`
+/// / `self.new_dstring(..)` and never touch the allocator pointer directly.
+pub trait DynSpireStateExt {
+    /// Raw host allocator pointer. Internal — prefer `new_dvec` / `new_dstring`.
+    #[doc(hidden)]
+    fn __dynspire_alloc(&self) -> *mut DynSpireAllocator;
+
+    /// Build an owning `DVec` in the host allocator.
+    fn new_dvec<T: ReprC>(&self, cap: usize) -> OwnedDVec<T> {
+        OwnedDVec::new_in(unsafe { &*self.__dynspire_alloc() }, cap)
+    }
+
+    /// Build an owning `DString` in the host allocator.
+    fn new_dstring(&self, s: &str) -> OwnedDString {
+        OwnedDString::new_in(unsafe { &*self.__dynspire_alloc() }, s)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

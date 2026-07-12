@@ -418,7 +418,9 @@ impl Parser {
             "f32" => FieldType::F32,
             "f64" => FieldType::F64,
             "String" => FieldType::String,
-            "Vec" | "Option" => {
+            "DStr" => FieldType::DStr,
+            "DString" => FieldType::DString,
+            "Vec" | "Option" | "DVec" | "DSlice" | "DOption" => {
                 // These need generic args, handled separately by caller.
                 // If we reach here without parsing <...>, treat as Named.
                 // This is a fallback — the proper path is parse_generic_type.
@@ -484,6 +486,26 @@ impl Parser {
                 self.eat(TokenKind::Gt)?;
                 Ok(FieldType::Option(Box::new(inner)))
             }
+            "DVec" => {
+                self.eat(TokenKind::Lt)?;
+                let inner = self.parse_type()?;
+                self.eat(TokenKind::Gt)?;
+                Ok(FieldType::DVec(Box::new(inner)))
+            }
+            "DSlice" => {
+                self.eat(TokenKind::Lt)?;
+                let inner = self.parse_type()?;
+                self.eat(TokenKind::Gt)?;
+                Ok(FieldType::DSlice(Box::new(inner)))
+            }
+            "DOption" => {
+                self.eat(TokenKind::Lt)?;
+                let inner = self.parse_type()?;
+                self.eat(TokenKind::Gt)?;
+                Ok(FieldType::DOption(Box::new(inner)))
+            }
+            "DStr" => Ok(FieldType::DStr),
+            "DString" => Ok(FieldType::DString),
             other => Ok(self.type_from_ident(other)),
         }
     }
@@ -740,8 +762,44 @@ interface Rle {
     }
 
     #[test]
-    fn test_canonical_sig() {
-        let iface = parse(RLE_DSPI).unwrap();
+    fn test_dtype_parsing() {
+        let src = "interface Foo {
+            fn echo(data: &[u8]) -> DVec<u8>;
+            fn consume(v: DVec<u8>) -> u64;
+            fn take_str(s: DStr) -> u64;
+            fn take_slice(s: DSlice<u8>) -> u64;
+            fn make_str(s: &[u8]) -> DString;
+            fn probe(x: &[u8]) -> DOption<u8>;
+        }";
+        let iface = parse(src).unwrap();
+
+        let echo = &iface.methods[0];
+        assert_eq!(
+            echo.return_type,
+            FieldType::DVec(Box::new(FieldType::U8))
+        );
+        let consume = &iface.methods[1];
+        assert_eq!(
+            consume.params[0].ty,
+            FieldType::DVec(Box::new(FieldType::U8))
+        );
+        assert_eq!(iface.methods[2].params[0].ty, FieldType::DStr);
+        assert_eq!(
+            iface.methods[3].params[0].ty,
+            FieldType::DSlice(Box::new(FieldType::U8))
+        );
+        assert_eq!(
+            iface.methods[4].return_type,
+            FieldType::DString
+        );
+        assert_eq!(
+            iface.methods[5].return_type,
+            FieldType::DOption(Box::new(FieldType::U8))
+        );
+    }
+
+    #[test]
+    fn test_canonical_sig() {        let iface = parse(RLE_DSPI).unwrap();
         let sig = iface.canonical_sig();
         assert!(sig.starts_with("Rle|"));
         assert!(sig.contains("compress(&[u8])->Vec<u8>"));

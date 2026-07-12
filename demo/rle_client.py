@@ -8,10 +8,12 @@ no runtime reflection — just a clean typed API.
 
 import os
 import sys
+import ctypes
 
 # The generated rle.py lives next to the spier crate's build output
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "rle-spier", "generated"))
 
+import rle  # noqa: E402
 from rle import Rle  # noqa: E402
 
 
@@ -78,6 +80,52 @@ def main():
         summary = c.report_summary(report)
         print("c.report_summary(handle)")
         print(f'  -> "{summary}"')
+        print()
+
+        # --- Optional managed types (DVec / DString) ---
+        # echo_bytes returns an OwnedDVec backed by the spier allocator.
+        dv = c.echo_bytes(input_data)
+        print("c.echo_bytes() -> DVec<u8> (zero-copy)")
+        print(f"  -> [{hex_fmt(dv.as_bytes())}] ({len(dv)} bytes)")
+        print()
+
+        # consume_dvec takes the (Copy) view back; host still owns/frees it.
+        n = c.consume_dvec(dv)
+        print("c.consume_dvec(DVec<u8>)")
+        print(f"  -> {n} (host still owns the buffer, freed on GC)")
+        print()
+
+        ds = c.build_string(input_data)
+        print("c.build_string() -> DString (zero-copy)")
+        print(f'  -> "{ds.as_str()}" ({len(ds)} bytes)')
+        print()
+
+        ns = c.consume_dstring(ds)
+        print("c.consume_dstring(DString)")
+        print(f"  -> {ns} (host still owns the buffer, freed on GC)")
+        print()
+
+        # Views: pass a DStr / DSlice over host-owned memory (no copy).
+        buf = (ctypes.c_ubyte * len(input_data)).from_buffer_copy(input_data)
+        ptr = ctypes.cast(buf, ctypes.c_void_p)
+        dstr = rle.DStr(ptr, len(input_data))
+        vn = c.view_len(dstr)
+        print("c.view_len(DStr)")
+        print(f"  -> {vn} (zero-copy view over host memory)")
+        print()
+
+        dslice = rle.DSlice(ptr, len(input_data))
+        vs = c.view_slice(dslice)
+        print("c.view_slice(DSlice<u8>)")
+        print(f"  -> {vs} (zero-copy view over host memory)")
+        print()
+
+        # DOption return: None or the present value.
+        present = c.probe(input_data)
+        maxv = c.opt_classify(input_data)
+        print("c.probe() / c.opt_classify() -> DOption<u8>")
+        print(f"  probe        -> {present!r}")
+        print(f"  opt_classify -> {maxv!r} (max byte)")
 
     # --- allocator report (debug allocator) ---
     # A separate client backed by the debug allocator tracks live/peak/total
