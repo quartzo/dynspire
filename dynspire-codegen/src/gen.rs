@@ -159,54 +159,6 @@ fn load_interface(dspi_path: &str) -> (Interface, Vec<String>) {
 }
 
 // ===========================================================================
-// TypeTable — assigns sequential type indices (mirrors gen_spier_schema)
-// ===========================================================================
-
-struct TypeTable {
-    counter: u32,
-}
-
-impl TypeTable {
-    fn new() -> Self {
-        Self { counter: 0 }
-    }
-
-    fn add(&mut self, ty: &FieldType) -> u32 {
-        match ty {
-            FieldType::U8Slice => {
-                self.add(&FieldType::U8);
-                self.next()
-            }
-            FieldType::Vec(inner) => {
-                self.add(inner);
-                self.next()
-            }
-            FieldType::Option(inner) => {
-                self.add(inner);
-                self.next()
-            }
-            FieldType::Tuple(elems) => {
-                for e in elems {
-                    self.add(e);
-                }
-                self.next()
-            }
-            FieldType::Array(inner, _) => {
-                self.add(inner);
-                self.next()
-            }
-            _ => self.next(),
-        }
-    }
-
-    fn next(&mut self) -> u32 {
-        let idx = self.counter;
-        self.counter += 1;
-        idx
-    }
-}
-
-// ===========================================================================
 // Name helpers
 // ===========================================================================
 
@@ -855,58 +807,22 @@ impl {tn} for {cn} {{
 }
 
 // ===========================================================================
-// gen_spier_exports — module-scope C exports: dynspire_free + dynspire_idl_hash
+// gen_spier_exports — module-scope C export: dynspire_idl_hash
+//
+// Owned returns are released by the host directly via `dynspire_release`
+// (the allocation carries its own RC header + drop_fn), so no
+// `dynspire_free`-style type_index dispatch is needed.
 // ===========================================================================
 
-fn gen_spier_exports(iface: &Interface, hash: u64) -> String {
-    let mut tt = TypeTable::new();
-
-    let mut free_arms: Vec<String> = Vec::new();
-    for m in &iface.methods {
-        for p in &m.params {
-            tt.add(&p.ty);
-        }
-        let ret_idx = tt.add(&m.return_type);
-        let recv_expr = gen_read_receive(&m.return_type, "r", &iface.types);
-        free_arms.push(format!(
-            "            {ret_idx} => {{ let _ = {recv_expr}; }}",
-        ));
-    }
-
+fn gen_spier_exports(_iface: &Interface, hash: u64) -> String {
     format!(
         r#"#[no_mangle]
-pub unsafe extern "C" fn dynspire_free(
-    type_index: u32,
-    slots: *const u64,
-    slot_count: usize,
-) {{
-    if slots.is_null() || slot_count == 0 {{ return; }}
-    let slice = core::slice::from_raw_parts(slots, slot_count);
-    let mut r = dynspire::slots::SlotReader::new(slice);
-    let tag = r.read_u64();
-    if tag == 1 {{
-        let _ = unsafe {{
-            let __ptr = r.read_u64() as *mut u8;
-            let __len = r.read_u64() as usize;
-            if __ptr.is_null() || __len == 0 {{ () }}
-            else {{ dynspire::managed::dynspire_release(__ptr); }}
-        }};
-        return;
-    }}
-    match type_index {{
-{free}
-        _ => {{}}
-    }}
-}}
-
-#[no_mangle]
 pub extern "C" fn dynspire_idl_hash() -> u64 {{
     {hash}
 }}
 
 "#,
         hash = hash,
-        free = free_arms.join("\n"),
     )
 }
 
@@ -1162,21 +1078,6 @@ fn is_immediate_owned(ft: &FieldType, types: &[TypeDecl]) -> bool {
     }
 }
 
-/// Compute the per-method `dynspire_free` type index. The construction order of
-/// the `TypeTable` MUST match `gen_spier_schema` exactly so the indices line up
-/// with the spier's `free` match arms.
-fn compute_ret_indices(iface: &Interface) -> Vec<u32> {
-    let mut tt = TypeTable::new();
-    let mut out = Vec::new();
-    for m in &iface.methods {
-        for p in &m.params {
-            let _ = tt.add(&p.ty);
-        }
-        out.push(tt.add(&m.return_type));
-    }
-    out
-}
-
 // --- encode: Python value -> slot stream (mirrors gen_write_encode) ---
 
 fn gen_py_write(ft: &FieldType, expr: &str, w: &str, types: &[TypeDecl], indent: usize) -> std::string::String {
@@ -1273,7 +1174,7 @@ fn gen_py_enum_write(e: &EnumDecl, expr: &str, w: &str, types: &[TypeDecl], inde
 // and empty-struct returns need statement blocks and are handled by
 // `gen_py_decode_block`.
 
-fn gen_py_read_expr(ft: &FieldType, r: &str, types: &[TypeDecl], ret_idx: u32) -> std::string::String {
+fn gen_py_read_expr(ft: &FieldType, r: &str, types: &[TypeDecl]) -> std::string::String {
     use FieldType::*;
     match ft {
         Unit => "None".into(),
@@ -1305,9 +1206,9 @@ fn gen_py_read_expr(ft: &FieldType, r: &str, types: &[TypeDecl], ret_idx: u32) -
             }
         }
         OutU8Vec => "None".into(),
-        Option(inner) => format!("None if {r}.read() == 0 else {}", gen_py_read_expr(inner, r, types, ret_idx)),
+        Option(inner) => format!("None if {r}.read() == 0 else {}", gen_py_read_expr(inner, r, types)),
         Tuple(elems) => {
-            let parts: std::vec::Vec<std::string::String> = elems.iter().map(|e| gen_py_read_expr(e, r, types, ret_idx)).collect();
+            let parts: std::vec::Vec<std::string::String> = elems.iter().map(|e| gen_py_read_expr(e, r, types)).collect();
             format!("({})", parts.join(", "))
         }
         Array(inner, len) => {
@@ -1318,7 +1219,7 @@ fn gen_py_read_expr(ft: &FieldType, r: &str, types: &[TypeDecl], ret_idx: u32) -
                 format!("b''.join([{parts}])", parts = parts.join(", "))
             } else {
                 let parts: std::vec::Vec<std::string::String> = (0..*len)
-                    .map(|_| gen_py_read_expr(inner, r, types, ret_idx))
+                    .map(|_| gen_py_read_expr(inner, r, types))
                     .collect();
                 format!("[{}]", parts.join(", "))
             }
@@ -1328,7 +1229,7 @@ fn gen_py_read_expr(ft: &FieldType, r: &str, types: &[TypeDecl], ret_idx: u32) -
                 panic!("dynspire-codegen: empty struct '{name}' return is not supported in Python codegen")
             }
             TypeDecl::Struct(_) | TypeDecl::Opaque(_) => {
-                format!("{name}(self, {r}.read(), {ret_idx})")
+                format!("{name}(self, {r}.read())")
             }
             TypeDecl::Enum(_) => panic!("dynspire-codegen: enum decode must go through gen_py_decode_block"),
         },
@@ -1336,36 +1237,31 @@ fn gen_py_read_expr(ft: &FieldType, r: &str, types: &[TypeDecl], ret_idx: u32) -
 }
 
 /// Statements (at `indent`) that decode the Ok payload into a local `_v`.
-/// Empty for `Unit` (caller returns `None` directly).
-/// `free_prefix` accumulates Option Some-tags so nested `Option<Struct>`
-/// OpaqueHandles pass the correct slot layout to `dynspire_free`.
-fn gen_py_decode_block(ft: &FieldType, r: &str, types: &[TypeDecl], ret_idx: u32, indent: usize, free_prefix: &[u64]) -> String {
+/// Empty for `Unit` (caller returns `None` directly). Owned leaf values
+/// (strings/bytes/vecs) append their allocation pointer to the reader's
+/// `_release_list`; the caller releases them via `release_owned()` once the
+/// Python value has been copied out. Opaque handles manage their own release
+/// on `__del__`.
+fn gen_py_decode_block(ft: &FieldType, r: &str, types: &[TypeDecl], indent: usize) -> String {
     let pad = " ".repeat(indent);
     match ft {
         FieldType::Unit => String::new(),
         FieldType::Named(name) => match find_type(types, name) {
             TypeDecl::Enum(e) => gen_py_enum_read_block(e, r, types, indent),
             TypeDecl::Struct(_) | TypeDecl::Opaque(_) => {
-                let pfx = if free_prefix.is_empty() {
-                    String::new()
-                } else {
-                    format!(", ({},)", free_prefix.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", "))
-                };
-                format!("{pad}_v = {name}(self, {r}.read(), {ret_idx}{pfx})\n")
+                format!("{pad}_v = {name}(self, {r}.read())\n")
             }
         },
         FieldType::Option(inner) => {
             let inpad = " ".repeat(indent + 4);
-            let mut new_prefix = free_prefix.to_vec();
-            new_prefix.push(1);
             let mut s = format!("{pad}_opt = {r}.read()\n");
             s.push_str(&format!("{pad}if _opt == 0:\n"));
             s.push_str(&format!("{inpad}_v = None\n"));
             s.push_str(&format!("{pad}else:\n"));
-            s.push_str(&gen_py_decode_block(inner, r, types, ret_idx, indent + 4, &new_prefix));
+            s.push_str(&gen_py_decode_block(inner, r, types, indent + 4));
             s
         }
-        _ => format!("{pad}_v = {}\n", gen_py_read_expr(ft, r, types, ret_idx)),
+        _ => format!("{pad}_v = {}\n", gen_py_read_expr(ft, r, types)),
     }
 }
 
@@ -1380,7 +1276,7 @@ fn gen_py_enum_read_block(e: &EnumDecl, r: &str, _types: &[TypeDecl], indent: us
         if v.fields.is_empty() {
             s.push_str(&format!("{inpad}_v = {n}('{vn}')\n", vn = v.name));
         } else {
-            let args: Vec<String> = v.fields.iter().map(|fty| gen_py_read_expr(fty, r, _types, 0)).collect();
+            let args: Vec<String> = v.fields.iter().map(|fty| gen_py_read_expr(fty, r, _types)).collect();
             s.push_str(&format!("{inpad}_v = {n}('{vn}', {args})\n", vn = v.name, args = args.join(", ")));
         }
     }
@@ -1392,17 +1288,15 @@ fn gen_py_enum_read_block(e: &EnumDecl, r: &str, _types: &[TypeDecl], indent: us
 
 // --- type classes ---
 
-fn gen_py_types(iface: &Interface, struct_ret: &HashMap<String, u32>) -> String {
+fn gen_py_types(iface: &Interface) -> String {
     let mut s = String::from("# --- Types ---\n\n");
     for ty in &iface.types {
         match ty {
             TypeDecl::Struct(st) => {
-                let idx = struct_ret.get(&st.name).copied().unwrap_or(0);
-                s.push_str(&format!("class {name}(OpaqueHandle):\n    _free_idx = {idx}\n\n\n", name = st.name, idx = idx));
+                s.push_str(&format!("class {name}(OpaqueHandle):\n    pass\n\n\n", name = st.name));
             }
             TypeDecl::Opaque(o) => {
-                let idx = struct_ret.get(&o.name).copied().unwrap_or(0);
-                s.push_str(&format!("class {name}(OpaqueHandle):\n    _free_idx = {idx}\n\n\n", name = o.name, idx = idx));
+                s.push_str(&format!("class {name}(OpaqueHandle):\n    pass\n\n\n", name = o.name));
             }
             TypeDecl::Enum(e) => s.push_str(&gen_py_enum_class(e)),
         }
@@ -1446,11 +1340,11 @@ fn gen_py_enum_class(e: &EnumDecl) -> String {
 
 // --- client class ---
 
-fn gen_py_client(iface: &Interface, ret_indices: &[u32]) -> String {
+fn gen_py_client(iface: &Interface) -> String {
     let cn = &iface.name;
     let mut methods = String::new();
-    for (m, &ret_idx) in iface.methods.iter().zip(ret_indices.iter()) {
-        methods.push_str(&gen_py_method(m, ret_idx, &iface.types));
+    for m in &iface.methods {
+        methods.push_str(&gen_py_method(m, &iface.types));
     }
     format!(
         "# --- Client ---\n\nclass {cn}(SpierClient):\n    _spier_name = '{name}'\n    _idl_hash_const = _IDL_HASH\n\n{methods}",
@@ -1460,7 +1354,7 @@ fn gen_py_client(iface: &Interface, ret_indices: &[u32]) -> String {
     )
 }
 
-fn gen_py_method(m: &Method, ret_idx: u32, types: &[TypeDecl]) -> String {
+fn gen_py_method(m: &Method, types: &[TypeDecl]) -> String {
     let inpad = "        ";
     let mut s = String::new();
 
@@ -1496,16 +1390,16 @@ fn gen_py_method(m: &Method, ret_idx: u32, types: &[TypeDecl]) -> String {
     s.push_str(&format!("{inpad}_tag = _r.read()\n"));
     s.push_str(&format!("{inpad}if _tag == 1:\n"));
     s.push_str(&format!("{inpad}    _err = _r.read_string()\n"));
-    s.push_str(&format!("{inpad}    self.free_owned({}, _out, _r.pos())\n", ret_idx));
+    s.push_str(&format!("{inpad}    _r.release_owned()\n"));
     s.push_str(&format!("{inpad}    raise DynSpireError(_err)\n"));
 
     let is_unit = matches!(m.return_type, FieldType::Unit);
     let owned = is_immediate_owned(&m.return_type, types);
 
     if !is_unit {
-        s.push_str(&gen_py_decode_block(&m.return_type, "_r", types, ret_idx, 8, &[]));
+        s.push_str(&gen_py_decode_block(&m.return_type, "_r", types, 8));
         if owned {
-            s.push_str(&format!("{inpad}self.free_owned({}, _out, _r.pos())\n", ret_idx));
+            s.push_str(&format!("{inpad}_r.release_owned()\n"));
         }
     }
 
@@ -1618,6 +1512,7 @@ class OutReader:
         self._arr = arr
         self._pos = 0
         self._client = client
+        self._release_list = []
 
     def read(self):
         v = self._arr[self._pos]
@@ -1668,18 +1563,23 @@ class OutReader:
         ptr, n = self.read(), self.read()
         if not ptr or not n:
             return ""
+        if ptr:
+            self._release_list.append(ptr)
         return ctypes.string_at(ptr, n).decode("utf-8", "replace")
 
     def read_bytes(self):
         ptr, n = self.read(), self.read()
         if not ptr or not n:
             return b""
+        if ptr:
+            self._release_list.append(ptr)
         return ctypes.string_at(ptr, n)
 
     def read_vec_string(self):
         ptr, n = self.read(), self.read()
         if not ptr or not n:
             return []
+        self._release_list.append(ptr)
         out = []
         for i in range(n):
             view = self._client._vec_view_at_fn(ptr, i)
@@ -1690,11 +1590,18 @@ class OutReader:
         ptr, n = self.read(), self.read()
         if not ptr or not n:
             return []
+        self._release_list.append(ptr)
         out = []
         for i in range(n):
             view = self._client._vec_view_at_fn(ptr, i)
             out.append(b"" if not view.len else ctypes.string_at(view.ptr, view.len))
         return out
+
+    def release_owned(self):
+        for p in self._release_list:
+            if p:
+                self._client._release_fn(p)
+        self._release_list = []
 
 
 def new_out_array():
@@ -1702,13 +1609,11 @@ def new_out_array():
 
 
 class OpaqueHandle:
-    __slots__ = ("_client", "_ptr", "_free_idx", "_free_slots", "__weakref__")
+    __slots__ = ("_client", "_ptr", "__weakref__")
 
-    def __init__(self, client, ptr, free_idx, free_slots=()):
+    def __init__(self, client, ptr):
         self._client = client
         self._ptr = ptr
-        self._free_idx = free_idx
-        self._free_slots = free_slots
 
     @property
     def type_name(self):
@@ -1719,7 +1624,8 @@ class OpaqueHandle:
 
     def __del__(self):
         try:
-            self._client._free_opaque(self._free_idx, self._ptr, self._free_slots)
+            if self._ptr:
+                self._client._release_fn(self._ptr)
         except Exception:
             pass
 
@@ -1764,10 +1670,10 @@ class SpierClient:
         f.restype = ctypes.c_uint64
         self._idl_hash_fn = f
 
-        f = self._lib.dynspire_free
-        f.argtypes = [ctypes.c_uint32, ctypes.c_void_p, ctypes.c_size_t]
+        f = self._lib.dynspire_release
+        f.argtypes = [ctypes.c_void_p]
         f.restype = None
-        self._free_fn = f
+        self._release_fn = f
 
         f = self._lib.dynspire_vec_create
         f.restype = ctypes.c_void_p
@@ -1810,16 +1716,6 @@ class SpierClient:
             raise DynSpireError("out-slot overflow dispatching '" + method + "'")
         if status != 0:
             raise DynSpireError("dispatch '" + method + "' failed (status " + str(status) + ")")
-
-    def free_owned(self, type_idx, out, count):
-        self._free_fn(type_idx, ctypes.cast(out, ctypes.c_void_p), count)
-
-    def _free_opaque(self, free_idx, ptr, free_slots=()):
-        if ptr == 0:
-            return
-        n = 2 + len(free_slots)
-        slots = (ctypes.c_uint64 * n)(0, *free_slots, ptr)
-        self._free_fn(free_idx, slots, n)
 
     def _new_outvec(self):
         return self._vec_create_fn()
@@ -1864,21 +1760,6 @@ pub fn generate_python(iface: &Interface) -> String {
 
 fn generate_python_with_ctx(iface: &Interface, _ctx: &mut BuildContext) -> String {
     let hash = fnv1a_64(iface.canonical_sig().as_bytes());
-    let types = &iface.types;
-    let ret_indices = compute_ret_indices(iface);
-
-    // Representative free index per boxed struct/opaque type (any method that
-    // returns it works — every matching free arm reconstructs the same type).
-    let mut struct_ret: HashMap<String, u32> = HashMap::new();
-    for (m, &ridx) in iface.methods.iter().zip(ret_indices.iter()) {
-        if let FieldType::Named(name) = &m.return_type {
-            if let Some(t) = types.iter().find(|t| t.name() == name.as_str()) {
-                if matches!(t, TypeDecl::Struct(_) | TypeDecl::Opaque(_)) {
-                    struct_ret.entry(name.clone()).or_insert(ridx);
-                }
-            }
-        }
-    }
 
     let mut out = String::new();
     out.push_str("# Auto-generated by dynspire-codegen. Do not edit.\n");
@@ -1886,8 +1767,8 @@ fn generate_python_with_ctx(iface: &Interface, _ctx: &mut BuildContext) -> Strin
     out.push_str(PY_RUNTIME);
     out.push_str("\n\n");
     out.push_str(&format!("_IDL_HASH = 0x{:016x}\n\n\n", hash));
-    out.push_str(&gen_py_types(iface, &struct_ret));
-    out.push_str(&gen_py_client(iface, &ret_indices));
+    out.push_str(&gen_py_types(iface));
+    out.push_str(&gen_py_client(iface));
     out.push('\n');
     out
 }
@@ -2018,7 +1899,10 @@ mod tests {
     fn generated_code_contains_free_and_hash() {
         let iface = parse_rle();
         let code = generate(&iface);
-        assert!(code.contains("dynspire_free"));
+        // Returns are released by the host directly via the RC header, so there
+        // is no `dynspire_free`-style type_index dispatch export.
+        assert!(!code.contains("dynspire_free"), "dynspire_free must be removed");
+        assert!(code.contains("dynspire_release"), "returns must be released via dynspire_release");
         assert!(code.contains("dynspire_idl_hash"));
         assert!(!code.contains("__IDL_SCHEMA"), "schema statics removed");
         assert!(!code.contains("idl_schema()"), "idl_schema() accessor removed");
