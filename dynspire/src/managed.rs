@@ -51,6 +51,12 @@ pub struct DynSpireAllocator {
     pub ctx: *mut c_void,
 }
 
+// A `DynSpireAllocator` is a handle to a thread-safe allocator (the vtable is a
+// set of `extern "C"` functions; `ctx` is opaque). Sharing it across threads is
+// sound — the allocator implementation is responsible for its own sync.
+unsafe impl Send for DynSpireAllocator {}
+unsafe impl Sync for DynSpireAllocator {}
+
 // ---------------------------------------------------------------------------
 // Default allocator (std::alloc)
 // ---------------------------------------------------------------------------
@@ -102,6 +108,25 @@ pub fn default_allocator() -> DynSpireAllocator {
         vtable: &DEFAULT_VTABLE as *const DynSpireAllocatorVtable,
         ctx: std::ptr::null_mut(),
     }
+}
+
+/// A process-lifetime default allocator instance. Its address is stable, so it
+/// can be handed to `dynspire_create` from foreign callers (e.g. the Python
+/// ctypes client) that cannot construct a `DynSpireAllocator` themselves.
+static DEFAULT_ALLOCATOR: DynSpireAllocator = DynSpireAllocator {
+    vtable: &DEFAULT_VTABLE as *const DynSpireAllocatorVtable,
+    ctx: std::ptr::null_mut(),
+};
+
+/// C-ABI: return a pointer to the process-lifetime default allocator.
+///
+/// # Safety
+///
+/// The returned pointer is valid for the whole process lifetime; it must not be
+/// freed or passed to `drop_allocator`.
+#[no_mangle]
+pub unsafe extern "C" fn dynspire_default_allocator() -> *mut DynSpireAllocator {
+    &DEFAULT_ALLOCATOR as *const DynSpireAllocator as *mut DynSpireAllocator
 }
 
 // ---------------------------------------------------------------------------

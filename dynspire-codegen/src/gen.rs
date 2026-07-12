@@ -944,7 +944,7 @@ fn gen_spier_macro(iface: &Interface) -> String {
                            if __n > 0 { unsafe { core::ptr::copy_nonoverlapping(__w.as_slice().as_ptr(), out_slots, __n); } }\n\
                            return 0; }\n";
 
-        let state_cast = "            let state = &*(state_handle as *const $state);\n";
+        let state_cast = "            let __spier_state = unsafe { &*(state_handle as *const __SpierState) };\n            let state = &__spier_state.inner;\n";
 
         let param_names: Vec<String> = std::iter::once("state".to_string())
             .chain(m.params.iter().map(|p| p.name.clone()))
@@ -1002,8 +1002,15 @@ fn gen_spier_macro(iface: &Interface) -> String {
 macro_rules! {mn} {{
     ($state:ty, $init:path, $name:literal) => {{
 {dispatch}
+        struct __SpierState {{
+            #[allow(dead_code)]
+            allocator: *mut dynspire::managed::DynSpireAllocator,
+            inner: $state,
+        }}
+
         #[no_mangle]
-        pub extern "C" fn dynspire_create(
+        pub unsafe extern "C" fn dynspire_create(
+            allocator: *mut dynspire::managed::DynSpireAllocator,
             data_ptr: *const u8,
             data_len: usize,
         ) -> *mut std::ffi::c_void {{
@@ -1014,7 +1021,9 @@ macro_rules! {mn} {{
                 dynspire::deserialize_kvmap(data)
             }};
             match $init(&config) {{
-                Ok(state) => Box::into_raw(Box::new(state)) as *mut std::ffi::c_void,
+                Ok(inner) => {{
+                    Box::into_raw(Box::new(__SpierState {{ allocator, inner }})) as *mut std::ffi::c_void
+                }}
                 Err(e) => {{
                     eprintln!("spier init failed: {{e}}");
                     std::ptr::null_mut()
@@ -1023,9 +1032,9 @@ macro_rules! {mn} {{
         }}
 
         #[no_mangle]
-        pub extern "C" fn dynspire_destroy(handle: *mut std::ffi::c_void) {{
+        pub unsafe extern "C" fn dynspire_destroy(handle: *mut std::ffi::c_void) {{
             if !handle.is_null() {{
-                unsafe {{ drop(Box::from_raw(handle as *mut $state)); }}
+                unsafe {{ drop(Box::from_raw(handle as *mut __SpierState)); }}
             }}
         }}
 
@@ -1719,16 +1728,22 @@ class SpierClient:
                 "IDL hash mismatch: host expects 0x{:016x}, spier '{}' has 0x{:016x}".format(expected, self._spier_name, actual)
             )
         cfg = _encode_config(config)
-        self._handle = self._create_fn(cfg, len(cfg))
+        self._alloc_ptr = self._alloc_fn()
+        self._handle = self._create_fn(self._alloc_ptr, cfg, len(cfg))
         if not self._handle:
             raise DynSpireError("spier '{}' create failed".format(self._spier_name))
         self._closed = False
         self._dispatch_cache = {}
 
     def _configure_symbols(self):
+        f = self._lib.dynspire_default_allocator
+        f.restype = ctypes.c_void_p
+        f.argtypes = []
+        self._alloc_fn = f
+
         f = self._lib.dynspire_create
         f.restype = ctypes.c_void_p
-        f.argtypes = [ctypes.c_char_p, ctypes.c_size_t]
+        f.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t]
         self._create_fn = f
 
         f = self._lib.dynspire_destroy

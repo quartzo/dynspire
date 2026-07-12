@@ -4,10 +4,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::kvmap::serialize_kvmap;
+use crate::managed::{default_allocator, DynSpireAllocator};
 use crate::slots::MAX_OUT_SLOTS;
 
 type FnIdlHash = unsafe extern "C" fn() -> u64;
-type FnCreate = unsafe extern "C" fn(*const u8, usize) -> *mut c_void;
+type FnCreate = unsafe extern "C" fn(*mut DynSpireAllocator, *const u8, usize) -> *mut c_void;
 type FnDestroy = unsafe extern "C" fn(*mut c_void);
 type FnDispatch = unsafe extern "C" fn(
     *mut c_void,
@@ -62,6 +63,10 @@ pub struct DynSpireLib {
     dispatch: Arc<Vec<FnDispatch>>,
     create: FnCreate,
     destroy: FnDestroy,
+    /// Allocator configured once at spier creation. Stored in the `Arc`-shared
+    /// lib so it outlives every client and the spier `State` (which holds a
+    /// pointer into this value).
+    allocator: Arc<DynSpireAllocator>,
 }
 
 unsafe impl Send for DynSpireLib {}
@@ -102,6 +107,7 @@ impl DynSpireLib {
             dispatch: Arc::new(dispatch),
             create: fn_create,
             destroy: fn_destroy,
+            allocator: Arc::new(default_allocator()),
         })
     }
 
@@ -110,7 +116,8 @@ impl DynSpireLib {
         config: &HashMap<String, String>,
     ) -> Result<DynSpireClient, String> {
         let buf = serialize_kvmap(config);
-        let handle_ptr = unsafe { (self.create)(buf.as_ptr(), buf.len()) };
+        let alloc_ptr = Arc::as_ptr(&self.allocator) as *mut DynSpireAllocator;
+        let handle_ptr = unsafe { (self.create)(alloc_ptr, buf.as_ptr(), buf.len()) };
         if handle_ptr.is_null() {
             return Err("spier create returned null".into());
         }
