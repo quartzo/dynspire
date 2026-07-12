@@ -715,7 +715,7 @@ fn gen_types(iface: &Interface, ctx: &mut BuildContext) -> String {
 
 fn gen_struct_def(s: &StructDecl) -> String {
     let mut out = format!(
-        "#[derive(Clone, Debug, PartialEq)]\npub struct {} {{\n",
+        "#[repr(C)]\n#[derive(Clone, Debug, PartialEq)]\npub struct {} {{\n",
         s.name
     );
     for (fname, fty) in &s.fields {
@@ -726,7 +726,10 @@ fn gen_struct_def(s: &StructDecl) -> String {
 }
 
 fn gen_enum_def(e: &EnumDecl) -> String {
-    let mut out = format!("#[derive(Clone, Debug, PartialEq)]\npub enum {} {{\n", e.name);
+    let mut out = format!(
+        "#[repr(C, u32)]\n#[derive(Clone, Debug, PartialEq)]\npub enum {} {{\n",
+        e.name
+    );
     for v in &e.variants {
         if v.fields.is_empty() {
             out.push_str(&format!("    {},\n", v.name));
