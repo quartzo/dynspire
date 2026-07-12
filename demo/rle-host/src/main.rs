@@ -44,8 +44,9 @@ fn main() {
     println!();
 
     // --- compress_into: (&[u8], &mut Vec<u8>) -> Result<(), String> ---
-    // The spier writes directly into the caller's Vec via a raw pointer
-    // passed through the slot system — no copy, no return allocation.
+    // Out-vec: the host passes a DVec<u8> backed by the host allocator; the
+    // spier fills it (via dynspire_realloc) and the host copies the bytes back
+    // into the caller's Vec, then releases the buffer.
     let mut buf: Vec<u8> = Vec::new();
     client.compress_into(&input[..], &mut buf).expect("compress_into failed");
     let mut_ok = buf == compressed;

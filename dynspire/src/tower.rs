@@ -205,6 +205,15 @@ impl DynSpireClient {
         Arc::new(lib).create_client(config)
     }
 
+    /// Returns the raw pointer to the allocator configured at spier creation.
+    ///
+    /// Codegen uses this to back out-params (`DVec<u8>`) and owned allocations
+    /// with the same allocator the spier was created with, so the host can
+    /// release them later.
+    pub fn alloc_ptr(&self) -> *mut DynSpireAllocator {
+        Arc::as_ptr(&self.lib.allocator) as *mut DynSpireAllocator
+    }
+
     pub fn dispatch(
         &self,
         method: usize,

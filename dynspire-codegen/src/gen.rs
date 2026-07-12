@@ -764,25 +764,47 @@ fn gen_tower(iface: &Interface) -> String {
             .collect();
 
         let mut encode_stmts = String::new();
+        let mut post_stmts = String::new();
         for p in &m.params {
-            encode_stmts.push_str(&gen_write_encode(&p.ty, &p.name, "__w", types));
+            if matches!(p.ty, FieldType::OutU8Vec) {
+                let n = &p.name;
+                encode_stmts.push_str(&format!(
+                    "        let mut __ov_{n}: dynspire::managed::DVec<u8> = dynspire::managed::DVec {{ allocator: self.client.alloc_ptr(), ptr: std::ptr::null_mut(), len: 0, cap: 0 }};\n\
+                     __w.write_u64(&mut __ov_{n} as *mut dynspire::managed::DVec<u8> as u64);\n",
+                ));
+                post_stmts.push_str(&format!(
+                    "        if !__ov_{n}.ptr.is_null() {{\n\
+                     let __bytes = unsafe {{ core::slice::from_raw_parts(__ov_{n}.ptr, __ov_{n}.len) }};\n\
+                     {out}.extend_from_slice(__bytes);\n\
+                     unsafe {{ dynspire::managed::dynspire_release(__ov_{n}.ptr); }}\n\
+                     }}\n",
+                    n = n, out = p.name,
+                ));
+            } else {
+                encode_stmts.push_str(&gen_write_encode(&p.ty, &p.name, "__w", types));
+            }
         }
 
         let result_recv = gen_read_result_receive(&m.return_type, "__r", types);
 
         methods.push_str(&format!(
-            "    fn {}({}) -> Result<{}, String> {{\n\
+            "    fn {name}({params}) -> Result<{ret}, String> {{\n\
              let mut __w = dynspire::slots::SlotWriter::new();\n\
              {encode_stmts}\
              let mut __out = [0u64; dynspire::slots::MAX_OUT_SLOTS];\n\
-             self.client.dispatch({}::{} as usize, __w.as_slice(), &mut __out)?;\n\
+             self.client.dispatch({opn}::{pascal} as usize, __w.as_slice(), &mut __out)?;\n\
              let mut __r = dynspire::slots::SlotReader::new(&__out);\n\
-             {result_recv}\n    }}\n",
-            m.name,
-            params.join(", "),
-            m.return_type.rust_type(),
-            opn,
-            pascal(&m.name),
+             let __result = {result_recv};\n\
+             {post_stmts}\
+             __result\n\
+             }}\n",
+            name = m.name,
+            params = params.join(", "),
+            ret = m.return_type.rust_type(),
+            opn = opn,
+            pascal = pascal(&m.name),
+            result_recv = result_recv,
+            post_stmts = post_stmts,
         ));
     }
 
@@ -840,6 +862,7 @@ fn gen_spier_macro(iface: &Interface) -> String {
     for m in &iface.methods {
         let fn_name = format!("dynspire_dispatch_{}", m.name);
 
+        let mut post_call = String::new();
         let decode_block = if m.params.is_empty() {
             String::new()
         } else {
@@ -847,11 +870,33 @@ fn gen_spier_macro(iface: &Interface) -> String {
                 "            let __in_data = if !in_slots.is_null() && in_count > 0 {\n                unsafe { core::slice::from_raw_parts(in_slots, in_count) }\n            } else { &[] };\n            let mut __r = dynspire::slots::SlotReader::new(__in_data);\n",
             );
             for p in &m.params {
-                let decode_expr = gen_read_decode(&p.ty, "__r", types);
-                block.push_str(&format!(
-                    "            let {}: {} = {decode_expr};\n",
-                    p.name, p.ty.rust_type(),
-                ));
+                if matches!(p.ty, FieldType::OutU8Vec) {
+                    let n = &p.name;
+                    block.push_str(&format!(
+                        "            let __ov_{n}_dvec = __r.read_u64() as *mut dynspire::managed::DVec<u8>;\n\
+                         let mut __ov_{n}_vec: Vec<u8> = Vec::new();\n\
+                         let {n}: &mut Vec<u8> = &mut __ov_{n}_vec;\n",
+                    ));
+                    post_call.push_str(&format!(
+                        "            if !__ov_{n}_dvec.is_null() {{\n\
+                         let __dvec = &mut *(__ov_{n}_dvec as *mut dynspire::managed::DVec<u8>);\n\
+                         let __n = __ov_{n}_vec.len();\n\
+                         if __n > 0 {{\n\
+                         let __new = dynspire::managed::dynspire_realloc(__dvec.allocator, __dvec.ptr, __dvec.cap, __n, 1);\n\
+                         if !__new.is_null() {{\n\
+                         core::ptr::copy_nonoverlapping(__ov_{n}_vec.as_ptr(), __new, __n);\n\
+                         __dvec.ptr = __new; __dvec.len = __n; __dvec.cap = __n; }}\n\
+                         }}\n\
+                         }}\n",
+                        n = n,
+                    ));
+                } else {
+                    let decode_expr = gen_read_decode(&p.ty, "__r", types);
+                    block.push_str(&format!(
+                        "            let {}: {} = {decode_expr};\n",
+                        p.name, p.ty.rust_type(),
+                    ));
+                }
             }
             block
         };
@@ -907,7 +952,7 @@ fn gen_spier_macro(iface: &Interface) -> String {
             out_capacity: usize,
         ) -> u8 {{
 {null_check}{state_cast}{decode}            let _result = <$state as $crate::{tn}>::{method}{call_args};
-            let mut __w = dynspire::slots::SlotWriter::new();
+{post_call}            let mut __w = dynspire::slots::SlotWriter::new();
             {result_encode}            {write_out}
         }}
 "#,
@@ -917,6 +962,7 @@ fn gen_spier_macro(iface: &Interface) -> String {
             null_check=null_check,
             state_cast=state_cast,
             decode=decode_block,
+            post_call=post_call,
             tn=tn,
             method=m.name,
             call_args=call_args,
@@ -1404,8 +1450,9 @@ fn gen_py_method(m: &Method, types: &[TypeDecl]) -> String {
     }
 
     if ov_count > 0 {
-        let lst: Vec<String> = (0..ov_count).map(|i| format!("self._read_outvec(_ov{i})")).collect();
+        let lst: Vec<String> = (0..ov_count).map(|i| format!("self._read_outvec({i})")).collect();
         s.push_str(&format!("{inpad}_outs = [{}]\n", lst.join(", ")));
+        s.push_str(&format!("{inpad}self._outvecs = []\n"));
         if is_unit {
             s.push_str(&format!("{inpad}return None, _outs\n"));
         } else {
@@ -1432,8 +1479,13 @@ class DynSpireError(RuntimeError):
     pass
 
 
-class _VecView(ctypes.Structure):
-    _fields_ = [("ptr", ctypes.c_void_p), ("len", ctypes.c_size_t)]
+class DVecU8(ctypes.Structure):
+    _fields_ = [
+        ("allocator", ctypes.c_void_p),
+        ("ptr", ctypes.c_void_p),
+        ("len", ctypes.c_size_t),
+        ("cap", ctypes.c_size_t),
+    ]
 
 
 class SlotWriter:
@@ -1650,6 +1702,7 @@ class SpierClient:
             raise DynSpireError("spier '{}' create failed".format(self._spier_name))
         self._closed = False
         self._dispatch_cache = {}
+        self._outvecs = []
 
     def _configure_symbols(self):
         f = self._lib.dynspire_default_allocator
@@ -1674,24 +1727,6 @@ class SpierClient:
         f.argtypes = [ctypes.c_void_p]
         f.restype = None
         self._release_fn = f
-
-        f = self._lib.dynspire_vec_create
-        f.restype = ctypes.c_void_p
-        self._vec_create_fn = f
-
-        f = self._lib.dynspire_vec_view
-        f.restype = _VecView
-        f.argtypes = [ctypes.c_void_p]
-        self._vec_view_fn = f
-
-        f = self._lib.dynspire_vec_free
-        f.argtypes = [ctypes.c_void_p]
-        self._vec_free_fn = f
-
-        f = self._lib.dynspire_vec_view_at
-        f.restype = _VecView
-        f.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
-        self._vec_view_at_fn = f
 
     def _dispatch_fn(self, method):
         fn = self._dispatch_cache.get(method)
@@ -1718,12 +1753,22 @@ class SpierClient:
             raise DynSpireError("dispatch '" + method + "' failed (status " + str(status) + ")")
 
     def _new_outvec(self):
-        return self._vec_create_fn()
+        d = DVecU8()
+        d.allocator = self._alloc_ptr
+        d.ptr = None
+        d.len = ctypes.c_size_t(0)
+        d.cap = ctypes.c_size_t(0)
+        self._outvecs.append(d)
+        return ctypes.addressof(d)
 
-    def _read_outvec(self, addr):
-        view = self._vec_view_fn(addr)
-        data = ctypes.string_at(view.ptr, view.len) if view.len else b""
-        self._vec_free_fn(addr)
+    def _read_outvec(self, i):
+        d = self._outvecs[i]
+        if not d.ptr:
+            return b""
+        n = int(d.len)
+        arr_t = ctypes.c_ubyte * n
+        data = bytes(ctypes.cast(d.ptr, ctypes.POINTER(arr_t))[0])
+        self._release_fn(d.ptr)
         return data
 
     def __enter__(self):

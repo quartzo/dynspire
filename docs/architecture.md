@@ -399,9 +399,9 @@ with Rle("target/debug/librle_spier.so") as c:
 The generated client handles:
 
 - **Borrows** (`&[u8]`, `&str`): copies Python bytes into a ctypes array pinned for the call duration, passes `(ptr, len)` slots
-- **Owned returns** (`Vec<u8>`, `String`): copied into Python `bytes`/`str` via `ctypes.string_at`, then freed immediately via `dynspire_free`
-- **Opaque struct returns**: wrapped in `OpaqueHandle` (holds the boxed pointer, frees via `dynspire_free` on `__del__`; can be passed back as an input)
-- **OutVec** (`&mut Vec<u8>`): creates a Rust `Vec` via `dynspire_vec_create()`, passes the handle, snapshots contents via `dynspire_vec_view()`, frees via `dynspire_vec_free()`
+- **Owned returns** (`Vec<u8>`, `String`): copied into Python `bytes`/`str` via `ctypes.string_at`, then released via `dynspire_release`
+- **Opaque struct returns**: wrapped in `OpaqueHandle` (holds the boxed pointer, releases via `dynspire_release` on `__del__`; can be passed back as an input)
+- **OutVec** (`&mut Vec<u8>`): the host passes a `DVec<u8>` (allocator + ptr/len/cap) backed by the host allocator; the spier fills it via `dynspire_realloc` and the host copies the bytes back, then releases the buffer via `dynspire_release`
 - **Enums** (DSL `enum`): decoded to typed Python classes generated at codegen time; can be passed back as an input
 - **Result<T, String>**: reads the tag slot, decodes the Ok value or raises `RuntimeError` with the error string
 

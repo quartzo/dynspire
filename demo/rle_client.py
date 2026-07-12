@@ -51,7 +51,7 @@ def main():
         result = outs[0]
         ok = result == compressed
         print("c.compress_into(&mut Vec<u8>)")
-        print("  spier wrote into a Rust Vec created by dynspire_vec_create()")
+        print("  spier filled a DVec<u8> backed by the host allocator")
         print(
             f"  -> [{hex_fmt(result)}] ({len(result)} bytes) "
             f'{"[matches compress]" if ok else "[MISMATCH]"}'
