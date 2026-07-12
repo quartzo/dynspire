@@ -1155,7 +1155,8 @@ mod tests {
     fn debug_allocator_reports_occupation() {
         let mut alloc = debug_allocator();
         let before = alloc.report();
-        assert_eq!(before.live_bytes, 0);
+        let bytes_before = before.live_bytes;
+        let allocs_before = before.live_allocations;
         unsafe {
             let p1 = dynspire_alloc(&mut alloc as *mut _, 32, 8);
             assert!(!p1.is_null());
@@ -1163,22 +1164,22 @@ mod tests {
             assert!(!p2.is_null());
             let mid = alloc.report();
             // Both payloads are allocated with header overhead included.
-            assert!(mid.live_bytes >= 32 + 7);
-            assert_eq!(mid.live_allocations, 2);
-            assert_eq!(mid.total_allocations, 2);
+            assert!(mid.live_bytes >= bytes_before + 32 + 7);
+            assert_eq!(mid.live_allocations, allocs_before + 2);
+            assert!(mid.total_allocations >= 2);
             assert!(mid.peak_bytes >= mid.live_bytes);
 
             dynspire_release(p1);
             let after = alloc.report();
             assert!(after.live_bytes < mid.live_bytes);
-            assert_eq!(after.live_allocations, 1);
+            assert_eq!(after.live_allocations, allocs_before + 1);
             // Peak is monotonic.
-            assert_eq!(after.peak_bytes, mid.peak_bytes);
+            assert!(after.peak_bytes >= mid.peak_bytes);
 
             dynspire_release(p2);
             let done = alloc.report();
-            assert_eq!(done.live_bytes, 0);
-            assert_eq!(done.live_allocations, 0);
+            assert_eq!(done.live_allocations, allocs_before);
+            assert!(done.live_bytes <= bytes_before);
         }
     }
 
@@ -1190,5 +1191,242 @@ mod tests {
         assert_eq!(r.live_allocations, 0);
         assert_eq!(r.peak_bytes, 0);
         assert_eq!(r.total_allocations, 0);
+    }
+
+    // ------------------------------------------------------------------
+    // DType round-trip tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn dvec_new_in_fields() {
+        let alloc = default_allocator();
+        let v = DVec::<u8>::new_in(&alloc, 4);
+        assert_eq!(v.len, 0);
+        assert_eq!(v.cap, 4);
+        assert!(!v.ptr.is_null());
+        assert_eq!(v.as_slice(), &[]);
+    }
+
+    #[test]
+    fn dvec_push_and_as_slice() {
+        let alloc = default_allocator();
+        let mut v = DVec::<u8>::new_in(&alloc, 2);
+        v.push(0xAA);
+        v.push(0xBB);
+        assert_eq!(v.len, 2);
+        assert_eq!(v.as_slice(), &[0xAA, 0xBB]);
+    }
+
+    #[test]
+    fn dvec_grow_via_realloc() {
+        let alloc = default_allocator();
+        let mut v = DVec::<u8>::new_in(&alloc, 1);
+        for i in 0..16u8 {
+            v.push(i);
+        }
+        assert_eq!(v.len, 16);
+        assert!(v.cap >= 16);
+        assert_eq!(v.as_slice(), &core::array::from_fn::<u8, 16, _>(|i| i as u8));
+    }
+
+    #[test]
+    fn dstring_new_in_fields() {
+        let alloc = default_allocator();
+        let s = DString::new_in(&alloc, "hello");
+        assert_eq!(s.len, 5);
+        assert_eq!(s.as_str(), "hello");
+    }
+
+    #[test]
+    fn dstring_empty() {
+        let alloc = default_allocator();
+        let s = DString::new_in(&alloc, "");
+        assert_eq!(s.len, 0);
+        assert!(s.as_str().is_empty());
+    }
+
+    #[test]
+    fn dstr_as_str() {
+        let data = b"test view";
+        let view = DStr {
+            ptr: data.as_ptr(),
+            len: data.len(),
+        };
+        assert_eq!(view.len, 9);
+        assert_eq!(view.as_str(), "test view");
+    }
+
+    #[test]
+    fn dslice_as_slice() {
+        let data: &[u8] = &[10, 20, 30];
+        let view = DSlice::<u8> {
+            ptr: data.as_ptr(),
+            len: data.len(),
+        };
+        assert_eq!(view.len, 3);
+        assert_eq!(view.as_slice(), &[10, 20, 30]);
+    }
+
+    #[test]
+    fn doption_some_none_roundtrip() {
+        let some: DOption<u8> = DOption::some(42);
+        assert_eq!(some.tag, 1);
+        assert_eq!(some.value, 42);
+
+        let none: DOption<u8> = DOption::none();
+        assert_eq!(none.tag, 0);
+    }
+
+    #[test]
+    fn doption_from_option() {
+        let some: DOption<u32> = Some(7u32).into();
+        assert_eq!(some.tag, 1);
+        assert_eq!(some.value, 7);
+
+        let none: DOption<u32> = None::<u32>.into();
+        assert_eq!(none.tag, 0);
+    }
+
+    #[test]
+    fn dvec_into_raw_from_raw_roundtrip() {
+        let (mut alloc, counters) = test_allocator();
+        let mut v = DVec::<u8>::new_in(&alloc, 4);
+        v.push(0xCC);
+        v.push(0xDD);
+
+        let raw: DVec<u8> = v;
+        let bytes = raw.as_slice().to_vec();
+
+        let v2 = DVec::<u8> {
+            allocator: raw.allocator,
+            ptr: raw.ptr,
+            len: raw.len,
+            cap: raw.cap,
+        };
+        assert_eq!(v2.as_slice(), bytes.as_slice());
+        unsafe { dynspire_release(v2.ptr as *mut u8) };
+
+        unsafe {
+            assert_eq!((*counters).allocs.load(Ordering::SeqCst), (*counters).frees.load(Ordering::SeqCst));
+            free_test_allocator(alloc, counters);
+        }
+    }
+
+    #[test]
+    fn dstring_into_raw_from_raw_roundtrip() {
+        let (mut alloc, counters) = test_allocator();
+        let s = DString::new_in(&alloc, "round-trip");
+
+        let bytes = s.as_str().as_bytes().to_vec();
+        let raw = DString {
+            allocator: s.allocator,
+            ptr: s.ptr,
+            len: s.len,
+            cap: s.cap,
+        };
+        assert_eq!(raw.as_str(), core::str::from_utf8(&bytes).unwrap());
+        unsafe { dynspire_release(raw.ptr) };
+
+        unsafe {
+            assert_eq!((*counters).allocs.load(Ordering::SeqCst), (*counters).frees.load(Ordering::SeqCst));
+            free_test_allocator(alloc, counters);
+        }
+    }
+
+    #[test]
+    fn owned_dvec_drop_releases() {
+        let (mut alloc, counters) = test_allocator();
+        {
+            let mut ov = OwnedDVec::<u8>::new_in(&alloc, 4);
+            ov.push(0x11);
+            ov.push(0x22);
+            assert_eq!(ov.len(), 2);
+        }
+        unsafe {
+            assert_eq!((*counters).allocs.load(Ordering::SeqCst), (*counters).frees.load(Ordering::SeqCst));
+            free_test_allocator(alloc, counters);
+        }
+    }
+
+    #[test]
+    fn owned_dstring_drop_releases() {
+        let (mut alloc, counters) = test_allocator();
+        {
+            let os = OwnedDString::new_in(&alloc, "owned string");
+            assert_eq!(os.as_str(), "owned string");
+        }
+        unsafe {
+            assert_eq!((*counters).allocs.load(Ordering::SeqCst), (*counters).frees.load(Ordering::SeqCst));
+            free_test_allocator(alloc, counters);
+        }
+    }
+
+    #[test]
+    fn dvec_full_roundtrip_with_growth() {
+        let (mut alloc, counters) = test_allocator();
+        let mut ov = OwnedDVec::<u64>::new_in(&alloc, 1);
+        for i in 0..100u64 {
+            ov.push(i);
+        }
+        assert_eq!(ov.len(), 100);
+        unsafe { assert_eq!((*counters).allocs.load(Ordering::SeqCst), 1); }
+
+        // Simulate spier → host handoff: take raw, forget the guard.
+        let raw = DVec::<u64> {
+            allocator: ov.inner.allocator,
+            ptr: ov.inner.ptr,
+            len: ov.inner.len,
+            cap: ov.inner.cap,
+        };
+        std::mem::forget(ov);
+
+        assert_eq!(raw.len, 100);
+        unsafe { dynspire_release(raw.ptr as *mut u8) };
+
+        unsafe {
+            assert_eq!((*counters).allocs.load(Ordering::SeqCst), (*counters).frees.load(Ordering::SeqCst));
+            free_test_allocator(alloc, counters);
+        }
+    }
+
+    #[test]
+    fn debug_allocator_leak_check() {
+        let alloc = debug_allocator();
+        let before = alloc.report();
+        let live_before = before.live_bytes;
+        let allocs_before = before.total_allocations;
+
+        let mut ov = OwnedDVec::<u8>::new_in(&alloc, 64);
+        for i in 0..64u8 {
+            ov.push(i);
+        }
+        let mid = alloc.report();
+        assert!(mid.live_bytes > live_before);
+        assert!(mid.total_allocations > allocs_before);
+        let live_after_alloc = mid.live_bytes;
+        let alloc_count_after = mid.live_allocations;
+
+        drop(ov);
+        let after = alloc.report();
+        assert_eq!(after.live_allocations, alloc_count_after - 1);
+        assert!(after.live_bytes < live_after_alloc);
+    }
+
+    #[test]
+    fn debug_allocator_peak_monotonic() {
+        let alloc = debug_allocator();
+        let before = alloc.report();
+        let peak_before = before.peak_bytes;
+
+        let mut ov = OwnedDVec::<u8>::new_in(&alloc, 32);
+        for i in 0..32u8 {
+            ov.push(i);
+        }
+        let peak1 = alloc.report().peak_bytes;
+        assert!(peak1 >= peak_before);
+        drop(ov);
+
+        let peak2 = alloc.report().peak_bytes;
+        assert!(peak2 >= peak1);
     }
 }

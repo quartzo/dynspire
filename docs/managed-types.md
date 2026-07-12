@@ -754,6 +754,40 @@ n = c.consume_dvec(dv)               # pass the (Copy) view back
 # freed on GC via __del__
 ```
 
+### Out-params with `DVec<u8>`
+
+The `&mut Vec<u8>` out-param pattern (`compress_into`) is now implemented
+using `DVec<u8>` internally. The codegen handles the full lifecycle:
+
+1. **Host side:** A `DVec<u8>` is allocated via the host allocator with
+   `null` pointer, zero length, and the caller's desired capacity.
+2. **FFI write:** The `DVec<u8>` is passed to the spier as a mutable borrow
+   (out-param). The spier writes into it via `dynspire_realloc` (reading the
+   allocator pointer from the `DVec` itself).
+3. **Host read-back:** The host copies the spier-filled bytes into the
+   caller's `Vec<u8>`, then releases the `DVec<u8>` buffer via
+   `dynspire_release`.
+
+```rust
+// Spier side — receives DVec<u8> as out-param, grows via realloc:
+fn compress_into(&self, data: &[u8], out: &mut DVec<u8>) -> Result<(), String> {
+    let compressed = rle_encode(data);
+    for &b in &compressed {
+        out.push(b);  // grows via dynspire_realloc(out.allocator, ...)
+    }
+    Ok(())
+}
+```
+
+```python
+# Python — out-vecs are returned as a second element:
+_, outs = c.compress_into(input_data)
+result = outs[0]  # bytes
+```
+
+The old `dynspire_vec_create` / `dynspire_vec_view` / `dynspire_vec_free`
+functions are removed — `DVec<u8>` subsumes them.
+
 ### Status
 
 Implemented in `dynspire` (`src/managed.rs`), `dynspire-codegen` (`ast.rs`,
