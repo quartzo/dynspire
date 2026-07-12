@@ -346,21 +346,25 @@ fn gen_write_return(ft: &FieldType, expr: &str, w: &str, types: &[TypeDecl]) -> 
         FieldType::String => format!(
             "if {expr}.is_empty() {{ {w}.write_u64(0); {w}.write_u64(0); }} else {{ \
              let __len = {expr}.len(); \
-             let __boxed = {expr}.into_bytes().into_boxed_slice(); \
-             let __ptr = __boxed.as_ptr() as usize; \
-             core::mem::forget(__boxed); \
-             {w}.write_u64(__ptr as u64); \
-             {w}.write_u64(__len as u64); }}"
+             let __data = dynspire::managed::dynspire_alloc(__alloc, __len, 1); \
+             if __data.is_null() {{ {w}.write_u64(0); {w}.write_u64(0); }} else {{ \
+             core::ptr::copy_nonoverlapping({expr}.as_ptr(), __data, __len); \
+             {w}.write_u64(__data as u64); \
+             {w}.write_u64(__len as u64); }} }}"
         ),
-        FieldType::Vec(_) => format!(
-            "if {expr}.is_empty() {{ {w}.write_u64(0); {w}.write_u64(0); }} else {{ \
-             let __len = {expr}.len(); \
-             let __boxed = {expr}.into_boxed_slice(); \
-             let __ptr = __boxed.as_ptr() as usize; \
-             core::mem::forget(__boxed); \
-             {w}.write_u64(__ptr as u64); \
-             {w}.write_u64(__len as u64); }}"
-        ),
+        FieldType::Vec(inner) => {
+            let rt = inner.rust_type();
+            format!(
+                "if {expr}.is_empty() {{ {w}.write_u64(0); {w}.write_u64(0); }} else {{ \
+                 let __len = {expr}.len(); \
+                 let __nbytes = __len * core::mem::size_of::<{rt}>(); \
+                 let __data = dynspire::managed::dynspire_alloc(__alloc, __nbytes, core::mem::align_of::<{rt}>()); \
+                 if __data.is_null() {{ {w}.write_u64(0); {w}.write_u64(0); }} else {{ \
+                 core::ptr::copy_nonoverlapping({expr}.as_ptr() as *const u8, __data, __nbytes); \
+                 {w}.write_u64(__data as u64); \
+                 {w}.write_u64(__len as u64); }} }}"
+            )
+        }
         FieldType::Option(inner) => {
             let some = gen_write_return(inner, "__v", w, types);
             if some.is_empty() {
@@ -389,7 +393,11 @@ fn gen_write_return(ft: &FieldType, expr: &str, w: &str, types: &[TypeDecl]) -> 
                     format!("{w}.write_u64(core::ptr::addr_of!({expr}) as u64);")
                 }
                 TypeDecl::Struct(_) | TypeDecl::Opaque(_) => {
-                    format!("{w}.write_u64(Box::into_raw(Box::new({expr})) as u64);")
+                    format!(
+                        "let __ptr = dynspire::managed::dynspire_alloc(__alloc, core::mem::size_of::<{name}>(), core::mem::align_of::<{name}>()) as *mut {name}; \
+                         *__ptr = {expr}; \
+                         {w}.write_u64(__ptr as u64);"
+                    )
                 }
                 TypeDecl::Enum(e) => gen_write_enum_return(e, expr, w, types),
             }
@@ -503,7 +511,7 @@ fn gen_read_receive(ft: &FieldType, r: &str, types: &[TypeDecl]) -> String {
              let __ptr = {r}.read_u64() as *mut u8; \
              let __len = {r}.read_u64() as usize; \
              if __ptr.is_null() || __len == 0 {{ String::new() }} \
-             else {{ String::from_utf8_unchecked(Box::from_raw(core::ptr::slice_from_raw_parts_mut(__ptr, __len)).into_vec()) }} }}"
+             else {{ let __v = String::from_utf8_unchecked(core::slice::from_raw_parts(__ptr, __len).to_vec()); dynspire::managed::dynspire_release(__ptr); __v }} }}"
         ),
         FieldType::Vec(inner) => {
             let rt = inner.rust_type();
@@ -512,7 +520,7 @@ fn gen_read_receive(ft: &FieldType, r: &str, types: &[TypeDecl]) -> String {
                  let __ptr = {r}.read_u64() as *mut {rt}; \
                  let __len = {r}.read_u64() as usize; \
                  if __ptr.is_null() || __len == 0 {{ Vec::new() }} \
-                 else {{ Box::from_raw(core::ptr::slice_from_raw_parts_mut(__ptr, __len)).into_vec() }} }}"
+                 else {{ let __v = core::slice::from_raw_parts(__ptr, __len).to_vec(); dynspire::managed::dynspire_release(__ptr as *mut u8); __v }} }}"
             )
         }
         FieldType::Option(inner) => {
@@ -551,7 +559,7 @@ fn gen_read_receive(ft: &FieldType, r: &str, types: &[TypeDecl]) -> String {
                     format!("{{ let _ = {r}.read_u64(); {name} }}")
                 }
                 TypeDecl::Struct(_) | TypeDecl::Opaque(_) => {
-                    format!("unsafe {{ *Box::from_raw({r}.read_u64() as *mut {name}) }}")
+                    format!("unsafe {{ let __ptr = {r}.read_u64() as *mut {name}; let __v = core::ptr::read(__ptr); dynspire::managed::dynspire_release(__ptr as *mut u8); __v }}")
                 }
                 TypeDecl::Enum(e) => gen_read_enum_receive(e, r, types),
             }
@@ -880,8 +888,8 @@ pub unsafe extern "C" fn dynspire_free(
         let _ = unsafe {{
             let __ptr = r.read_u64() as *mut u8;
             let __len = r.read_u64() as usize;
-            if __ptr.is_null() || __len == 0 {{ String::new() }}
-            else {{ String::from_utf8_unchecked(Box::from_raw(core::ptr::slice_from_raw_parts_mut(__ptr, __len)).into_vec()) }}
+            if __ptr.is_null() || __len == 0 {{ () }}
+            else {{ dynspire::managed::dynspire_release(__ptr); }}
         }};
         return;
     }}
@@ -937,14 +945,16 @@ fn gen_spier_macro(iface: &Interface) -> String {
                            __w.write_u64(1);\n\
                            let __err = \"null handle\".to_string();\n\
                            if __err.is_empty() { __w.write_u64(0); __w.write_u64(0); } else {\n\
-                           let __len = __err.len(); let __boxed = __err.into_bytes().into_boxed_slice();\n\
-                           let __ptr = __boxed.as_ptr() as usize; core::mem::forget(__boxed);\n\
-                           __w.write_u64(__ptr as u64); __w.write_u64(__len as u64); }\n\
+                           let __len = __err.len(); let __data = dynspire::managed::dynspire_alloc(&mut dynspire::managed::default_allocator() as *mut _, __len, 1);\n\
+                           if __data.is_null() { __w.write_u64(0); __w.write_u64(0); } else {\n\
+                           core::ptr::copy_nonoverlapping(__err.as_ptr(), __data, __len);\n\
+                           __w.write_u64(__data as u64); __w.write_u64(__len as u64); }\n\
+                           }\n\
                            let __n = __w.len(); if __n > out_capacity { return 2; }\n\
                            if __n > 0 { unsafe { core::ptr::copy_nonoverlapping(__w.as_slice().as_ptr(), out_slots, __n); } }\n\
                            return 0; }\n";
 
-        let state_cast = "            let __spier_state = unsafe { &*(state_handle as *const __SpierState) };\n            let state = &__spier_state.inner;\n";
+        let state_cast = "            let __spier_state = unsafe { &*(state_handle as *const __SpierState) };\n            let state = &__spier_state.inner;\n            #[allow(unused_variables)]\n            let __alloc = __spier_state.allocator;\n";
 
         let param_names: Vec<String> = std::iter::once("state".to_string())
             .chain(m.params.iter().map(|p| p.name.clone()))
@@ -2013,6 +2023,30 @@ mod tests {
         assert!(!code.contains("__IDL_SCHEMA"), "schema statics removed");
         assert!(!code.contains("idl_schema()"), "idl_schema() accessor removed");
         assert!(!code.contains("__IDL_TYPE_TABLE"), "type table removed");
+    }
+
+    #[test]
+    fn generated_returns_use_allocator_rc() {
+        let iface = parse_rle();
+        let code = generate(&iface);
+        // Spier-side returns are allocated through the host allocator stored at
+        // `dynspire_create`, not via a global `Box::into_raw`/into_boxed_slice
+        // handoff.
+        assert!(
+            code.contains("dynspire::managed::dynspire_alloc(__alloc,"),
+            "spier must allocate returns via dynspire_alloc"
+        );
+        // Both the host receive path and the spier's `dynspire_free` must release
+        // the returned payload through the RC header.
+        assert!(
+            code.contains("dynspire::managed::dynspire_release"),
+            "return payloads must be released via dynspire_release"
+        );
+        // The old global-Box return handoff must be gone.
+        assert!(
+            !code.contains("into_boxed_slice"),
+            "return handoff must not use into_boxed_slice"
+        );
     }
 
     #[test]
