@@ -79,6 +79,19 @@ def main():
         print("c.report_summary(handle)")
         print(f'  -> "{summary}"')
 
+    # --- allocator report (debug allocator) ---
+    # A separate client backed by the debug allocator tracks live/peak/total
+    # memory occupation across all spier allocations.
+    with Rle(lib_path, debug=True) as d:
+        d.compress(input_data)
+        d.analyze(input_data)
+        rep = d.allocator_report()
+        print("allocator_report() (debug allocator)")
+        print(f"  live bytes        : {rep.live_bytes}")
+        print(f"  live allocations  : {rep.live_allocations}")
+        print(f"  peak bytes        : {rep.peak_bytes}")
+        print(f"  total allocations : {rep.total_allocations}")
+
     print()
     print("Done. Typed dispatch via code-generated ctypes bindings.")
 

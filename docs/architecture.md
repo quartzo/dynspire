@@ -355,7 +355,7 @@ The tower client (`DynSpireClient`) is the Rust host-side API. The generated `Dy
 
 ```rust
 // One-line setup — generated wrapper, no handwritten boilerplate
-let client = DynSpireRle::connect("rle_spier", &config)?;
+let client = DynSpireRle::connect("rle_spier", &config, false)?;
 
 // Type-safe dispatch via the generated trait
 let result: Vec<u8> = client.compress(&input[..])?;

@@ -497,6 +497,39 @@ The user does not see the allocator. Values are released immediately after
 consumption. The host is responsible for keeping the allocator alive until
 after `dynspire_destroy` and all `release` calls complete.
 
+### Debug allocator & memory reporting
+
+For debugging spier memory problems, opt into the **debug allocator** instead
+of the zero-overhead default. It tracks live/peak/total occupation in
+process-lifetime counters:
+
+```rust
+// Rust host: pass `debug = true` to opt into the tracking allocator.
+let client = DynSpireRle::connect("rle_spier", &config, /* debug = */ true)?;
+let report = client.allocator_report();
+println!("live bytes: {}, peak bytes: {}", report.live_bytes, report.peak_bytes);
+```
+
+```python
+# Python host
+with Rle(lib_path, debug=True) as c:
+    c.compress(data)
+    rep = c.allocator_report()   # DynSpireAllocatorReport(live_bytes=..., ...)
+```
+
+The report is a `#[repr(C)]` `DynSpireAllocatorReport { live_bytes,
+live_allocations, peak_bytes, total_allocations }`, available through:
+
+- C-ABI: `dynspire_allocator_report(alloc)` (and `dynspire_debug_allocator()`
+  to obtain the debug allocator's pointer).
+- Rust: `DynSpireAllocator::report()`, `DynSpireClient::allocator_report()`,
+  and the generated `DynSpire{Name}::allocator_report()`.
+- Python: `SpierClient.allocator_report()`.
+
+The default allocator keeps a null `ctx` and a `report` that returns all
+zeros, so choosing the debug allocator is purely opt-in and has no overhead
+otherwise.
+
 ### Explicit: host-managed allocator
 
 When the host wants to reuse allocations or hold returns across multiple calls:

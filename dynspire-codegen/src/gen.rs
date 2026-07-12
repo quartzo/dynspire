@@ -814,9 +814,16 @@ fn gen_tower(iface: &Interface) -> String {
 }}
 
 impl {cn} {{
-    pub fn connect(spier_name: &str, config: &std::collections::HashMap<String, String>) -> Result<Self, String> {{
-        let client = dynspire::DynSpireClient::connect(spier_name, &IDL, config)?;
+    pub fn connect(spier_name: &str, config: &std::collections::HashMap<String, String>, debug: bool) -> Result<Self, String> {{
+        let client = dynspire::DynSpireClient::connect(spier_name, &IDL, config, debug)?;
         Ok(Self {{ client }})
+    }}
+
+    /// Snapshot of the allocator's memory occupation (see
+    /// `DynSpireClient::allocator_report`). Only meaningful when the client was
+    /// created with `debug = true`.
+    pub fn allocator_report(&self) -> dynspire::managed::DynSpireAllocatorReport {{
+        self.client.allocator_report()
     }}
 }}
 
@@ -1488,6 +1495,24 @@ class DVecU8(ctypes.Structure):
     ]
 
 
+class DynSpireAllocatorReport(ctypes.Structure):
+    _fields_ = [
+        ("live_bytes", ctypes.c_size_t),
+        ("live_allocations", ctypes.c_size_t),
+        ("peak_bytes", ctypes.c_size_t),
+        ("total_allocations", ctypes.c_size_t),
+    ]
+
+    def __repr__(self):
+        return (
+            "AllocatorReport(live_bytes={}, live_allocations={}, "
+            "peak_bytes={}, total_allocations={})"
+        ).format(
+            self.live_bytes, self.live_allocations,
+            self.peak_bytes, self.total_allocations,
+        )
+
+
 class SlotWriter:
     def __init__(self):
         self._vals = []
@@ -1686,7 +1711,7 @@ class SpierClient:
     _spier_name = None
     _idl_hash_const = 0
 
-    def __init__(self, lib_path, config=None):
+    def __init__(self, lib_path, config=None, debug=False):
         self._lib = ctypes.CDLL(lib_path)
         self._configure_symbols()
         actual = self._idl_hash_fn()
@@ -1696,7 +1721,7 @@ class SpierClient:
                 "IDL hash mismatch: host expects 0x{:016x}, spier '{}' has 0x{:016x}".format(expected, self._spier_name, actual)
             )
         cfg = _encode_config(config)
-        self._alloc_ptr = self._alloc_fn()
+        self._alloc_ptr = self._debug_alloc_fn() if debug else self._alloc_fn()
         self._handle = self._create_fn(self._alloc_ptr, cfg, len(cfg))
         if not self._handle:
             raise DynSpireError("spier '{}' create failed".format(self._spier_name))
@@ -1709,6 +1734,16 @@ class SpierClient:
         f.restype = ctypes.c_void_p
         f.argtypes = []
         self._alloc_fn = f
+
+        f = self._lib.dynspire_debug_allocator
+        f.restype = ctypes.c_void_p
+        f.argtypes = []
+        self._debug_alloc_fn = f
+
+        f = self._lib.dynspire_allocator_report
+        f.restype = DynSpireAllocatorReport
+        f.argtypes = [ctypes.c_void_p]
+        self._report_fn = f
 
         f = self._lib.dynspire_create
         f.restype = ctypes.c_void_p
@@ -1770,6 +1805,14 @@ class SpierClient:
         data = bytes(ctypes.cast(d.ptr, ctypes.POINTER(arr_t))[0])
         self._release_fn(d.ptr)
         return data
+
+    def allocator_report(self):
+        """Snapshot of the allocator's memory occupation.
+
+        Only meaningful when the client was created with debug=True; otherwise
+        returns all zeros.
+        """
+        return self._report_fn(self._alloc_ptr)
 
     def __enter__(self):
         return self

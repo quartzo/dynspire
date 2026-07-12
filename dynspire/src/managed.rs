@@ -26,6 +26,22 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// Allocator vtable. DynSpire defines the contract; the host provides the
 /// implementation. Every spier uses the allocator configured at
 /// `dynspire_create` (stored in its `State`) for all dynamic allocations.
+/// Snapshot of an allocator's current memory occupation. Returned by
+/// [`DynSpireAllocator::report`] / `dynspire_allocator_report`. All counters are
+/// in bytes / counts of live heap blocks (header overhead included).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DynSpireAllocatorReport {
+    /// Bytes currently owned by live allocations (header + payload).
+    pub live_bytes: usize,
+    /// Number of live allocations.
+    pub live_allocations: usize,
+    /// Peak live bytes observed since the allocator was created.
+    pub peak_bytes: usize,
+    /// Cumulative number of allocations made.
+    pub total_allocations: usize,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct DynSpireAllocatorVtable {
@@ -39,6 +55,10 @@ pub struct DynSpireAllocatorVtable {
         align: usize,
     ) -> *mut u8,
     pub drop_allocator: unsafe extern "C" fn(ctx: *mut c_void),
+    /// Returns a snapshot of the allocator's memory occupation. The default
+    /// allocator has no bookkeeping and returns all zeros; the debug allocator
+    /// tracks live/peak/total counters in its `ctx`.
+    pub report: unsafe extern "C" fn(ctx: *mut c_void) -> DynSpireAllocatorReport,
 }
 
 /// A host-provided allocator. `vtable` is DynSpire-stable; `ctx` is opaque host
@@ -92,11 +112,18 @@ unsafe extern "C" fn default_realloc(
 
 unsafe extern "C" fn default_drop_allocator(_ctx: *mut c_void) {}
 
+unsafe extern "C" fn default_report(
+    _ctx: *mut c_void,
+) -> DynSpireAllocatorReport {
+    DynSpireAllocatorReport::default()
+}
+
 static DEFAULT_VTABLE: DynSpireAllocatorVtable = DynSpireAllocatorVtable {
     alloc: default_alloc,
     dealloc: default_dealloc,
     realloc: default_realloc,
     drop_allocator: default_drop_allocator,
+    report: default_report,
 };
 
 /// Returns the default allocator backed by the Rust system allocator.
@@ -127,6 +154,178 @@ static DEFAULT_ALLOCATOR: DynSpireAllocator = DynSpireAllocator {
 #[no_mangle]
 pub unsafe extern "C" fn dynspire_default_allocator() -> *mut DynSpireAllocator {
     &DEFAULT_ALLOCATOR as *const DynSpireAllocator as *mut DynSpireAllocator
+}
+
+// ---------------------------------------------------------------------------
+// Debug allocator — tracks live/peak/total memory occupation for debugging
+// spiers. Stats live in a process-lifetime `static`, so there is no per-instance
+// bookkeeping overhead and no box to free. The performant `default_allocator`
+// keeps a null `ctx` and a `report` that returns zeros, so choosing the debug
+// allocator is purely opt-in.
+// ---------------------------------------------------------------------------
+
+struct DebugStats {
+    live_bytes: AtomicUsize,
+    live_allocations: AtomicUsize,
+    peak_bytes: AtomicUsize,
+    total_allocations: AtomicUsize,
+}
+
+static DEBUG_STATS: DebugStats = DebugStats {
+    live_bytes: AtomicUsize::new(0),
+    live_allocations: AtomicUsize::new(0),
+    peak_bytes: AtomicUsize::new(0),
+    total_allocations: AtomicUsize::new(0),
+};
+
+#[inline]
+fn debug_record_alloc(size: usize) {
+    let s = &DEBUG_STATS;
+    s.live_bytes.fetch_add(size, Ordering::Relaxed);
+    s.live_allocations.fetch_add(1, Ordering::Relaxed);
+    s.total_allocations.fetch_add(1, Ordering::Relaxed);
+    let cur = s.live_bytes.load(Ordering::Relaxed);
+    let mut peak = s.peak_bytes.load(Ordering::Relaxed);
+    while cur > peak {
+        match s.peak_bytes.compare_exchange_weak(peak, cur, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(p) => peak = p,
+        }
+    }
+}
+
+#[inline]
+fn debug_record_free(size: usize) {
+    let s = &DEBUG_STATS;
+    s.live_bytes.fetch_sub(size, Ordering::Relaxed);
+    s.live_allocations.fetch_sub(1, Ordering::Relaxed);
+}
+
+unsafe extern "C" fn debug_alloc(_ctx: *mut c_void, size: usize, align: usize) -> *mut u8 {
+    if size == 0 {
+        return std::ptr::null_mut();
+    }
+    let ptr = match Layout::from_size_align(size, align) {
+        Ok(layout) => std::alloc::alloc(layout),
+        Err(_) => return std::ptr::null_mut(),
+    };
+    if !ptr.is_null() {
+        debug_record_alloc(size);
+    }
+    ptr
+}
+
+unsafe extern "C" fn debug_dealloc(_ctx: *mut c_void, ptr: *mut u8, size: usize, align: usize) {
+    if ptr.is_null() || size == 0 {
+        return;
+    }
+    let layout = Layout::from_size_align_unchecked(size, align);
+    std::alloc::dealloc(ptr, layout);
+    debug_record_free(size);
+}
+
+unsafe extern "C" fn debug_realloc(
+    _ctx: *mut c_void,
+    ptr: *mut u8,
+    old_size: usize,
+    new_size: usize,
+    align: usize,
+) -> *mut u8 {
+    let old = Layout::from_size_align_unchecked(old_size, align);
+    let new = std::alloc::realloc(ptr, old, new_size);
+    if new.is_null() {
+        if !ptr.is_null() && old_size > 0 {
+            debug_record_free(old_size);
+        }
+    } else {
+        let s = &DEBUG_STATS;
+        s.live_bytes
+            .fetch_add(new_size.wrapping_sub(old_size), Ordering::Relaxed);
+        let cur = s.live_bytes.load(Ordering::Relaxed);
+        let mut peak = s.peak_bytes.load(Ordering::Relaxed);
+        while cur > peak {
+            match s.peak_bytes.compare_exchange_weak(peak, cur, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => break,
+                Err(p) => peak = p,
+            }
+        }
+    }
+    new
+}
+
+unsafe extern "C" fn debug_drop_allocator(_ctx: *mut c_void) {}
+
+unsafe extern "C" fn debug_report(_ctx: *mut c_void) -> DynSpireAllocatorReport {
+    let s = &DEBUG_STATS;
+    DynSpireAllocatorReport {
+        live_bytes: s.live_bytes.load(Ordering::Relaxed),
+        live_allocations: s.live_allocations.load(Ordering::Relaxed),
+        peak_bytes: s.peak_bytes.load(Ordering::Relaxed),
+        total_allocations: s.total_allocations.load(Ordering::Relaxed),
+    }
+}
+
+static DEBUG_VTABLE: DynSpireAllocatorVtable = DynSpireAllocatorVtable {
+    alloc: debug_alloc,
+    dealloc: debug_dealloc,
+    realloc: debug_realloc,
+    drop_allocator: debug_drop_allocator,
+    report: debug_report,
+};
+
+/// A process-lifetime allocator that tracks memory occupation for debugging.
+///
+/// Unlike [`default_allocator`], every allocation/realloc/dealloc updates the
+/// global debug counters, which can be read with
+/// [`DynSpireAllocator::report`] / `dynspire_allocator_report`. There is one
+/// shared debug instance per process, so counters aggregate across all spiers
+/// created with it.
+static DEBUG_ALLOCATOR: DynSpireAllocator = DynSpireAllocator {
+    vtable: &DEBUG_VTABLE as *const DynSpireAllocatorVtable,
+    ctx: &DEBUG_STATS as *const DebugStats as *mut c_void,
+};
+
+/// Returns the process-lifetime debug allocator (tracks memory occupation).
+pub fn debug_allocator() -> DynSpireAllocator {
+    DEBUG_ALLOCATOR
+}
+
+/// C-ABI: return a pointer to the process-lifetime debug allocator.
+///
+/// # Safety
+///
+/// The returned pointer is valid for the whole process lifetime; it must not be
+/// freed or passed to `drop_allocator`.
+#[no_mangle]
+pub unsafe extern "C" fn dynspire_debug_allocator() -> *mut DynSpireAllocator {
+    &DEBUG_ALLOCATOR as *const DynSpireAllocator as *mut DynSpireAllocator
+}
+
+impl DynSpireAllocator {
+    /// Returns a snapshot of the allocator's current memory occupation.
+    ///
+    /// The default allocator has no bookkeeping and returns all zeros; the
+    /// debug allocator returns live/peak/total counters tracked in its `ctx`.
+    pub fn report(&self) -> DynSpireAllocatorReport {
+        unsafe { ((*self.vtable).report)(self.ctx) }
+    }
+}
+
+/// C-ABI: snapshot of an allocator's memory occupation.
+///
+/// # Safety
+///
+/// `alloc` must be a valid `DynSpireAllocator` (e.g. from
+/// `dynspire_default_allocator` / `dynspire_debug_allocator`).
+#[no_mangle]
+pub unsafe extern "C" fn dynspire_allocator_report(
+    alloc: *mut DynSpireAllocator,
+) -> DynSpireAllocatorReport {
+    if alloc.is_null() {
+        return DynSpireAllocatorReport::default();
+    }
+    (*alloc).report()
 }
 
 // ---------------------------------------------------------------------------
@@ -470,6 +669,10 @@ mod tests {
     }
     unsafe extern "C" fn t_drop_alloc(_ctx: *mut c_void) {}
 
+    unsafe extern "C" fn t_report(_ctx: *mut c_void) -> DynSpireAllocatorReport {
+        DynSpireAllocatorReport::default()
+    }
+
     fn test_allocator() -> (DynSpireAllocator, *mut Counters) {
         let counters = Box::into_raw(Box::new(Counters {
             allocs: AtomicUsize::new(0),
@@ -481,6 +684,7 @@ mod tests {
             dealloc: t_dealloc,
             realloc: t_realloc,
             drop_allocator: t_drop_alloc,
+            report: t_report,
         }));
         let alloc = DynSpireAllocator {
             vtable,
@@ -600,5 +804,46 @@ mod tests {
             dynspire_release(p);
             free_test_allocator(alloc, counters);
         }
+    }
+
+    #[test]
+    fn debug_allocator_reports_occupation() {
+        let mut alloc = debug_allocator();
+        let before = alloc.report();
+        assert_eq!(before.live_bytes, 0);
+        unsafe {
+            let p1 = dynspire_alloc(&mut alloc as *mut _, 32, 8);
+            assert!(!p1.is_null());
+            let p2 = dynspire_alloc(&mut alloc as *mut _, 7, 1);
+            assert!(!p2.is_null());
+            let mid = alloc.report();
+            // Both payloads are allocated with header overhead included.
+            assert!(mid.live_bytes >= 32 + 7);
+            assert_eq!(mid.live_allocations, 2);
+            assert_eq!(mid.total_allocations, 2);
+            assert!(mid.peak_bytes >= mid.live_bytes);
+
+            dynspire_release(p1);
+            let after = alloc.report();
+            assert!(after.live_bytes < mid.live_bytes);
+            assert_eq!(after.live_allocations, 1);
+            // Peak is monotonic.
+            assert_eq!(after.peak_bytes, mid.peak_bytes);
+
+            dynspire_release(p2);
+            let done = alloc.report();
+            assert_eq!(done.live_bytes, 0);
+            assert_eq!(done.live_allocations, 0);
+        }
+    }
+
+    #[test]
+    fn default_allocator_report_is_zero() {
+        let alloc = default_allocator();
+        let r = alloc.report();
+        assert_eq!(r.live_bytes, 0);
+        assert_eq!(r.live_allocations, 0);
+        assert_eq!(r.peak_bytes, 0);
+        assert_eq!(r.total_allocations, 0);
     }
 }

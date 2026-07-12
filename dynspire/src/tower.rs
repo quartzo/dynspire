@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::kvmap::serialize_kvmap;
-use crate::managed::{default_allocator, DynSpireAllocator};
+use crate::managed::{debug_allocator, default_allocator, DynSpireAllocator, DynSpireAllocatorReport};
 use crate::slots::MAX_OUT_SLOTS;
 
 type FnIdlHash = unsafe extern "C" fn() -> u64;
@@ -77,6 +77,7 @@ impl DynSpireLib {
         so_path: &str,
         idl_hash: u64,
         methods: &[MethodConfig],
+        debug: bool,
     ) -> Result<Self, String> {
         let lib = unsafe {
             libloading::Library::new(so_path)
@@ -102,12 +103,20 @@ impl DynSpireLib {
             dispatch.push(fn_ptr);
         }
 
+        // Opt into the debug allocator (tracks memory occupation) when requested;
+        // otherwise use the zero-overhead default allocator.
+        let allocator = if debug {
+            debug_allocator()
+        } else {
+            default_allocator()
+        };
+
         Ok(Self {
             _lib: lib,
             dispatch: Arc::new(dispatch),
             create: fn_create,
             destroy: fn_destroy,
-            allocator: Arc::new(default_allocator()),
+            allocator: Arc::new(allocator),
         })
     }
 
@@ -184,6 +193,7 @@ impl DynSpireClient {
         spier_name: &str,
         idl: &'static IdlDescriptor,
         config: &HashMap<String, String>,
+        debug: bool,
     ) -> Result<Self, String> {
         let so_path = DynSpireLib::find(spier_name)?;
         let methods: Vec<MethodConfig> = idl
@@ -191,7 +201,7 @@ impl DynSpireClient {
             .iter()
             .map(|&n| MethodConfig { name: n })
             .collect();
-        let lib = DynSpireLib::load(&so_path, idl.hash, &methods)?;
+        let lib = DynSpireLib::load(&so_path, idl.hash, &methods, debug)?;
         Arc::new(lib).create_client(config)
     }
 
@@ -200,9 +210,19 @@ impl DynSpireClient {
         idl_hash: u64,
         methods: &[MethodConfig],
         config: &HashMap<String, String>,
+        debug: bool,
     ) -> Result<Self, String> {
-        let lib = DynSpireLib::load(so_path, idl_hash, methods)?;
+        let lib = DynSpireLib::load(so_path, idl_hash, methods, debug)?;
         Arc::new(lib).create_client(config)
+    }
+
+    /// Returns a snapshot of the allocator's current memory occupation.
+    ///
+    /// Use the `debug = true` flag on [`DynSpireClient::connect`] /
+    /// [`DynSpireClient::load`] to back the client with the allocator that
+    /// tracks live/peak/total counters — otherwise this returns all zeros.
+    pub fn allocator_report(&self) -> DynSpireAllocatorReport {
+        self.lib.allocator.report()
     }
 
     /// Returns the raw pointer to the allocator configured at spier creation.

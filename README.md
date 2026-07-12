@@ -57,7 +57,7 @@ impl_rle_spier!(RleState, init, "rle");
 
 ```rust
 // Host crate
-let client = DynSpireRle::connect("rle_spier", &config)?;
+let client = DynSpireRle::connect("rle_spier", &config, false)?;
 let compressed: Vec<u8> = client.compress(&input[..])?;
 let report = client.analyze(&input[..])?;  // typed CompressionReport
 ```
@@ -192,7 +192,7 @@ fn main() {
 #![allow(non_upper_case_globals)]
 include!(concat!(env!("OUT_DIR"), "/my_host.rs"));
 
-let client = DynSpireMy::connect("my_spier", &config)?;
+let client = DynSpireMy::connect("my_spier", &config, false)?;
 let result = client.do_thing(&input[..])?;
 ```
 
