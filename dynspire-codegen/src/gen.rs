@@ -1589,7 +1589,7 @@ fn gen_py_read_expr(ft: &FieldType, r: &str, types: &[TypeDecl]) -> std::string:
                 panic!("dynspire-codegen: empty struct '{name}' return is not supported in Python codegen")
             }
             TypeDecl::Struct(_) | TypeDecl::Opaque(_) => {
-                format!("{name}(self, {r}.read())")
+                format!("{name}._from_ptr(self, {r}.read())")
             }
             TypeDecl::Enum(_) => panic!("dynspire-codegen: enum decode must go through gen_py_decode_block"),
         },
@@ -1609,7 +1609,7 @@ fn gen_py_decode_block(ft: &FieldType, r: &str, types: &[TypeDecl], indent: usiz
         FieldType::Named(name) => match find_type(types, name) {
             TypeDecl::Enum(e) => gen_py_enum_read_block(e, r, types, indent),
             TypeDecl::Struct(_) | TypeDecl::Opaque(_) => {
-                format!("{pad}_v = {name}(self, {r}.read())\n")
+                format!("{pad}_v = {name}._from_ptr(self, {r}.read())\n")
             }
         },
         FieldType::Option(inner) => {
@@ -1653,7 +1653,11 @@ fn gen_py_types(iface: &Interface) -> String {
     for ty in &iface.types {
         match ty {
             TypeDecl::Struct(st) => {
-                s.push_str(&format!("class {name}(OpaqueHandle):\n    pass\n\n\n", name = st.name));
+                if st.fields.is_empty() {
+                    s.push_str(&format!("class {name}(OpaqueHandle):\n    pass\n\n\n", name = st.name));
+                } else {
+                    s.push_str(&gen_py_struct_class(st, &iface.types));
+                }
             }
             TypeDecl::Opaque(o) => {
                 s.push_str(&format!("class {name}(OpaqueHandle):\n    pass\n\n\n", name = o.name));
@@ -1662,6 +1666,144 @@ fn gen_py_types(iface: &Interface) -> String {
         }
     }
     s
+}
+
+/// Map a FieldType to a Python ctypes field expression for `_fields_`.
+#[allow(clippy::only_used_in_recursion)]
+fn py_ctypes_field(ft: &FieldType, types: &[TypeDecl]) -> String {
+    use FieldType::*;
+    match ft {
+        Bool => "ctypes.c_uint8".into(),
+        U8 => "ctypes.c_uint8".into(),
+        U16 => "ctypes.c_uint16".into(),
+        U32 => "ctypes.c_uint32".into(),
+        U64 => "ctypes.c_uint64".into(),
+        I8 => "ctypes.c_int8".into(),
+        I16 => "ctypes.c_int16".into(),
+        I32 => "ctypes.c_int32".into(),
+        I64 => "ctypes.c_int64".into(),
+        F32 => "ctypes.c_float".into(),
+        F64 => "ctypes.c_double".into(),
+        String | DString => "DString".into(),
+        Vec(_) | DVec(_) => "DVec".into(),
+        Str | U8Slice | DStr | DSlice(_) => "DStr".into(),
+        DOption(_) => "DOption".into(),
+        Option(_) => "DOption".into(),
+        Named(name) => format!("{name}Ctypes"),
+        Tuple(elems) => {
+            let inner: std::vec::Vec<std::string::String> = elems.iter().map(|e| py_ctypes_field(e, types)).collect();
+            format!("({})", inner.join(", "))
+        }
+        Array(inner, len) => {
+            let ct = py_ctypes_field(inner, types);
+            format!("({ct} * {len})")
+        }
+        _ => "ctypes.c_uint64".into(),
+    }
+}
+
+/// Map a FieldType to a Python default-value expression for `__init__`.
+fn py_default_value(ft: &FieldType) -> String {
+    use FieldType::*;
+    match ft {
+        Bool | U8 | U16 | U32 | U64 | I8 | I16 | I32 | I64 => "0".into(),
+        F32 | F64 => "0.0".into(),
+        String | DString | Str | U8Slice | DStr | DSlice(_) | Vec(_) | DVec(_) => "None".into(),
+        Option(_) | DOption(_) => "None".into(),
+        Named(name) => format!("{name}._default()"),
+        Tuple(_) => "None".into(),
+        Array(_, _) => "None".into(),
+        Unit => "None".into(),
+        OutU8Vec => "None".into(),
+    }
+}
+
+/// Generate a Python class for an IDL struct with ctypes mirror + field accessors.
+fn gen_py_struct_class(s: &StructDecl, types: &[TypeDecl]) -> String {
+    let n = &s.name;
+    let mut out = String::new();
+
+    // --- ctypes mirror class ---
+    out.push_str(&format!("class {n}Ctypes(ctypes.Structure):\n"));
+    out.push_str("    _fields_ = [\n");
+    for (fname, fty) in &s.fields {
+        let ct = py_ctypes_field(fty, types);
+        out.push_str(&format!("        ('{fname}', {ct}),\n"));
+    }
+    out.push_str("    ]\n\n\n");
+
+    // --- wrapper class ---
+    let slots: Vec<String> = s.fields.iter().map(|(f, _)| format!("'_{f}'")).collect();
+    let mut all_slots = slots.clone();
+    all_slots.push("'_client'".into());
+    all_slots.push("'_ptr'".into());
+    all_slots.push("'_cbuf'".into());
+    out.push_str(&format!("class {n}(OpaqueHandle):\n"));
+    out.push_str(&format!("    __slots__ = ({})\n\n", all_slots.join(", ")));
+
+    // __init__
+    let init_params: Vec<String> = s.fields.iter().map(|(f, _)| f.clone()).collect();
+    out.push_str(&format!("    def __init__(self, {}):\n", init_params.join(", ")));
+    out.push_str("        self._client = None\n");
+    out.push_str("        self._cbuf = None\n");
+    out.push_str("        self._ptr = 0\n");
+    for (fname, fty) in &s.fields {
+        let default = py_default_value(fty);
+        out.push_str(&format!("        self._{fname} = {fname} if {fname} is not None else {default}\n"));
+    }
+    // build ctypes buffer from field values
+    let ctypes_args: Vec<String> = s.fields.iter().map(|(f, _)| format!("self._{f}")).collect();
+    out.push_str(&format!("        self._cbuf = {n}Ctypes({})\n", ctypes_args.join(", ")));
+    out.push_str("        self._ptr = ctypes.addressof(self._cbuf)\n");
+    out.push('\n');
+
+    // _from_ptr classmethod
+    out.push_str("    @classmethod\n");
+    out.push_str("    def _from_ptr(cls, client, ptr):\n");
+    out.push_str(&format!("        buf = {n}Ctypes()\n"));
+    out.push_str("        ctypes.memmove(ctypes.addressof(buf), ptr, ctypes.sizeof(buf))\n");
+    let field_reads: Vec<String> = s.fields.iter().map(|(f, _)| format!("buf.{f}")).collect();
+    out.push_str(&format!("        obj = cls({})\n", field_reads.join(", ")));
+    out.push_str("        obj._client = client\n");
+    out.push_str("        obj._ptr = ptr\n");
+    out.push_str("        return obj\n\n");
+
+    // _default classmethod (for nested struct defaults)
+    let defaults: Vec<String> = s.fields.iter().map(|(f, fty)| {
+        let d = py_default_value(fty);
+        format!("{f}={d}")
+    }).collect();
+    out.push_str("    @classmethod\n");
+    out.push_str("    def _default(cls):\n");
+    out.push_str(&format!("        return cls({})\n\n", defaults.join(", ")));
+
+    // @property accessors
+    for (fname, _fty) in &s.fields {
+        out.push_str("    @property\n");
+        out.push_str(&format!("    def {fname}(self):\n"));
+        out.push_str(&format!("        return self._{fname}\n\n"));
+    }
+
+    // __repr__
+    let repr_parts: Vec<String> = s.fields.iter().map(|(f, _)| {
+        format!("'{f}=' + repr(self._{f})")
+    }).collect();
+    out.push_str("    def __repr__(self):\n");
+    out.push_str(&format!("        return '{n}(' + {} + ')'\n\n", repr_parts.join(" + ', ' + ")));
+
+    // __eq__
+    let eq_parts: Vec<String> = s.fields.iter().map(|(f, _)| {
+        format!("self._{f} == other._{f}")
+    }).collect();
+    out.push_str("    def __eq__(self, other):\n");
+    out.push_str(&format!("        return isinstance(other, {n}) and {}\n\n", eq_parts.join(" and ")));
+
+    // __hash__
+    let hash_fields: Vec<String> = s.fields.iter().map(|(f, _)| format!("self._{f}")).collect();
+    out.push_str("    def __hash__(self):\n");
+    out.push_str(&format!("        return hash(({},))\n\n", hash_fields.join(", ")));
+
+    out
 }
 
 fn gen_py_enum_class(e: &EnumDecl) -> String {
@@ -2614,6 +2756,89 @@ mod tests {
         assert!(
             py.contains("def make_named_run(self"),
             "Python client must expose make_named_run"
+        );
+    }
+
+    #[test]
+    fn generated_python_struct_class() {
+        let iface = parse_rle();
+        let py = generate_python(&iface);
+
+        // ctypes mirror class
+        assert!(
+            py.contains("class NamedRunCtypes(ctypes.Structure)"),
+            "NamedRunCtypes ctypes structure class must be generated"
+        );
+        assert!(
+            py.contains("('label', DString)"),
+            "NamedRunCtypes must have label field of type DString"
+        );
+        assert!(
+            py.contains("('count', ctypes.c_uint64)"),
+            "NamedRunCtypes must have count field of type c_uint64"
+        );
+
+        // wrapper class with __slots__
+        assert!(
+            py.contains("    __slots__ = "),
+            "NamedRun wrapper must have __slots__"
+        );
+
+        // __init__ with both fields
+        assert!(
+            py.contains("def __init__(self, label, count):"),
+            "NamedRun must have __init__ with label and count"
+        );
+
+        // _from_ptr classmethod
+        assert!(
+            py.contains("def _from_ptr(cls, client, ptr):"),
+            "NamedRun must have _from_ptr classmethod"
+        );
+
+        // _default classmethod
+        assert!(
+            py.contains("def _default(cls):"),
+            "NamedRun must have _default classmethod"
+        );
+
+        // property accessors for both fields
+        assert!(
+            py.contains("@property\n    def label(self):"),
+            "NamedRun must have label property"
+        );
+        assert!(
+            py.contains("@property\n    def count(self):"),
+            "NamedRun must have count property"
+        );
+
+        // __repr__
+        assert!(
+            py.contains("def __repr__(self):"),
+            "NamedRun must have __repr__"
+        );
+
+        // __eq__
+        assert!(
+            py.contains("def __eq__(self, other):"),
+            "NamedRun must have __eq__"
+        );
+
+        // __hash__
+        assert!(
+            py.contains("def __hash__(self):"),
+            "NamedRun must have __hash__"
+        );
+
+        // _from_ptr must be used in method decode (not direct constructor)
+        assert!(
+            py.contains("NamedRun._from_ptr(self,"),
+            "Method returning NamedRun must use _from_ptr, not direct constructor"
+        );
+        // old pattern must NOT appear
+        assert!(
+            !py.contains("NamedRun(self,") || py.contains("_from_ptr"),
+            "NamedRun(self, ...) without _from_ptr must not appear in decode"
         );
     }
 

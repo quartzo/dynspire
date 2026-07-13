@@ -356,7 +356,7 @@ The generated module is self-contained — it inlines the ctypes primitives
 class per interface:
 
 ```python
-from rle import Rle, Tone, CompressionReport
+from rle import Rle, Tone, CompressionReport, NamedRun
 
 with Rle("target/debug/librle_spier.so") as c:
     compressed = c.compress(b"AAAABBBBCCCC")
@@ -369,16 +369,24 @@ with Rle("target/debug/librle_spier.so") as c:
     tone = c.classify(b"AAAABBBBCCCC")     # Tone.Loud(71)
     desc = c.describe_tone(Tone.Quiet())    # "silence"
 
-    # Opaque structs are boxed handles (freed on GC)
+    # Structs with fields get full Python classes (not opaque handles)
     report = c.analyze(b"AAAABBBBCCCC")     # CompressionReport
-    summary = c.report_summary(report)      # "original=12 ..."
+    print(report.original_size)             # @property accessor
+    summary = c.report_summary(report)      # pass back to spier
+
+    # Construct structs from Python
+    run = NamedRun(label="A", count=42)
+    print(run.label, run.count)             # "A" 42
+    repr(run)                               # "NamedRun(label='A', count=42)"
+    assert run == NamedRun(label="A", count=42)  # structural equality
 ```
 
 The generated module inlines all runtime primitives: `SlotWriter`
 (encodes args into `u64[]`), `SpierClient` (loads `.so`, verifies IDL
 hash, dispatches), `OpaqueHandle` (GC-managed boxed pointer), and
 out-vec helpers. No external package dependency — only `ctypes` from
-the Python stdlib.
+the Python stdlib. See [docs/architecture.md](docs/architecture.md)
+for the full struct codegen specification.
 
 ## License
 

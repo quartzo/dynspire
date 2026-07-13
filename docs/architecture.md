@@ -391,19 +391,66 @@ with Rle("target/debug/librle_spier.so") as c:
     tone = c.classify(b"AAAABBBBCCCC")     # Tone.Loud(71)
     desc = c.describe_tone(Tone.Quiet())    # "silence"
 
-    # Opaque structs are boxed handles (freed on GC)
+    # Structs with fields are typed Python objects (not opaque handles)
     report = c.analyze(b"AAAABBBBCCCC")     # CompressionReport
-    summary = c.report_summary(report)      # "original=12 ..."
+    print(report.original_size)             # field accessor
+    summary = c.report_summary(report)      # pass back to spier
 ```
 
 The generated client handles:
 
 - **Borrows** (`&[u8]`, `&str`): copies Python bytes into a ctypes array pinned for the call duration, passes `(ptr, len)` slots
 - **Owned returns** (`Vec<u8>`, `String`): copied into Python `bytes`/`str` via `ctypes.string_at`, then released via `dynspire_release`
-- **Opaque struct returns**: wrapped in `OpaqueHandle` (holds the boxed pointer, releases via `dynspire_release` on `__del__`; can be passed back as an input)
+- **Struct returns** (`CompressionReport`, `NamedRun`, etc.): decoded via `{Name}._from_ptr()` — a classmethod that copies from the raw pointer into a ctypes mirror buffer, then constructs a wrapper with `@property` accessors, `__repr__`, `__eq__`, `__hash__`. Released via `dynspire_release` on `__del__` (triggers `drop_fn` for structs with dynamic fields like `DString`/`DVec`)
+- **Opaque struct returns** (no fields): wrapped in bare `OpaqueHandle` (boxed pointer, freed on GC)
 - **OutVec** (`&mut Vec<u8>`): the host passes a `DVec<u8>` (allocator + ptr/len/cap) backed by the host allocator; the spier fills it via `dynspire_realloc` and the host copies the bytes back, then releases the buffer via `dynspire_release`
 - **Enums** (DSL `enum`): decoded to typed Python classes generated at codegen time; can be passed back as an input
 - **Result<T, String>**: reads the tag slot, decodes the Ok value or raises `RuntimeError` with the error string
+
+### Struct Codegen
+
+Structs declared in the IDL with fields generate typed Python classes with full field access — not just opaque handles.
+
+For each struct `Foo { name: DString, count: u64 }`, the codegen emits:
+
+1. **`FooCtypes(ctypes.Structure)`** — ctypes mirror class with `_fields_` mapping each IDL field to its ctypes equivalent (`DString`, `c_uint64`, etc.)
+2. **`Foo(OpaqueHandle)`** — wrapper class with:
+
+| Feature | Description |
+|---------|-------------|
+| `__init__(self, name, count)` | Each field is a positional parameter; builds ctypes buffer from values |
+| `_from_ptr(cls, client, ptr)` | Classmethod: copies from raw pointer via `ctypes.memmove`, reads field values from the buffer |
+| `_default(cls)` | Classmethod: constructs with all-default values (used for nested struct defaults) |
+| `@property` accessors | Read-only properties for each field (e.g., `obj.name`, `obj.count`) |
+| `__repr__` | Shows all field values: `Foo(name='hello', count=5)` |
+| `__eq__` / `__hash__` | Structural equality and hashing based on all fields |
+
+Opaque structs (no fields) generate a bare `class Foo(OpaqueHandle): pass` — no field access.
+
+```python
+from rle import NamedRun
+
+# Construct from field values
+run = NamedRun(label="A", count=42)
+
+# Access fields via properties
+print(run.label)   # "A"
+print(run.count)   # 42
+
+# Value semantics
+run2 = NamedRun(label="A", count=42)
+assert run == run2
+assert hash(run) == hash(run2)
+
+# repr
+repr(run)  # "NamedRun(label='A', count=42)"
+
+# Passed to spier methods — write_opaque uses the ctypes pointer
+result = c.make_named_run("B", 10)
+print(result.label)  # "B"
+```
+
+Internally, `_from_ptr` is used by the generated decode logic when the spier returns a struct. The ctypes buffer holds the wire data (pointer `u64` for dynamic fields like `DString`/`DVec`), and the wrapper's `@property` accessors read from the buffer fields directly. `__del__` releases the backing pointer via `dynspire_release` (triggering `drop_fn` for structs with dynamic fields).
 
 ### Lifecycle
 
