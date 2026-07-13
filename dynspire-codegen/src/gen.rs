@@ -812,9 +812,11 @@ fn gen_struct_def(s: &StructDecl) -> String {
 }
 
 fn gen_enum_def(e: &EnumDecl) -> String {
+    let has_fields = e.variants.iter().any(|v| !v.fields.is_empty());
+    let repr = if has_fields { "#[repr(C, u32)]" } else { "#[repr(u32)]" };
     let mut out = format!(
-        "#[repr(C, u32)]\n#[derive(Clone, Debug, PartialEq)]\npub enum {} {{\n",
-        e.name
+        "{}\n#[derive(Clone, Debug, PartialEq)]\npub enum {} {{\n",
+        repr, e.name
     );
     for v in &e.variants {
         if v.fields.is_empty() {
@@ -2545,6 +2547,39 @@ mod tests {
         assert!(code.contains("pub enum Tone"));
         assert!(!code.contains("impl dynspire::slots::SlotEncode for CompressionReport"), "no trait impls for DSL types");
         assert!(!code.contains("impl dynspire::slots::SlotEncode for Tone"), "no trait impls for DSL types");
+    }
+
+    #[test]
+    fn generated_enum_repr_fielded_vs_fieldless() {
+        let iface = parse_rle();
+        let code = generate(&iface);
+        // Tone has Loud(u8) → fielded enum → must keep #[repr(C, u32)]
+        assert!(
+            code.contains("#[repr(C, u32)]\n#[derive(Clone, Debug, PartialEq)]\npub enum Tone"),
+            "fielded enum Tone must use #[repr(C, u32)]"
+        );
+
+        // RleOp is fieldless → must use #[repr(u8)] (separate generation path)
+        assert!(code.contains("#[repr(u8)]"));
+        assert!(
+            !code.contains("#[repr(C, u32)]\n#[derive(Clone, Debug, PartialEq)]\npub enum RleOp"),
+            "RleOp is generated independently and must not get #[repr(C, u32)]"
+        );
+
+        // Synthetic check: a fieldless DSL enum should get #[repr(u32)]
+        let src = r#"
+interface Test {
+  enum Color { Red, Green, Blue }
+  fn pick() -> Color;
+}
+"#;
+        let iface2 = crate::parser::parse(src).unwrap();
+        let code2 = generate(&iface2);
+        assert!(
+            code2.contains("#[repr(u32)]\n#[derive(Clone, Debug, PartialEq)]\npub enum Color"),
+            "fieldless enum Color must use #[repr(u32)], got:\n{}",
+            code2
+        );
     }
 
     #[test]

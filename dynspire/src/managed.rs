@@ -722,6 +722,11 @@ impl<T: ReprC> DVec<T> {
             unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
         }
     }
+
+    /// Raw pointer to the first element (or null if empty).
+    pub fn as_ptr(&self) -> *const T {
+        self.ptr
+    }
 }
 
 impl DString {
@@ -757,6 +762,16 @@ impl DString {
         } else {
             unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(self.ptr, self.len)) }
         }
+    }
+
+    /// Raw pointer to the first byte (or null if empty).
+    pub fn as_ptr(&self) -> *const u8 {
+        self.ptr
+    }
+
+    /// View the contents as `&[u8]` without copying.
+    pub fn as_bytes(&self) -> &[u8] {
+        self.as_str().as_bytes()
     }
 }
 
@@ -828,6 +843,117 @@ impl<T: ReprC> From<Option<T>> for DOption<T> {
             Some(v) => DOption::some(v),
             None => DOption::none(),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Ergonomic conversions from std types
+// ---------------------------------------------------------------------------
+
+impl From<String> for DString {
+    fn from(s: String) -> Self {
+        Self::new_in(&DEFAULT_ALLOCATOR, &s)
+    }
+}
+
+impl From<&str> for DString {
+    fn from(s: &str) -> Self {
+        Self::new_in(&DEFAULT_ALLOCATOR, s)
+    }
+}
+
+impl<T: ReprC> From<Vec<T>> for DVec<T> {
+    fn from(v: Vec<T>) -> Self {
+        let len = v.len();
+        let mut d = Self::new_in(&DEFAULT_ALLOCATOR, len);
+        if len > 0 {
+            unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), d.ptr, len) };
+            d.len = len;
+        }
+        d
+    }
+}
+
+impl From<&[u8]> for DVec<u8> {
+    fn from(b: &[u8]) -> Self {
+        let mut d = Self::new_in(&DEFAULT_ALLOCATOR, b.len());
+        if !b.is_empty() {
+            unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), d.ptr as *mut u8, b.len()) };
+            d.len = b.len();
+        }
+        d
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Content-based trait impls for DString / DVec<T>
+//
+// These delegate to as_str() / as_slice() so that comparisons, hashing, and
+// formatting operate on the payload — not on pointer addresses (which is what
+// a #[derive] would produce, since these types contain raw pointers).
+// ---------------------------------------------------------------------------
+
+impl std::fmt::Debug for DString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self.as_str(), f)
+    }
+}
+
+impl PartialEq for DString {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl Eq for DString {}
+
+impl PartialOrd for DString {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for DString {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.as_str().cmp(other.as_str())
+    }
+}
+
+impl std::hash::Hash for DString {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.as_str().hash(state);
+    }
+}
+
+impl<T: ReprC + std::fmt::Debug> std::fmt::Debug for DVec<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self.as_slice(), f)
+    }
+}
+
+impl<T: ReprC + PartialEq> PartialEq for DVec<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl<T: ReprC + Eq> Eq for DVec<T> {}
+
+impl<T: ReprC + PartialOrd> PartialOrd for DVec<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.as_slice().partial_cmp(other.as_slice())
+    }
+}
+
+impl<T: ReprC + Ord> Ord for DVec<T> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.as_slice().cmp(other.as_slice())
+    }
+}
+
+impl<T: ReprC + std::hash::Hash> std::hash::Hash for DVec<T> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.as_slice().hash(state);
     }
 }
 
@@ -1451,5 +1577,102 @@ mod tests {
 
         let peak2 = alloc.report().peak_bytes;
         assert!(peak2 >= peak1);
+    }
+
+    // ------------------------------------------------------------------
+    // From conversions + trait impls
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn dstring_from_string() {
+        let s: DString = String::from("hello world").into();
+        assert_eq!(s.as_str(), "hello world");
+        assert_eq!(s.len(), 11);
+        unsafe { dynspire_release(s.ptr) };
+    }
+
+    #[test]
+    fn dstring_from_str() {
+        let s: DString = "test".into();
+        assert_eq!(s.as_str(), "test");
+        unsafe { dynspire_release(s.ptr) };
+    }
+
+    #[test]
+    fn dvec_from_vec() {
+        let v: Vec<u32> = vec![10, 20, 30];
+        let d: DVec<u32> = v.into();
+        assert_eq!(d.as_slice(), &[10, 20, 30]);
+        assert_eq!(d.len(), 3);
+        unsafe { dynspire_release(d.ptr as *mut u8) };
+    }
+
+    #[test]
+    fn dvec_from_empty_vec() {
+        let v: Vec<u8> = vec![];
+        let d: DVec<u8> = v.into();
+        assert!(d.is_empty());
+        assert_eq!(d.as_slice(), &[]);
+    }
+
+    #[test]
+    fn dvec_from_byte_slice() {
+        let d: DVec<u8> = b"abc".as_slice().into();
+        assert_eq!(d.as_slice(), b"abc");
+        unsafe { dynspire_release(d.ptr as *mut u8) };
+    }
+
+    #[test]
+    fn dstring_traits_content_based() {
+        let a: DString = "foo".into();
+        let b: DString = "foo".into();
+        let c: DString = "bar".into();
+
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        assert!(a > c);
+        assert_eq!(format!("{:?}", a), "\"foo\"");
+
+        let mut set = std::collections::HashSet::new();
+        set.insert(a);
+        assert!(set.contains(&b));
+        assert!(!set.contains(&c));
+
+        unsafe {
+            dynspire_release(b.ptr);
+            dynspire_release(c.ptr);
+        }
+    }
+
+    #[test]
+    fn dvec_traits_content_based() {
+        let a: DVec<u8> = vec![1, 2, 3].into();
+        let b: DVec<u8> = vec![1, 2, 3].into();
+        let c: DVec<u8> = vec![4, 5, 6].into();
+
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        assert!(a < c);
+        assert_eq!(format!("{:?}", a), "[1, 2, 3]");
+
+        unsafe {
+            dynspire_release(a.ptr as *mut u8);
+            dynspire_release(c.ptr as *mut u8);
+        }
+    }
+
+    #[test]
+    fn dstring_as_ptr_as_bytes() {
+        let s: DString = "hello".into();
+        assert!(!s.as_ptr().is_null());
+        assert_eq!(s.as_bytes(), b"hello");
+        unsafe { dynspire_release(s.ptr) };
+    }
+
+    #[test]
+    fn dvec_as_ptr() {
+        let d: DVec<u8> = vec![1, 2, 3].into();
+        assert!(!d.as_ptr().is_null());
+        unsafe { dynspire_release(d.ptr as *mut u8) };
     }
 }
