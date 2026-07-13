@@ -7,6 +7,11 @@ interface Rle {
     runs: u64,
   }
 
+  struct NamedRun {
+    label: DString,
+    count: u64,
+  }
+
   enum Tone {
     Quiet,
     Normal,
@@ -35,4 +40,5 @@ interface Rle {
   fn view_slice(data: DSlice<u8>) -> u64;
   fn probe(data: &[u8]) -> DOption<u8>;
   fn opt_classify(data: &[u8]) -> DOption<u8>;
+  fn make_named_run(label: DString, count: u64) -> NamedRun;
 }

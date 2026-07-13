@@ -243,6 +243,37 @@ impl FieldType {
             FieldType::Str | FieldType::U8Slice | FieldType::OutU8Vec | FieldType::DStr | FieldType::DSlice(_)
         )
     }
+
+    /// Rust source type for a **struct/enum field** in `repr(C)` layout.
+    /// Translates IDL types to their C-stable DType equivalents:
+    /// `String` → `DString`, `Vec<T>` → `DVec<T>`, `Option<T>` → `DOption<T>`,
+    /// `&str` → `DStr`, `&[u8]` → `DSlice<u8>`. Primitives and named types
+    /// pass through unchanged.
+    pub fn rust_field_type(&self) -> String {
+        match self {
+            FieldType::String => "dynspire::managed::DString".into(),
+            FieldType::Vec(inner) => format!("dynspire::managed::DVec<{}>", inner.rust_field_type()),
+            FieldType::Option(inner) => format!("dynspire::managed::DOption<{}>", inner.rust_field_type()),
+            FieldType::Str => "dynspire::managed::DStr".into(),
+            FieldType::U8Slice => "dynspire::managed::DSlice<u8>".into(),
+            FieldType::DStr => "dynspire::managed::DStr".into(),
+            FieldType::DSlice(inner) => format!("dynspire::managed::DSlice<{}>", inner.rust_field_type()),
+            FieldType::DString => "dynspire::managed::DString".into(),
+            FieldType::DVec(inner) => format!("dynspire::managed::DVec<{}>", inner.rust_field_type()),
+            FieldType::DOption(inner) => format!("dynspire::managed::DOption<{}>", inner.rust_field_type()),
+            other => other.rust_type(),
+        }
+    }
+
+    /// Whether this type (as a struct/enum field) contains heap-allocated
+    /// buffers that require a `drop_fn` to release.  True for `DString`,
+    /// `DVec<T>`, and for any struct/enum containing them.
+    pub fn has_dynamic_fields(&self) -> bool {
+        matches!(
+            self,
+            FieldType::DString | FieldType::DVec(_)
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------

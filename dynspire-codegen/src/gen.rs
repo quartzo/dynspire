@@ -351,8 +351,7 @@ fn gen_write_return(ft: &FieldType, expr: &str, w: &str, types: &[TypeDecl]) -> 
             "{w}.write_u64({expr}.allocator as u64); {w}.write_u64({expr}.ptr as u64); \
              {w}.write_u64({expr}.len as u64); {w}.write_u64({expr}.cap as u64);"
         ),
-        FieldType::DVec(inner) => {
-            let rt = inner.rust_type();
+        FieldType::DVec(_inner) => {
             format!(
                 "{w}.write_u64({expr}.allocator as u64); {w}.write_u64({expr}.ptr as u64); \
                  {w}.write_u64({expr}.len as u64); {w}.write_u64({expr}.cap as u64);"
@@ -390,6 +389,13 @@ fn gen_write_return(ft: &FieldType, expr: &str, w: &str, types: &[TypeDecl]) -> 
             match ty {
                 TypeDecl::Struct(s) if s.fields.is_empty() => {
                     format!("{w}.write_u64(core::ptr::addr_of!({expr}) as u64);")
+                }
+                TypeDecl::Struct(s) if struct_has_dynamic_fields(s, types) => {
+                    format!(
+                        "let __ptr = dynspire::managed::dyn_alloc(__alloc, core::mem::size_of::<{name}>(), core::mem::align_of::<{name}>(), 0, Some(drop_{name} as unsafe extern \"C\" fn(*mut core::ffi::c_void))) as *mut {name}; \
+                         *__ptr = {expr}; \
+                         {w}.write_u64(__ptr as u64);"
+                    )
                 }
                 TypeDecl::Struct(_) | TypeDecl::Opaque(_) => {
                     format!(
@@ -617,6 +623,13 @@ fn gen_read_receive(ft: &FieldType, r: &str, types: &[TypeDecl]) -> String {
                 TypeDecl::Struct(s) if s.fields.is_empty() => {
                     format!("{{ let _ = {r}.read_u64(); {name} }}")
                 }
+                TypeDecl::Struct(s) if struct_has_dynamic_fields(s, types) => {
+                    format!(
+                        "unsafe {{ let __ptr = {r}.read_u64() as *mut {name}; \
+                         let __v = core::ptr::read(__ptr); \
+                         dynspire::managed::dynspire_dealloc_only(__ptr as *mut u8); __v }}"
+                    )
+                }
                 TypeDecl::Struct(_) | TypeDecl::Opaque(_) => {
                     format!("unsafe {{ let __ptr = {r}.read_u64() as *mut {name}; let __v = core::ptr::read(__ptr); dynspire::managed::dynspire_release(__ptr as *mut u8); __v }}")
                 }
@@ -769,10 +782,16 @@ fn gen_types(iface: &Interface, ctx: &mut BuildContext) -> String {
             TypeDecl::Struct(s) => {
                 if !s.fields.is_empty() {
                     out.push_str(&gen_struct_def(s));
+                    if struct_has_dynamic_fields(s, &iface.types) {
+                        out.push_str(&gen_drop_fn(s, &iface.types));
+                    }
                 }
             }
             TypeDecl::Enum(e) => {
                 out.push_str(&gen_enum_def(e));
+                if enum_has_dynamic_fields(e, &iface.types) {
+                    out.push_str(&gen_enum_drop_fn(e, &iface.types));
+                }
             }
             TypeDecl::Opaque(_) => {}
         }
@@ -786,7 +805,7 @@ fn gen_struct_def(s: &StructDecl) -> String {
         s.name
     );
     for (fname, fty) in &s.fields {
-        out.push_str(&format!("    pub {}: {},\n", fname, fty.rust_type()));
+        out.push_str(&format!("    pub {}: {},\n", fname, fty.rust_field_type()));
     }
     out.push_str("}\n\n");
     out
@@ -801,12 +820,135 @@ fn gen_enum_def(e: &EnumDecl) -> String {
         if v.fields.is_empty() {
             out.push_str(&format!("    {},\n", v.name));
         } else {
-            let fields: Vec<String> = v.fields.iter().map(|t| t.rust_type()).collect();
+            let fields: Vec<String> = v.fields.iter().map(|t| t.rust_field_type()).collect();
             out.push_str(&format!("    {}({}),\n", v.name, fields.join(", ")));
         }
     }
     out.push_str("}\n\n");
     out
+}
+
+// ===========================================================================
+// Dynamic-field helpers — drop_fn generation for structs/enums
+// ===========================================================================
+
+fn field_has_dynamic(ft: &FieldType, types: &[TypeDecl]) -> bool {
+    match ft {
+        FieldType::DString | FieldType::DVec(_) => true,
+        FieldType::DOption(inner) => field_has_dynamic(inner, types),
+        FieldType::Named(name) => {
+            if let Some(ty) = types.iter().find(|t| t.name() == name.as_str()) {
+                match ty {
+                    TypeDecl::Struct(s) => s.fields.iter().any(|(_, f)| field_has_dynamic(f, types)),
+                    TypeDecl::Enum(e) => e.variants.iter().any(|v| v.fields.iter().any(|f| field_has_dynamic(f, types))),
+                    TypeDecl::Opaque(_) => false,
+                }
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
+fn struct_has_dynamic_fields(s: &StructDecl, types: &[TypeDecl]) -> bool {
+    s.fields.iter().any(|(_, f)| field_has_dynamic(f, types))
+}
+
+fn enum_has_dynamic_fields(e: &EnumDecl, types: &[TypeDecl]) -> bool {
+    e.variants.iter().any(|v| v.fields.iter().any(|f| field_has_dynamic(f, types)))
+}
+
+/// Emit `dynspire_release(s.field.ptr)` lines for each dynamic field in a
+/// struct, used inside the generated `drop_fn`.
+fn gen_field_releases(prefix: &str, fields: &[(String, FieldType)], types: &[TypeDecl]) -> String {
+    let mut out = String::new();
+    for (fname, fty) in fields {
+        match fty {
+            FieldType::DString => {
+                out.push_str(&format!(
+                    "        dynspire::managed::dynspire_release({prefix}{fname}.ptr as *mut u8);\n"
+                ));
+            }
+            FieldType::DVec(_inner) => {
+                out.push_str(&format!(
+                    "        dynspire::managed::dynspire_release({prefix}{fname}.ptr as *mut u8);\n"
+                ));
+            }
+            FieldType::DOption(inner) => match inner.as_ref() {
+                FieldType::DString => {
+                    out.push_str(&format!(
+                        "        if {prefix}{fname}.tag != 0 {{\n            dynspire::managed::dynspire_release({prefix}{fname}.value.ptr as *mut u8);\n        }}\n"
+                    ));
+                }
+                FieldType::DVec(_inner2) => {
+                    out.push_str(&format!(
+                        "        if {prefix}{fname}.tag != 0 {{\n            dynspire::managed::dynspire_release({prefix}{fname}.value.ptr as *mut u8);\n        }}\n"
+                    ));
+                }
+                _ => {}
+            },
+            FieldType::Named(name) => {
+                if let Some(ty) = types.iter().find(|t| t.name() == name.as_str()) {
+                    match ty {
+                        TypeDecl::Struct(inner_s) if struct_has_dynamic_fields(inner_s, types) => {
+                            out.push_str(&format!(
+                                "        drop_{name}(&{prefix}{fname} as *const {name} as *mut core::ffi::c_void);\n"
+                            ));
+                        }
+                        TypeDecl::Enum(inner_e) if enum_has_dynamic_fields(inner_e, types) => {
+                            out.push_str(&format!(
+                                "        drop_{name}(&{prefix}{fname} as *const {name} as *mut core::ffi::c_void);\n"
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn gen_drop_fn(s: &StructDecl, types: &[TypeDecl]) -> String {
+    let name = &s.name;
+    let releases = gen_field_releases("(*__s).", &s.fields, types);
+    format!(
+        "unsafe extern \"C\" fn drop_{name}(ptr: *mut core::ffi::c_void) {{\n\
+         \x20   let __s = unsafe {{ &mut *(ptr as *mut {name}) }};\n\
+         {releases}}}\n\n"
+    )
+}
+
+fn gen_enum_drop_fn(e: &EnumDecl, types: &[TypeDecl]) -> String {
+    let name = &e.name;
+    let mut arms = String::new();
+    for v in e.variants.iter() {
+        if v.fields.is_empty() {
+            continue;
+        }
+        let binds: Vec<String> = (0..v.fields.len()).map(|i| format!("__f{i}")).collect();
+        let binds_str = binds.join(", ");
+        let releases = gen_field_releases("", &v.fields.iter().enumerate().map(|(i, f)| (binds[i].clone(), f.clone())).collect::<Vec<_>>(), types);
+        if releases.is_empty() {
+            continue;
+        }
+        arms.push_str(&format!(
+            "        {name}::{vn}({binds_str}) => {{\n{releases}        }}\n",
+            vn = v.name,
+        ));
+    }
+    if arms.is_empty() {
+        return String::new();
+    }
+    format!(
+        "unsafe extern \"C\" fn drop_{name}(ptr: *mut core::ffi::c_void) {{\n\
+         \x20   let __s = unsafe {{ &mut *(ptr as *mut {name}) }};\n\
+         \x20   match unsafe {{ core::ptr::read(__s) }} {{\n\
+         {arms}\
+         \x20   }}\n}}\n\n"
+    )
 }
 
 // ===========================================================================
@@ -2227,7 +2369,7 @@ fn merge_types(iface: &mut crate::ast::Interface, included: Vec<crate::ast::Type
     }
 
     let mut merged = included;
-    merged.extend(iface.types.drain(..));
+    merged.append(&mut iface.types);
     iface.types = merged;
 }
 
@@ -2307,6 +2449,59 @@ mod tests {
         assert!(
             !code.contains("into_boxed_slice"),
             "return handoff must not use into_boxed_slice"
+        );
+    }
+
+    #[test]
+    fn generated_struct_with_dynamic_fields_has_drop_fn() {
+        let iface = parse_rle();
+        let code = generate(&iface);
+        // NamedRun has a DString field → should get a drop_fn
+        assert!(
+            code.contains("unsafe extern \"C\" fn drop_NamedRun("),
+            "struct with DString field must generate drop_NamedRun"
+        );
+        // The drop_fn must release the DString's buffer
+        assert!(
+            code.contains("dynspire::managed::dynspire_release"),
+            "drop_fn must release dynamic field buffers"
+        );
+        // make_named_run returns NamedRun → heap-alloc with drop_fn
+        assert!(
+            code.contains("dynspire::managed::dyn_alloc(__alloc,"),
+            "struct with dynamic fields must use dyn_alloc with drop_fn"
+        );
+        // Host receive must use dealloc_only (skip drop_fn) for NamedRun
+        assert!(
+            code.contains("dynspire::managed::dynspire_dealloc_only"),
+            "host receive for struct with dynamic fields must use dynspire_dealloc_only"
+        );
+        // CompressionReport has no dynamic fields → must NOT get a drop_fn
+        assert!(
+            !code.contains("unsafe extern \"C\" fn drop_CompressionReport("),
+            "struct without dynamic fields must NOT generate a drop_fn"
+        );
+    }
+
+    #[test]
+    fn generated_struct_fields_use_dtypes() {
+        let iface = parse_rle();
+        let code = generate(&iface);
+        // NamedRun's label field is DString, not String
+        assert!(
+            code.contains("pub label: dynspire::managed::DString"),
+            "DString field in struct must use DString type"
+        );
+    }
+
+    #[test]
+    fn generated_drop_fn_releases_dstring_field() {
+        let iface = parse_rle();
+        let code = generate(&iface);
+        // The drop_fn should release label.ptr (DString's buffer)
+        assert!(
+            code.contains("drop_NamedRun") && code.contains("(*__s).label.ptr as *mut u8"),
+            "drop_NamedRun must release the DString buffer via label.ptr"
         );
     }
 
@@ -2405,6 +2600,22 @@ mod tests {
         assert!(py.contains("None if"), "python DOption must map to None/value");
     }
 
+
+    #[test]
+    fn generated_python_struct_with_dynamic_fields() {
+        let iface = parse_rle();
+        let py = generate_python(&iface);
+        // NamedRun struct should be defined as an OpaqueHandle subclass
+        assert!(
+            py.contains("class NamedRun(OpaqueHandle)"),
+            "NamedRun must be an OpaqueHandle subclass"
+        );
+        // make_named_run method should exist
+        assert!(
+            py.contains("def make_named_run(self"),
+            "Python client must expose make_named_run"
+        );
+    }
 
     #[test]
     fn generated_code_is_deterministic() {

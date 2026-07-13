@@ -544,6 +544,29 @@ pub unsafe extern "C" fn dynspire_release(ptr: *mut u8) {
     }
 }
 
+/// Deallocate a heap block **without** running its `drop_fn`.  Used by host
+/// receive-path codegen for structs with dynamic fields: the host copies the
+/// struct (taking ownership of the dynamic-field buffers), then deallocates
+/// the shell without triggering the `drop_fn` that would double-free them.
+///
+/// # Safety
+///
+/// `ptr` must be a valid payload pointer from `dynspire_alloc`/`dyn_alloc`.
+/// The block is freed and must not be used afterwards.
+#[no_mangle]
+pub unsafe extern "C" fn dynspire_dealloc_only(ptr: *mut u8) {
+    if ptr.is_null() {
+        return;
+    }
+    let header = header_of(ptr);
+    let alloc = (*header).allocator;
+    let size = (*header).size;
+    let align = (*header).align;
+    let base = ptr.sub(HEADER_SIZE);
+    let total = HEADER_SIZE + size;
+    v_dealloc(alloc, base, total, align);
+}
+
 // ---------------------------------------------------------------------------
 // DynSpire types
 // ---------------------------------------------------------------------------
