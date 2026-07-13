@@ -1,6 +1,6 @@
 [package]
 name = "dynspire"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 description = "DynSpire - dynamic spire framework (arena, runtime, FFI, tower client)"
 license = "MIT"
