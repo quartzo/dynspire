@@ -4,6 +4,17 @@ use dynspire::managed::{DOption, DSlice, DStr, DVec};
 
 include!(concat!(env!("OUT_DIR"), "/rle_host.rs"));
 
+#[repr(C)]
+pub struct Snapshot {
+    pub data: Vec<u8>,
+}
+
+impl Clone for Snapshot {
+    fn clone(&self) -> Self {
+        Snapshot { data: self.data.clone() }
+    }
+}
+
 fn hex(bytes: &[u8]) -> String {
     bytes
         .iter()
@@ -160,6 +171,15 @@ fn main() {
     println!("probe(&[u8]) / opt_classify(&[u8]) -> DOption<u8>");
     println!("  probe        -> {}", show(present));
     println!("  opt_classify -> {} (max byte)", show(maxv));
+    println!();
+
+    // --- Opaque type round-trip ---
+    let snap = client.make_snapshot(&input[..]).expect("make_snapshot failed");
+    println!("make_snapshot(&[u8]) -> Snapshot (opaque, boxed pointer)");
+    println!("  -> {} bytes", snap.data.len());
+    let snap_len = client.snapshot_len(snap).expect("snapshot_len failed");
+    println!("snapshot_len(Snapshot)");
+    println!("  -> {snap_len}");
     println!();
 
     println!("Done. Spier was loaded, verified, and dispatched entirely at runtime.");

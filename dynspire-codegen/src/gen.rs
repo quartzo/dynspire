@@ -436,14 +436,14 @@ fn gen_write_return(ft: &FieldType, expr: &str, w: &str, types: &[TypeDecl]) -> 
                 TypeDecl::Struct(s) if struct_has_dynamic_fields(s, types) => {
                     format!(
                         "let __ptr = dynspire::managed::dyn_alloc(__alloc, core::mem::size_of::<{name}>(), core::mem::align_of::<{name}>(), 0, Some(drop_{name} as unsafe extern \"C\" fn(*mut core::ffi::c_void))) as *mut {name}; \
-                         *__ptr = {expr}; \
+                         core::ptr::write(__ptr, {expr}); \
                          {w}.write_u64(__ptr as u64);"
                     )
                 }
                 TypeDecl::Struct(_) | TypeDecl::Opaque(_) => {
                     format!(
                         "let __ptr = dynspire::managed::dynspire_alloc(__alloc, core::mem::size_of::<{name}>(), core::mem::align_of::<{name}>()) as *mut {name}; \
-                         *__ptr = {expr}; \
+                         core::ptr::write(__ptr, {expr}); \
                          {w}.write_u64(__ptr as u64);"
                     )
                 }
@@ -2903,6 +2903,21 @@ interface Codec {
         assert!(code.contains("OwnedDString::from_raw"), "host must reconstruct OwnedDString");
         // DOption decode writes a tag, not a Rust Some/None pattern, on spier side.
         assert!(code.contains(".tag == 0"), "DOption decode must branch on tag field");
+    }
+
+    #[test]
+    fn generated_named_returns_use_ptr_write() {
+        let iface = parse_rle();
+        let code = generate(&iface);
+        // Named-type returns (struct/opaque) must use core::ptr::write instead of
+        // *__ptr = val to avoid double-drop when the type has non-Copy fields.
+        // The old form (*__ptr = val) caused the compiler to generate drop glue
+        // for the moved value, leading to "free(): invalid pointer" on types
+        // with Drop (e.g., Vec, Arc).
+        assert!(
+            code.contains("core::ptr::write(__ptr,") && !code.contains("*__ptr = __v"),
+            "Named-type write_return must use core::ptr::write, not *__ptr = val"
+        );
     }
 
     #[test]

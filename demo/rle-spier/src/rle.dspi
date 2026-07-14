@@ -13,6 +13,8 @@ interface Rle {
     Loud(u8),
   }
 
+  opaque struct Snapshot;
+
   fn compress(data: &[u8]) -> Vec<u8>;
   fn decompress(data: &[u8]) -> Vec<u8>;
   fn compress_into(data: &[u8], out: &mut Vec<u8>) -> ();
@@ -28,6 +30,8 @@ interface Rle {
   fn try_classify(data: &[u8]) -> Option<Tone>;
   fn try_analyze(data: &[u8]) -> Option<CompressionReport>;
   fn delay(ms: u64) -> ();
+  fn make_snapshot(data: &[u8]) -> Snapshot;
+  fn snapshot_len(snap: Snapshot) -> u64;
 
   // --- Optional managed types (zero-copy) ---
   fn echo_bytes(data: &[u8]) -> DVec<u8>;

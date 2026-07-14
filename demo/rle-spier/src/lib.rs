@@ -6,6 +6,17 @@ include!(concat!(env!("OUT_DIR"), "/rle_spier.rs"));
 
 pub struct RleState;
 
+#[repr(C)]
+pub struct Snapshot {
+    pub data: Vec<u8>,
+}
+
+impl Clone for Snapshot {
+    fn clone(&self) -> Self {
+        Snapshot { data: self.data.clone() }
+    }
+}
+
 fn rle_compress(data: &[u8]) -> Vec<u8> {
     if data.is_empty() {
         return vec![];
@@ -152,6 +163,14 @@ impl RleEngine for RleState {
     fn delay(&self, ms: u64) -> Result<(), String> {
         std::thread::sleep(std::time::Duration::from_millis(ms));
         Ok(())
+    }
+
+    fn make_snapshot(&self, data: &[u8]) -> Result<Snapshot, String> {
+        Ok(Snapshot { data: data.to_vec() })
+    }
+
+    fn snapshot_len(&self, snap: Snapshot) -> Result<u64, String> {
+        Ok(snap.data.len() as u64)
     }
 
     // --- Optional managed types (zero-copy) ---
