@@ -2422,6 +2422,13 @@ class OpaqueHandle:
         self._client = client
         self._ptr = ptr
 
+    @classmethod
+    def _from_ptr(cls, client, ptr):
+        obj = cls.__new__(cls)
+        obj._client = client
+        obj._ptr = ptr
+        return obj
+
     @property
     def type_name(self):
         return type(self).__name__
@@ -3114,6 +3121,18 @@ interface Codec {
         assert!(
             !py.contains("NamedRun(self,") || py.contains("_from_ptr"),
             "NamedRun(self, ...) without _from_ptr must not appear in decode"
+        );
+    }
+
+    #[test]
+    fn generated_python_opaque_handle_has_from_ptr() {
+        let iface = parse_rle();
+        let py = generate_python(&iface);
+        // OpaqueHandle base class must have _from_ptr classmethod so that
+        // opaque struct subclasses (which get just `pass`) inherit it.
+        assert!(
+            py.contains("class OpaqueHandle:") && py.contains("def _from_ptr(cls, client, ptr):"),
+            "OpaqueHandle base must have _from_ptr classmethod"
         );
     }
 
