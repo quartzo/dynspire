@@ -11,9 +11,11 @@
 //!   an inline refcount, a type index, a `drop_fn`, the owning allocator, and
 //!   size/align. [`dynspire_retain`] / [`dynspire_release`] manage lifecycle;
 //!   `release` to zero runs `drop_fn` then reclaims the block.
-//! - [`DStr`], [`DSlice`], [`DString`], [`DVec`], [`DOption`] are the C-stable
-//!   DynSpire types (`repr(C)`). Dynamic types carry their own allocator
-//!   pointer (first field) so they are self-contained for realloc/release.
+//! - [`DString`], [`DVec`], [`DOption`] are the C-stable DynSpire owned types
+//!   (`repr(C)`). They are **RC-aware**: `Clone` retains, `Drop` releases.
+//!   The wire format for owned appearances is the raw 4-field struct; for
+//!   borrowed appearances (`&DString` / `&DVec<T>` in the IDL) the codegen
+//!   emits a 2-slot `(ptr, len)` view — see `gen.rs` for the codec.
 
 use std::alloc::Layout;
 use std::ffi::c_void;
@@ -543,7 +545,6 @@ pub unsafe extern "C" fn dynspire_release(ptr: *mut u8) {
         v_dealloc(alloc, base, total, align);
     }
 }
-
 /// Deallocate a heap block **without** running its `drop_fn`.  Used by host
 /// receive-path codegen for structs with dynamic fields: the host copies the
 /// struct (taking ownership of the dynamic-field buffers), then deallocates
@@ -571,7 +572,7 @@ pub unsafe extern "C" fn dynspire_dealloc_only(ptr: *mut u8) {
 // DynSpire types
 // ---------------------------------------------------------------------------
 
-/// Marker for types with a stable C layout. All implementors are `Copy`.
+/// Marker for types with a stable C layout.
 ///
 /// # Safety
 ///
@@ -579,8 +580,14 @@ pub unsafe extern "C" fn dynspire_dealloc_only(ptr: *mut u8) {
 /// and free of invalid bit patterns, so it can be projected across the FFI
 /// boundary by any language with a C FFI. The trait has no unsafe methods;
 /// the bound is purely a compile-time contract on layout.
+///
+/// Note: the bound is *not* `Copy` — RC-aware owned types like `DVec<T>` /
+/// `DString` implement `ReprC` despite having non-Copy semantics (their
+/// `Drop` releases the backing buffer). The wire format is the raw
+/// `repr(C)` struct; the codegen uses `into_raw` / `from_raw` to handle
+/// ownership transfer at the FFI boundary.
 #[allow(clippy::missing_safety_doc)]
-pub unsafe trait ReprC: Copy {}
+pub unsafe trait ReprC {}
 
 /// `&str` semantics — non-owning, read-only view. No allocator pointer.
 #[repr(C)]
@@ -599,8 +606,12 @@ pub struct DSlice<T: ReprC> {
 }
 
 /// `String` semantics — owned, allocator pointer is the first field.
+///
+/// **RC-aware**: `Clone` calls `dynspire_retain`, `Drop` calls
+/// `dynspire_release`. The buffer is freed exactly once when the last
+/// clone is dropped. Use [`DString::into_raw`] / [`DString::from_raw`]
+/// for FFI handoff (the wire format is the raw `repr(C)` struct: 4 slots).
 #[repr(C)]
-#[derive(Clone, Copy)]
 pub struct DString {
     pub allocator: *mut DynSpireAllocator,
     pub ptr: *mut u8,
@@ -609,8 +620,16 @@ pub struct DString {
 }
 
 /// `Vec<T>` semantics — owned, allocator pointer is the first field.
+///
+/// **RC-aware**: `Clone` calls `dynspire_retain`, `Drop` calls
+/// `dynspire_release`. The buffer is freed exactly once when the last
+/// clone is dropped. Use [`DVec::into_raw`] / [`DVec::from_raw`] for FFI
+/// handoff (the wire format is the raw `repr(C)` struct: 4 slots).
+///
+/// Mutation methods (`push`, `resize`) require single ownership
+/// (refcount == 1); they panic in debug builds if shared. This matches
+/// the "no direct mutation when shared" rule of `Rc::get_mut`.
 #[repr(C)]
-#[derive(Clone, Copy)]
 pub struct DVec<T: ReprC> {
     pub allocator: *mut DynSpireAllocator,
     pub ptr: *mut T,
@@ -657,6 +676,8 @@ unsafe impl Send for DStr {}
 unsafe impl Sync for DStr {}
 unsafe impl<T: ReprC + Send> Send for DSlice<T> {}
 unsafe impl<T: ReprC + Sync> Sync for DSlice<T> {}
+// Note: DString/DVec are non-Copy (they own the buffer). Send/Sync still
+// sound because the buffer is in the host allocator (thread-safe).
 unsafe impl Send for DString {}
 unsafe impl Sync for DString {}
 unsafe impl<T: ReprC + Send> Send for DVec<T> {}
@@ -665,15 +686,16 @@ unsafe impl<T: ReprC + Send> Send for DOption<T> {}
 unsafe impl<T: ReprC + Sync> Sync for DOption<T> {}
 
 // ---------------------------------------------------------------------------
-// DType constructors + owning guards
+// DType constructors + RC-aware ownership
 //
 // `DVec`/`DString` own a host-allocator buffer. The low-level constructors
 // (`DVec::new_in` / `DString::new_in`) allocate through a `*mut
 // DynSpireAllocator` and are the single allocation path used by both the
 // spier (via `DynSpireStateExt::new_dvec`) and the host (via the generated
-// client `new_dvec`). The owning `OwnedDVec`/`OwnedDString` guards wrap the
-// raw managed struct and release the buffer on `Drop`, so a returned DType is
-// freed exactly once — by the side that received it.
+// client `new_dvec`). The types are **RC-aware**: `Clone` retains, `Drop`
+// releases. There is no separate owning guard — the same `DVec`/`DString`
+// type is used for input, output, and across the FFI boundary. Use
+// `into_raw` / `from_raw` to hand off ownership without touching the RC.
 // ---------------------------------------------------------------------------
 
 impl<T: ReprC> DVec<T> {
@@ -694,7 +716,14 @@ impl<T: ReprC> DVec<T> {
     }
 
     /// Append `value`, growing the buffer (host allocator) as needed.
+    ///
+    /// **Requires single ownership** (refcount == 1). Panics in debug builds
+    /// if the buffer is shared — use `make_unique` first to clone-on-write.
     pub fn push(&mut self, value: T) {
+        debug_assert!(
+            self.rc() <= 1,
+            "DVec::push requires single ownership; clone first"
+        );
         if self.len == self.cap {
             let new_cap = if self.cap == 0 { 4 } else { self.cap * 2 };
             let old_nbytes = self.len * std::mem::size_of::<T>();
@@ -716,6 +745,17 @@ impl<T: ReprC> DVec<T> {
         }
         unsafe { std::ptr::write(self.ptr.add(self.len), value) };
         self.len += 1;
+    }
+
+    /// Current refcount of the backing buffer (1 = sole owner).
+    pub fn rc(&self) -> usize {
+        if self.ptr.is_null() {
+            return 1;
+        }
+        unsafe {
+            let h = header_of(self.ptr as *mut u8);
+            (*h).rc.load(Ordering::Acquire)
+        }
     }
 
     /// Number of elements.
@@ -740,6 +780,47 @@ impl<T: ReprC> DVec<T> {
     /// Raw pointer to the first element (or null if empty).
     pub fn as_ptr(&self) -> *const T {
         self.ptr
+    }
+
+    /// Consume the handle, returning the raw `DVec` payload wrapped in
+    /// `ManuallyDrop` so the returned value does NOT trigger `Drop` when
+    /// it goes out of scope. Used for FFI handoff: the receiver wraps
+    /// the bytes via [`DVec::from_raw`] and takes implicit ownership.
+    pub fn into_raw(self) -> std::mem::ManuallyDrop<Self> {
+        std::mem::ManuallyDrop::new(self)
+    }
+
+    /// Wrap a raw `DVec` payload (received from the FFI) into an owning
+    /// handle. The refcount is *not* touched.
+    pub fn from_raw(raw: Self) -> Self {
+        // `raw` already has the correct fields — just move it out.
+        // This is a no-op identity function that exists for API symmetry
+        // with `into_raw`.
+        raw
+    }
+}
+
+impl<T: ReprC> Clone for DVec<T> {
+    /// Shallow clone: increments the backing buffer's refcount. Both
+    /// handles share the same payload.
+    fn clone(&self) -> Self {
+        if !self.ptr.is_null() {
+            unsafe { dynspire_retain(self.ptr as *mut u8) };
+        }
+        DVec {
+            allocator: self.allocator,
+            ptr: self.ptr,
+            len: self.len,
+            cap: self.cap,
+        }
+    }
+}
+
+impl<T: ReprC> Drop for DVec<T> {
+    /// Decrements the refcount; when it reaches zero, the backing buffer
+    /// is released to its allocator.
+    fn drop(&mut self) {
+        unsafe { dynspire_release(self.ptr as *mut u8) };
     }
 }
 
@@ -786,6 +867,53 @@ impl DString {
     /// View the contents as `&[u8]` without copying.
     pub fn as_bytes(&self) -> &[u8] {
         self.as_str().as_bytes()
+    }
+
+    /// Current refcount of the backing buffer (1 = sole owner).
+    pub fn rc(&self) -> usize {
+        if self.ptr.is_null() {
+            return 1;
+        }
+        unsafe {
+            let h = header_of(self.ptr);
+            (*h).rc.load(Ordering::Acquire)
+        }
+    }
+
+    /// Consume the handle, returning the raw `DString` payload wrapped in
+    /// `ManuallyDrop` so the returned value does NOT trigger `Drop` when
+    /// it goes out of scope. Used for FFI handoff.
+    pub fn into_raw(self) -> std::mem::ManuallyDrop<Self> {
+        std::mem::ManuallyDrop::new(self)
+    }
+
+    /// Wrap a raw `DString` payload (received from the FFI) into an owning
+    /// handle. The refcount is *not* touched.
+    pub fn from_raw(raw: Self) -> Self {
+        raw
+    }
+}
+
+impl Clone for DString {
+    /// Shallow clone: increments the backing buffer's refcount.
+    fn clone(&self) -> Self {
+        if !self.ptr.is_null() {
+            unsafe { dynspire_retain(self.ptr) };
+        }
+        DString {
+            allocator: self.allocator,
+            ptr: self.ptr,
+            len: self.len,
+            cap: self.cap,
+        }
+    }
+}
+
+impl Drop for DString {
+    /// Decrements the refcount; when it reaches zero, the backing buffer
+    /// is released to its allocator.
+    fn drop(&mut self) {
+        unsafe { dynspire_release(self.ptr) };
     }
 }
 
@@ -971,147 +1099,6 @@ impl<T: ReprC + std::hash::Hash> std::hash::Hash for DVec<T> {
     }
 }
 
-/// Owning guard around [`DVec`]. Releases the backing buffer on `Drop`.
-///
-/// Spier methods return this type (built via `DynSpireStateExt::new_dvec`); the
-/// generated dispatch converts it to a raw `DVec` (`into_raw`) before writing
-/// the slots, so the buffer is *not* released on the spier side. The host
-/// reconstructs an `OwnedDVec` from the received raw struct and releases it on
-/// `Drop` — the single owner is the host caller.
-pub struct OwnedDVec<T: ReprC> {
-    inner: DVec<T>,
-}
-
-impl<T: ReprC> OwnedDVec<T> {
-    /// Allocate a new owning vector in `alloc`.
-    pub fn new_in(alloc: &DynSpireAllocator, cap: usize) -> Self {
-        OwnedDVec {
-            inner: DVec::new_in(alloc, cap),
-        }
-    }
-
-    /// Consume the guard, returning the raw [`DVec`] without releasing it.
-    ///
-    /// Used by the spier dispatch to hand ownership to the host without a
-    /// double-free.
-    pub fn into_raw(self) -> DVec<T> {
-        let d = self.inner;
-        std::mem::forget(self);
-        d
-    }
-
-    /// Wrap a raw [`DVec`] (received from the spier) into an owning guard.
-    pub fn from_raw(inner: DVec<T>) -> Self {
-        OwnedDVec { inner }
-    }
-
-    /// Number of elements.
-    pub fn len(&self) -> usize {
-        self.inner.len()
-    }
-
-    /// Whether the vector is empty.
-    pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
-    }
-
-    /// View the contents without copying.
-    pub fn as_slice(&self) -> &[T] {
-        self.inner.as_slice()
-    }
-}
-
-impl<T: ReprC> From<DVec<T>> for OwnedDVec<T> {
-    fn from(inner: DVec<T>) -> Self {
-        OwnedDVec { inner }
-    }
-}
-
-impl<T: ReprC> std::ops::Deref for OwnedDVec<T> {
-    type Target = DVec<T>;
-    fn deref(&self) -> &DVec<T> {
-        &self.inner
-    }
-}
-
-impl<T: ReprC> std::ops::DerefMut for OwnedDVec<T> {
-    fn deref_mut(&mut self) -> &mut DVec<T> {
-        &mut self.inner
-    }
-}
-
-impl<T: ReprC> Drop for OwnedDVec<T> {
-    fn drop(&mut self) {
-        unsafe { dynspire_release(self.inner.ptr as *mut u8) };
-    }
-}
-
-/// Owning guard around [`DString`]. Releases the backing buffer on `Drop`.
-pub struct OwnedDString {
-    inner: DString,
-}
-
-impl OwnedDString {
-    /// Allocate a new owning string in `alloc`.
-    pub fn new_in(alloc: &DynSpireAllocator, s: &str) -> Self {
-        OwnedDString {
-            inner: DString::new_in(alloc, s),
-        }
-    }
-
-    /// Consume the guard, returning the raw [`DString`] without releasing it.
-    pub fn into_raw(self) -> DString {
-        let d = self.inner;
-        std::mem::forget(self);
-        d
-    }
-
-    /// Wrap a raw [`DString`] (received from the spier) into an owning guard.
-    pub fn from_raw(inner: DString) -> Self {
-        OwnedDString { inner }
-    }
-
-    /// Number of bytes.
-    pub fn len(&self) -> usize {
-        self.inner.len()
-    }
-
-    /// Whether the string is empty.
-    pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
-    }
-
-    /// View the contents as `&str` without copying.
-    pub fn as_str(&self) -> &str {
-        self.inner.as_str()
-    }
-}
-
-impl From<DString> for OwnedDString {
-    fn from(inner: DString) -> Self {
-        OwnedDString { inner }
-    }
-}
-
-impl std::ops::Deref for OwnedDString {
-    type Target = DString;
-    fn deref(&self) -> &DString {
-        &self.inner
-    }
-}
-
-impl std::ops::DerefMut for OwnedDString {
-    fn deref_mut(&mut self) -> &mut DString {
-        &mut self.inner
-    }
-}
-
-impl Drop for OwnedDString {
-    fn drop(&mut self) {
-        unsafe { dynspire_release(self.inner.ptr) };
-    }
-}
-
 /// Ergonomic access to the host allocator and DType constructors from within a
 /// spier trait method.
 ///
@@ -1125,13 +1112,13 @@ pub trait DynSpireStateExt {
     fn __dynspire_alloc(&self) -> *mut DynSpireAllocator;
 
     /// Build an owning `DVec` in the host allocator.
-    fn new_dvec<T: ReprC>(&self, cap: usize) -> OwnedDVec<T> {
-        OwnedDVec::new_in(unsafe { &*self.__dynspire_alloc() }, cap)
+    fn new_dvec<T: ReprC>(&self, cap: usize) -> DVec<T> {
+        DVec::new_in(unsafe { &*self.__dynspire_alloc() }, cap)
     }
 
     /// Build an owning `DString` in the host allocator.
-    fn new_dstring(&self, s: &str) -> OwnedDString {
-        OwnedDString::new_in(unsafe { &*self.__dynspire_alloc() }, s)
+    fn new_dstring(&self, s: &str) -> DString {
+        DString::new_in(unsafe { &*self.__dynspire_alloc() }, s)
     }
 }
 
@@ -1457,17 +1444,16 @@ mod tests {
         v.push(0xCC);
         v.push(0xDD);
 
-        let raw: DVec<u8> = v;
+        // Simulate spier → host handoff: into_raw wraps in ManuallyDrop.
+        let raw = v.into_raw();
         let bytes = raw.as_slice().to_vec();
+        assert_eq!(bytes, &[0xCC, 0xDD]);
 
-        let v2 = DVec::<u8> {
-            allocator: raw.allocator,
-            ptr: raw.ptr,
-            len: raw.len,
-            cap: raw.cap,
-        };
+        // Host side wraps via from_raw; on drop it releases the buffer.
+        // We extract the inner DVec from ManuallyDrop via read().
+        let v2 = DVec::<u8>::from_raw(std::mem::ManuallyDrop::into_inner(raw));
         assert_eq!(v2.as_slice(), bytes.as_slice());
-        unsafe { dynspire_release(v2.ptr as *mut u8) };
+        drop(v2);
 
         unsafe {
             assert_eq!((*counters).allocs.load(Ordering::SeqCst), (*counters).frees.load(Ordering::SeqCst));
@@ -1481,14 +1467,11 @@ mod tests {
         let s = DString::new_in(&alloc, "round-trip");
 
         let bytes = s.as_str().as_bytes().to_vec();
-        let raw = DString {
-            allocator: s.allocator,
-            ptr: s.ptr,
-            len: s.len,
-            cap: s.cap,
-        };
+        let raw = s.into_raw();
         assert_eq!(raw.as_str(), core::str::from_utf8(&bytes).unwrap());
-        unsafe { dynspire_release(raw.ptr) };
+
+        let wrapped = DString::from_raw(std::mem::ManuallyDrop::into_inner(raw));
+        drop(wrapped);
 
         unsafe {
             assert_eq!((*counters).allocs.load(Ordering::SeqCst), (*counters).frees.load(Ordering::SeqCst));
@@ -1497,13 +1480,13 @@ mod tests {
     }
 
     #[test]
-    fn owned_dvec_drop_releases() {
+    fn dvec_drop_releases() {
         let (mut alloc, counters) = test_allocator();
         {
-            let mut ov = OwnedDVec::<u8>::new_in(&alloc, 4);
-            ov.push(0x11);
-            ov.push(0x22);
-            assert_eq!(ov.len(), 2);
+            let mut v = DVec::<u8>::new_in(&alloc, 4);
+            v.push(0x11);
+            v.push(0x22);
+            assert_eq!(v.len(), 2);
         }
         unsafe {
             assert_eq!((*counters).allocs.load(Ordering::SeqCst), (*counters).frees.load(Ordering::SeqCst));
@@ -1512,11 +1495,52 @@ mod tests {
     }
 
     #[test]
-    fn owned_dstring_drop_releases() {
+    fn dstring_drop_releases() {
         let (mut alloc, counters) = test_allocator();
         {
-            let os = OwnedDString::new_in(&alloc, "owned string");
-            assert_eq!(os.as_str(), "owned string");
+            let s = DString::new_in(&alloc, "owned string");
+            assert_eq!(s.as_str(), "owned string");
+        }
+        unsafe {
+            assert_eq!((*counters).allocs.load(Ordering::SeqCst), (*counters).frees.load(Ordering::SeqCst));
+            free_test_allocator(alloc, counters);
+        }
+    }
+
+    #[test]
+    fn dvec_clone_retains_and_drop_releases_once() {
+        let (mut alloc, counters) = test_allocator();
+        {
+            let mut v = DVec::<u8>::new_in(&alloc, 4);
+            v.push(0x11);
+            assert_eq!(v.rc(), 1);
+
+            let c = v.clone();
+            assert_eq!(v.rc(), 2);
+            assert_eq!(c.rc(), 2);
+            assert_eq!(c.as_slice(), &[0x11]);
+
+            drop(v);
+            // Buffer still alive — clone holds it.
+            assert_eq!(c.rc(), 1);
+            assert_eq!(c.as_slice(), &[0x11]);
+        }
+        unsafe {
+            assert_eq!((*counters).allocs.load(Ordering::SeqCst), (*counters).frees.load(Ordering::SeqCst));
+            free_test_allocator(alloc, counters);
+        }
+    }
+
+    #[test]
+    fn dstring_clone_retains() {
+        let (mut alloc, counters) = test_allocator();
+        {
+            let s = DString::new_in(&alloc, "hi");
+            let c = s.clone();
+            assert_eq!(s.rc(), 2);
+            assert_eq!(c.as_str(), "hi");
+            drop(s);
+            assert_eq!(c.rc(), 1);
         }
         unsafe {
             assert_eq!((*counters).allocs.load(Ordering::SeqCst), (*counters).frees.load(Ordering::SeqCst));
@@ -1527,24 +1551,18 @@ mod tests {
     #[test]
     fn dvec_full_roundtrip_with_growth() {
         let (mut alloc, counters) = test_allocator();
-        let mut ov = OwnedDVec::<u64>::new_in(&alloc, 1);
+        let mut v = DVec::<u64>::new_in(&alloc, 1);
         for i in 0..100u64 {
-            ov.push(i);
+            v.push(i);
         }
-        assert_eq!(ov.len(), 100);
+        assert_eq!(v.len(), 100);
         unsafe { assert_eq!((*counters).allocs.load(Ordering::SeqCst), 1); }
 
-        // Simulate spier → host handoff: take raw, forget the guard.
-        let raw = DVec::<u64> {
-            allocator: ov.inner.allocator,
-            ptr: ov.inner.ptr,
-            len: ov.inner.len,
-            cap: ov.inner.cap,
-        };
-        std::mem::forget(ov);
-
+        // Simulate spier → host handoff.
+        let raw = v.into_raw();
         assert_eq!(raw.len, 100);
-        unsafe { dynspire_release(raw.ptr as *mut u8) };
+        let host_side = DVec::<u64>::from_raw(std::mem::ManuallyDrop::into_inner(raw));
+        drop(host_side);
 
         unsafe {
             assert_eq!((*counters).allocs.load(Ordering::SeqCst), (*counters).frees.load(Ordering::SeqCst));
@@ -1559,9 +1577,9 @@ mod tests {
         let live_before = before.live_bytes;
         let allocs_before = before.total_allocations;
 
-        let mut ov = OwnedDVec::<u8>::new_in(&alloc, 64);
+        let mut v = DVec::<u8>::new_in(&alloc, 64);
         for i in 0..64u8 {
-            ov.push(i);
+            v.push(i);
         }
         let mid = alloc.report();
         assert!(mid.live_bytes > live_before);
@@ -1569,7 +1587,7 @@ mod tests {
         let live_after_alloc = mid.live_bytes;
         let alloc_count_after = mid.live_allocations;
 
-        drop(ov);
+        drop(v);
         let after = alloc.report();
         assert_eq!(after.live_allocations, alloc_count_after - 1);
         assert!(after.live_bytes < live_after_alloc);
@@ -1581,13 +1599,13 @@ mod tests {
         let before = alloc.report();
         let peak_before = before.peak_bytes;
 
-        let mut ov = OwnedDVec::<u8>::new_in(&alloc, 32);
+        let mut v = DVec::<u8>::new_in(&alloc, 32);
         for i in 0..32u8 {
-            ov.push(i);
+            v.push(i);
         }
         let peak1 = alloc.report().peak_bytes;
         assert!(peak1 >= peak_before);
-        drop(ov);
+        drop(v);
 
         let peak2 = alloc.report().peak_bytes;
         assert!(peak2 >= peak1);
@@ -1602,14 +1620,13 @@ mod tests {
         let s: DString = String::from("hello world").into();
         assert_eq!(s.as_str(), "hello world");
         assert_eq!(s.len(), 11);
-        unsafe { dynspire_release(s.ptr) };
+        // Drop releases the buffer automatically — no manual dynspire_release.
     }
 
     #[test]
     fn dstring_from_str() {
         let s: DString = "test".into();
         assert_eq!(s.as_str(), "test");
-        unsafe { dynspire_release(s.ptr) };
     }
 
     #[test]
@@ -1618,7 +1635,6 @@ mod tests {
         let d: DVec<u32> = v.into();
         assert_eq!(d.as_slice(), &[10, 20, 30]);
         assert_eq!(d.len(), 3);
-        unsafe { dynspire_release(d.ptr as *mut u8) };
     }
 
     #[test]
@@ -1633,7 +1649,6 @@ mod tests {
     fn dvec_from_byte_slice() {
         let d: DVec<u8> = b"abc".as_slice().into();
         assert_eq!(d.as_slice(), b"abc");
-        unsafe { dynspire_release(d.ptr as *mut u8) };
     }
 
     #[test]
@@ -1647,15 +1662,12 @@ mod tests {
         assert!(a > c);
         assert_eq!(format!("{:?}", a), "\"foo\"");
 
+        // Hashing operates on the payload, not the pointer.
         let mut set = std::collections::HashSet::new();
         set.insert(a);
         assert!(set.contains(&b));
         assert!(!set.contains(&c));
-
-        unsafe {
-            dynspire_release(b.ptr);
-            dynspire_release(c.ptr);
-        }
+        // a, b, c all drop normally here.
     }
 
     #[test]
@@ -1668,11 +1680,6 @@ mod tests {
         assert_ne!(a, c);
         assert!(a < c);
         assert_eq!(format!("{:?}", a), "[1, 2, 3]");
-
-        unsafe {
-            dynspire_release(a.ptr as *mut u8);
-            dynspire_release(c.ptr as *mut u8);
-        }
     }
 
     #[test]
@@ -1680,13 +1687,11 @@ mod tests {
         let s: DString = "hello".into();
         assert!(!s.as_ptr().is_null());
         assert_eq!(s.as_bytes(), b"hello");
-        unsafe { dynspire_release(s.ptr) };
     }
 
     #[test]
     fn dvec_as_ptr() {
         let d: DVec<u8> = vec![1, 2, 3].into();
         assert!(!d.as_ptr().is_null());
-        unsafe { dynspire_release(d.ptr as *mut u8) };
     }
 }

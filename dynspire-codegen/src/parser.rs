@@ -300,38 +300,25 @@ impl Parser {
     // --- Types ---
 
     fn parse_borrow_type(&mut self) -> Result<FieldType> {
-        // We already consumed '&'
-        match self.peek() {
-            TokenKind::LBracket => {
-                // &[u8]
-                self.advance(); // [
-                self.expect_primitive("u8")?;
-                self.eat(TokenKind::RBracket)?;
-                Ok(FieldType::U8Slice)
+        // We already consumed '&'.
+        //
+        // `&T`        — shared borrow view (2-slot ptr+len wire for DTypes)
+        // `&mut T`    — mutable borrow (out-param). Currently restricted
+        //               to `&mut DVec<U>` for any element type `U`.
+        if matches!(self.peek(), TokenKind::Mut) {
+            self.advance(); // consume 'mut'
+            let inner = self.parse_type()?;
+            // Restrict mutable borrows to DVec<T> out-params.
+            if !matches!(inner, FieldType::DVec(_)) {
+                return Err(self.err(
+                    "expected `DVec<T>` after `&mut` (only DVec out-params are supported)",
+                ));
             }
-            TokenKind::Ident(s) if s == "str" => {
-                self.advance();
-                Ok(FieldType::Str)
-            }
-            TokenKind::Mut => {
-                // &mut Vec<u8>
-                self.advance(); // mut
-                let name = self.expect_ident()?;
-                if name != "Vec" {
-                    return Err(self.err(
-                        "expected `Vec<u8>` after `&mut`",
-                    ));
-                }
-                self.eat(TokenKind::Lt)?;
-                self.expect_primitive("u8")?;
-                self.eat(TokenKind::Gt)?;
-                Ok(FieldType::OutU8Vec)
-            }
-            other => Err(self.err(format!(
-                "expected `[`, `str`, or `mut` after `&`, found {}",
-                other.kind_name(),
-            ))),
+            return Ok(FieldType::RefMut(Box::new(inner)));
         }
+        // Shared borrow: parse the underlying type.
+        let inner = self.parse_type()?;
+        Ok(FieldType::Ref(Box::new(inner)))
     }
 
     fn parse_paren_type(&mut self) -> Result<FieldType> {
@@ -403,7 +390,8 @@ impl Parser {
     }
 
     /// Resolve an identifier into a FieldType.
-    /// Handles primitives, Vec<T>, Option<T>, String, and named types.
+    /// Handles primitives, DString, and named types. Rejects native Rust
+    /// types (String, str) — the IDL is language-agnostic.
     fn type_from_ident(&self, name: &str) -> FieldType {
         match name {
             "bool" => FieldType::Bool,
@@ -417,13 +405,16 @@ impl Parser {
             "i64" => FieldType::I64,
             "f32" => FieldType::F32,
             "f64" => FieldType::F64,
-            "String" => FieldType::String,
-            "DStr" => FieldType::DStr,
             "DString" => FieldType::DString,
-            "Vec" | "Option" | "DVec" | "DSlice" | "DOption" => {
+            "DVec" | "DOption" => {
                 // These need generic args, handled separately by caller.
                 // If we reach here without parsing <...>, treat as Named.
-                // This is a fallback — the proper path is parse_generic_type.
+                // This is a fallback — the proper path is parse_type.
+                FieldType::Named(name.to_string())
+            }
+            // Reject Rust-native types: the IDL is language-agnostic.
+            // Use DString / DVec<T> / DOption<T> instead.
+            "String" | "str" | "Vec" | "Option" | "DStr" | "DSlice" => {
                 FieldType::Named(name.to_string())
             }
             other => FieldType::Named(other.to_string()),
@@ -455,7 +446,7 @@ impl Parser {
 
 impl Parser {
     fn parse_type(&mut self) -> Result<FieldType> {
-        // Borrow forms: &[...], &str, &mut Vec<u8>
+        // Borrow forms: &T (shared) and &mut T (mutable/out-param).
         if *self.peek() == TokenKind::Amp {
             self.advance();
             return self.parse_borrow_type();
@@ -474,29 +465,11 @@ impl Parser {
         let name = self.expect_ident()?;
 
         match name.as_str() {
-            "Vec" => {
-                self.eat(TokenKind::Lt)?;
-                let inner = self.parse_type()?;
-                self.eat(TokenKind::Gt)?;
-                Ok(FieldType::Vec(Box::new(inner)))
-            }
-            "Option" => {
-                self.eat(TokenKind::Lt)?;
-                let inner = self.parse_type()?;
-                self.eat(TokenKind::Gt)?;
-                Ok(FieldType::Option(Box::new(inner)))
-            }
             "DVec" => {
                 self.eat(TokenKind::Lt)?;
                 let inner = self.parse_type()?;
                 self.eat(TokenKind::Gt)?;
                 Ok(FieldType::DVec(Box::new(inner)))
-            }
-            "DSlice" => {
-                self.eat(TokenKind::Lt)?;
-                let inner = self.parse_type()?;
-                self.eat(TokenKind::Gt)?;
-                Ok(FieldType::DSlice(Box::new(inner)))
             }
             "DOption" => {
                 self.eat(TokenKind::Lt)?;
@@ -504,8 +477,12 @@ impl Parser {
                 self.eat(TokenKind::Gt)?;
                 Ok(FieldType::DOption(Box::new(inner)))
             }
-            "DStr" => Ok(FieldType::DStr),
             "DString" => Ok(FieldType::DString),
+            // Native Rust types are rejected: the IDL is language-agnostic.
+            // Use DString / DVec<T> / DOption<T> instead.
+            "String" | "str" | "Vec" | "Option" | "DStr" | "DSlice" => Err(self.err(format!(
+                "native Rust type `{name}` is not allowed in the IDL; use the DynSpire managed type instead (DString / DVec<T> / DOption<T>)"
+            ))),
             other => Ok(self.type_from_ident(other)),
         }
     }
@@ -628,9 +605,11 @@ fn check_named_types(ty: &FieldType, declared: &std::collections::HashSet<&str>)
             }
             Ok(())
         }
-        FieldType::Vec(inner) | FieldType::Option(inner) | FieldType::Array(inner, _) => {
-            check_named_types(inner, declared)
-        }
+        FieldType::DVec(inner)
+        | FieldType::DOption(inner)
+        | FieldType::Ref(inner)
+        | FieldType::RefMut(inner)
+        | FieldType::Array(inner, _) => check_named_types(inner, declared),
         FieldType::Tuple(elems) => {
             for e in elems {
                 check_named_types(e, declared)?;
@@ -664,18 +643,18 @@ interface Rle {
     Loud(u8),
   }
 
-  fn compress(data: &[u8]) -> Vec<u8>;
-  fn decompress(data: &[u8]) -> Vec<u8>;
-  fn compress_into(data: &[u8], out: &mut Vec<u8>) -> ();
-  fn stats(data: &[u8]) -> (u64, u64);
-  fn analyze(data: &[u8]) -> CompressionReport;
-  fn report_summary(report: CompressionReport) -> String;
-  fn run_labels(data: &[u8]) -> Vec<String>;
-  fn split_runs(data: &[u8]) -> Vec<Vec<u8>>;
-  fn compress_into_checked(data: &[u8], out: &mut Vec<u8>) -> bool;
-  fn first_byte(data: &[u8]) -> Option<u8>;
-  fn classify(data: &[u8]) -> Tone;
-  fn describe_tone(tone: Tone) -> String;
+  fn compress(data: &DVec<u8>) -> DVec<u8>;
+  fn decompress(data: &DVec<u8>) -> DVec<u8>;
+  fn compress_into(data: &DVec<u8>, out: &mut DVec<u8>) -> ();
+  fn stats(data: &DVec<u8>) -> (u64, u64);
+  fn analyze(data: &DVec<u8>) -> CompressionReport;
+  fn report_summary(report: CompressionReport) -> DString;
+  fn run_labels(data: &DVec<u8>) -> DVec<DString>;
+  fn split_runs(data: &DVec<u8>) -> DVec<DVec<u8>>;
+  fn compress_into_checked(data: &DVec<u8>, out: &mut DVec<u8>) -> bool;
+  fn first_byte(data: &DVec<u8>) -> DOption<u8>;
+  fn classify(data: &DVec<u8>) -> Tone;
+  fn describe_tone(tone: Tone) -> DString;
   fn delay(ms: u64) -> ();
 }
 "#;
@@ -722,17 +701,26 @@ interface Rle {
     fn test_method_types() {
         let iface = parse(RLE_DSPI).unwrap();
 
-        // compress(data: &[u8]) -> Vec<u8>
+        // compress(data: &DVec<u8>) -> DVec<u8>
         let compress = &iface.methods[0];
         assert_eq!(compress.name, "compress");
         assert_eq!(compress.params[0].name, "data");
-        assert_eq!(compress.params[0].ty, FieldType::U8Slice);
-        assert_eq!(compress.return_type, FieldType::Vec(Box::new(FieldType::U8)));
+        assert_eq!(
+            compress.params[0].ty,
+            FieldType::Ref(Box::new(FieldType::DVec(Box::new(FieldType::U8))))
+        );
+        assert_eq!(
+            compress.return_type,
+            FieldType::DVec(Box::new(FieldType::U8))
+        );
 
-        // compress_into(data: &[u8], out: &mut Vec<u8>) -> ()
+        // compress_into(data: &DVec<u8>, out: &mut DVec<u8>) -> ()
         let compress_into = &iface.methods[2];
         assert_eq!(compress_into.params[1].name, "out");
-        assert_eq!(compress_into.params[1].ty, FieldType::OutU8Vec);
+        assert_eq!(
+            compress_into.params[1].ty,
+            FieldType::RefMut(Box::new(FieldType::DVec(Box::new(FieldType::U8))))
+        );
         assert_eq!(compress_into.return_type, FieldType::Unit);
 
         // stats -> (u64, u64)
@@ -742,34 +730,32 @@ interface Rle {
             FieldType::Tuple(vec![FieldType::U64, FieldType::U64]),
         );
 
-        // first_byte -> Option<u8>
+        // first_byte -> DOption<u8>
         let first_byte = &iface.methods[9];
         assert_eq!(
             first_byte.return_type,
-            FieldType::Option(Box::new(FieldType::U8)),
+            FieldType::DOption(Box::new(FieldType::U8)),
         );
 
         // classify -> Tone (named)
         let classify = &iface.methods[10];
         assert_eq!(classify.return_type, FieldType::Named("Tone".into()));
 
-        // split_runs -> Vec<Vec<u8>>
+        // split_runs -> DVec<DVec<u8>>
         let split = &iface.methods[7];
         assert_eq!(
             split.return_type,
-            FieldType::Vec(Box::new(FieldType::Vec(Box::new(FieldType::U8)))),
+            FieldType::DVec(Box::new(FieldType::DVec(Box::new(FieldType::U8)))),
         );
     }
 
     #[test]
     fn test_dtype_parsing() {
         let src = "interface Foo {
-            fn echo(data: &[u8]) -> DVec<u8>;
+            fn echo(data: &DVec<u8>) -> DVec<u8>;
             fn consume(v: DVec<u8>) -> u64;
-            fn take_str(s: DStr) -> u64;
-            fn take_slice(s: DSlice<u8>) -> u64;
-            fn make_str(s: &[u8]) -> DString;
-            fn probe(x: &[u8]) -> DOption<u8>;
+            fn make_str(s: &DVec<u8>) -> DString;
+            fn probe(x: &DVec<u8>) -> DOption<u8>;
         }";
         let iface = parse(src).unwrap();
 
@@ -778,22 +764,21 @@ interface Rle {
             echo.return_type,
             FieldType::DVec(Box::new(FieldType::U8))
         );
+        assert_eq!(
+            echo.params[0].ty,
+            FieldType::Ref(Box::new(FieldType::DVec(Box::new(FieldType::U8))))
+        );
         let consume = &iface.methods[1];
         assert_eq!(
             consume.params[0].ty,
             FieldType::DVec(Box::new(FieldType::U8))
         );
-        assert_eq!(iface.methods[2].params[0].ty, FieldType::DStr);
         assert_eq!(
-            iface.methods[3].params[0].ty,
-            FieldType::DSlice(Box::new(FieldType::U8))
-        );
-        assert_eq!(
-            iface.methods[4].return_type,
+            iface.methods[2].return_type,
             FieldType::DString
         );
         assert_eq!(
-            iface.methods[5].return_type,
+            iface.methods[3].return_type,
             FieldType::DOption(Box::new(FieldType::U8))
         );
     }
@@ -802,8 +787,8 @@ interface Rle {
     fn test_canonical_sig() {        let iface = parse(RLE_DSPI).unwrap();
         let sig = iface.canonical_sig();
         assert!(sig.starts_with("Rle|"));
-        assert!(sig.contains("compress(&[u8])->Vec<u8>"));
-        assert!(sig.contains("stats(&[u8])->(u64,u64)"));
+        assert!(sig.contains("compress(&DVec<u8>)->DVec<u8>"));
+        assert!(sig.contains("stats(&DVec<u8>)->(u64,u64)"));
     }
 
     #[test]
@@ -847,15 +832,46 @@ interface Rle {
     }
 
     #[test]
-    fn test_unknown_type_in_borrow() {
-        let err = parse("interface Foo { fn a(x: &[u32]) -> (); }").unwrap_err();
-        assert!(err.msg.contains("`u8`"));
+    fn test_native_types_rejected() {
+        // Native Rust types are not allowed in the language-agnostic IDL.
+        let err = parse("interface Foo { fn a(x: String) -> (); }").unwrap_err();
+        assert!(err.msg.contains("not allowed in the IDL"));
+        let err = parse("interface Foo { fn a(x: Vec<u8>) -> (); }").unwrap_err();
+        assert!(err.msg.contains("not allowed in the IDL"));
+        let err = parse("interface Foo { fn a(x: Option<u8>) -> (); }").unwrap_err();
+        assert!(err.msg.contains("not allowed in the IDL"));
+        let err = parse("interface Foo { fn a(x: str) -> (); }").unwrap_err();
+        assert!(err.msg.contains("not allowed in the IDL"));
     }
 
     #[test]
-    fn test_invalid_outvec() {
-        let err = parse("interface Foo { fn a(x: &mut Vec<u32>) -> (); }").unwrap_err();
-        assert!(err.msg.contains("`Vec<u8>`") || err.msg.contains("`u8`"));
+    fn test_refmut_only_dvec_allowed() {
+        // &mut DVec<T> is the only valid mutable borrow form.
+        let iface = parse("interface Foo { fn a(x: &mut DVec<u8>) -> (); }").unwrap();
+        assert_eq!(
+            iface.methods[0].params[0].ty,
+            FieldType::RefMut(Box::new(FieldType::DVec(Box::new(FieldType::U8))))
+        );
+        // &mut DString should error.
+        let err = parse("interface Foo { fn a(x: &mut DString) -> (); }").unwrap_err();
+        assert!(err.msg.contains("expected `DVec<T>` after `&mut`"));
+    }
+
+    #[test]
+    fn test_ref_borrow_views() {
+        // &T produces a Ref variant — the wire format is determined by the
+        // codegen (2-slot ptr+len for DTypes).
+        let iface = parse("interface Foo {
+            fn a(d: &DVec<u8>, s: &DString) -> ();
+        }").unwrap();
+        assert_eq!(
+            iface.methods[0].params[0].ty,
+            FieldType::Ref(Box::new(FieldType::DVec(Box::new(FieldType::U8))))
+        );
+        assert_eq!(
+            iface.methods[0].params[1].ty,
+            FieldType::Ref(Box::new(FieldType::DString))
+        );
     }
 
     #[test]
@@ -887,21 +903,17 @@ interface Rle {
     #[test]
     fn test_nested_generics() {
         let src = "interface Foo {
-            fn a(x: Vec<Option<Vec<u8>>>) -> Vec<Vec<Vec<u8>>>;
+            fn a(x: DOption<DVec<u8>>) -> DVec<DVec<u8>>;
         }";
         let iface = parse(src).unwrap();
         let m = &iface.methods[0];
         assert_eq!(
             m.params[0].ty,
-            FieldType::Vec(Box::new(FieldType::Option(Box::new(
-                FieldType::Vec(Box::new(FieldType::U8))
-            )))),
+            FieldType::DOption(Box::new(FieldType::DVec(Box::new(FieldType::U8)))),
         );
         assert_eq!(
             m.return_type,
-            FieldType::Vec(Box::new(FieldType::Vec(Box::new(
-                FieldType::Vec(Box::new(FieldType::U8))
-            )))),
+            FieldType::DVec(Box::new(FieldType::DVec(Box::new(FieldType::U8)))),
         );
     }
 
@@ -930,8 +942,8 @@ interface Rle {
     }
 
     #[test]
-    fn test_undeclared_type_in_vec() {
-        let iface = parse("interface Foo { fn a() -> Vec<MissingType>; }").unwrap();
+    fn test_undeclared_type_in_dvec() {
+        let iface = parse("interface Foo { fn a() -> DVec<MissingType>; }").unwrap();
         let err = validate(&iface).unwrap_err();
         assert!(err.msg.contains("undeclared type reference: MissingType"));
     }
@@ -988,7 +1000,7 @@ interface Rle {
     fn test_type_fragment_basic() {
         let src = r#"
             opaque struct Handle;
-            struct Config { path: String, }
+            struct Config { path: DString, }
             enum Status { Ok, Err(u32), }
         "#;
         let (types, includes) = parse_type_fragment(src).unwrap();

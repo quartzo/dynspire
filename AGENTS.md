@@ -55,3 +55,42 @@ dynspire-codegen/ ← .dspi → .rs
 | `#[spier_storage]` proc macro | Absorbed into `impl_{name}_spier!` |
 | Handwritten tower wrapper | Generated `DynSpire{Name}` struct |
 | PyO3 runtime reflection | Codegen-emitted typed Python (`.py`) via `build_python()` |
+
+### The IDL is language-agnostic — only DTypes cross the boundary
+
+The `.dspi` grammar accepts **only** DynSpire managed types, primitives,
+tuples, arrays, and named (user-declared) types. Native Rust types
+(`String`, `Vec<T>`, `Option<T>`, `&str`, `&[u8]`, `&mut Vec<u8>`) are
+**rejected at parse time** — the IDL is the contract, not a Rust mirror.
+
+The closed set of managed types:
+
+- `DString` — owned, RC-aware string (`{allocator, ptr, len, cap}`).
+- `DVec<T>` — owned, RC-aware vec of `T: ReprC`.
+- `DOption<T>` — managed optional (`{tag, _pad, value}`).
+- `&T` — shared borrow view. For `&DString` the Rust decode produces a
+  `DStr` (ptr+len); for `&DVec<T>` it produces a `DSlice<T>` (ptr+len).
+  Wire format: 2 slots.
+- `&mut DVec<T>` — mutable borrow (out-param). Generalizes the old
+  `&mut Vec<u8>` to any element type. Wire format: 1 slot (raw ptr).
+
+Borrow semantics (`&` / `&mut`) are **orthogonal** to the underlying
+type. The DTypes (`DString` / `DVec<T>`) carry the memory ownership
+strategy; the `&` / `&mut` operators express the borrow mode for the
+duration of a single call.
+
+### RC-aware owned types — no separate "guard" wrappers
+
+`DVec<T>` and `DString` are **RC-aware**: `Clone` retains (calls
+`dynspire_retain`), `Drop` releases (calls `dynspire_release`). The
+backing buffer is freed exactly once when the last clone drops. There
+is **no** `OwnedDVec` / `OwnedDString` wrapper anymore — the same type
+is used for input, output, and across the FFI boundary.
+
+FFI handoff uses `DVec::into_raw(self) -> Self` (forgets the Drop) on
+the spier side and `DVec::from_raw(raw)` on the host side. The wire
+format is the raw `repr(C)` struct (4 slots: allocator, ptr, len, cap).
+
+Mutation methods (`push`, `resize`) require single ownership
+(refcount == 1); they panic in debug builds if the buffer is shared.
+This matches the "no direct mutation when shared" rule of `Rc::get_mut`.

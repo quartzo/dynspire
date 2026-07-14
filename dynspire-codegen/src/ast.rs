@@ -82,6 +82,12 @@ pub struct Param {
 /// field. Each variant maps 1:1 to a slot encoding strategy in the runtime.
 ///
 /// **Not** an open Rust type system — the grammar is closed.
+///
+/// The IDL is **language-agnostic**: only DynSpire managed types (`D*`),
+/// primitives, tuples, arrays, and named types cross the boundary. Borrow
+/// semantics (`&T` for shared views, `&mut T` for out-params) are
+/// orthogonal to the underlying type via [`FieldType::Ref`] /
+/// [`FieldType::RefMut`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum FieldType {
     Unit,
@@ -96,28 +102,22 @@ pub enum FieldType {
     I64,
     F32,
     F64,
-    /// `&str` — zero-copy borrow (ptr, len).
-    Str,
-    /// `&[u8]` — zero-copy borrow (ptr, len).
-    U8Slice,
-    /// `&mut Vec<u8>` — out-param (raw ptr to caller's Vec).
-    OutU8Vec,
-    /// Owned `String`.
-    String,
-    /// Owned `Vec<T>`.
-    Vec(Box<FieldType>),
-    /// `Option<T>`.
-    Option(Box<FieldType>),
-    /// `DStr` — non-owning view (`dynspire::managed::DStr`). Zero-copy.
-    DStr,
-    /// `DSlice<T>` — non-owning view (`dynspire::managed::DSlice<T>`). Zero-copy.
-    DSlice(Box<FieldType>),
-    /// `DString` — owned managed string (`dynspire::managed::DString`).
+    /// Owned managed string (`dynspire::managed::DString`). RC-aware.
     DString,
-    /// `DVec<T>` — owned managed vec (`dynspire::managed::DVec<T>`).
+    /// Owned managed vec (`dynspire::managed::DVec<T>`). RC-aware.
     DVec(Box<FieldType>),
-    /// `DOption<T>` — managed option (`dynspire::managed::DOption<T>`).
+    /// Managed option (`dynspire::managed::DOption<T>`).
     DOption(Box<FieldType>),
+    /// `&T` — shared borrow view. Wire format: 2 slots `(ptr, len)` when
+    /// `T` is `DString` / `DVec<_>` (zero-copy view of the underlying
+    /// buffer); for primitives/named types the codegen emits the same
+    /// wire as a pass-by-value (the borrow is a Rust-side hint).
+    Ref(Box<FieldType>),
+    /// `&mut T` — mutable borrow (out-param). The caller owns `T` and
+    /// the callee fills it via realloc/copy-back through the host
+    /// allocator. Generalizes the previous `&mut Vec<u8>` to any
+    /// `&mut DVec<T>` (and potentially `&mut DString`).
+    RefMut(Box<FieldType>),
     /// `(A, B, C)` — 2+ elements only.
     Tuple(Vec<FieldType>),
     /// `[u8; N]` — fixed-size byte array.
@@ -142,17 +142,11 @@ impl FieldType {
             FieldType::I64 => "i64".into(),
             FieldType::F32 => "f32".into(),
             FieldType::F64 => "f64".into(),
-            FieldType::Str => "&str".into(),
-            FieldType::U8Slice => "&[u8]".into(),
-            FieldType::OutU8Vec => "&mut Vec<u8>".into(),
-            FieldType::String => "String".into(),
-            FieldType::Vec(t) => format!("Vec<{}>", t.canonical()),
-            FieldType::Option(t) => format!("Option<{}>", t.canonical()),
-            FieldType::DStr => "DStr".into(),
-            FieldType::DSlice(t) => format!("DSlice<{}>", t.canonical()),
             FieldType::DString => "DString".into(),
             FieldType::DVec(t) => format!("DVec<{}>", t.canonical()),
             FieldType::DOption(t) => format!("DOption<{}>", t.canonical()),
+            FieldType::Ref(t) => format!("&{}", t.canonical()),
+            FieldType::RefMut(t) => format!("&mut {}", t.canonical()),
             FieldType::Tuple(ts) => {
                 let parts: Vec<String> = ts.iter().map(|t| t.canonical()).collect();
                 format!("({})", parts.join(","))
@@ -163,11 +157,9 @@ impl FieldType {
     }
 
     /// Rust source type for a **by-value** appearance of this type (struct
-    /// fields, and DType inputs, which are non-owning `Copy` views).
+    /// fields, and DType inputs, which are RC-aware but passed by value).
     pub fn rust_value_type(&self) -> String {
         match self {
-            FieldType::DStr => "dynspire::managed::DStr".into(),
-            FieldType::DSlice(t) => format!("dynspire::managed::DSlice<{}>", t.rust_type()),
             FieldType::DString => "dynspire::managed::DString".into(),
             FieldType::DVec(t) => format!("dynspire::managed::DVec<{}>", t.rust_type()),
             FieldType::DOption(t) => format!("dynspire::managed::DOption<{}>", t.rust_type()),
@@ -175,27 +167,39 @@ impl FieldType {
         }
     }
 
-    /// Rust source type for a method **input parameter**. DTypes are passed
-    /// by value as `Copy` views (the spier reads them without releasing).
+    /// Rust source type for a method **input parameter**. Owned DTypes are
+    /// passed by value (the receiver takes implicit ownership of the RC
+    /// slot); borrowed types (`Ref`/`RefMut`) use the corresponding view
+    /// types — `&DVec<T>` in the IDL becomes `DSlice<T>` in Rust (a
+    /// 2-field ptr+len view), `&DString` becomes `DStr`, and `&mut DVec<T>`
+    /// becomes `&mut DVec<T>` (mutable borrow for out-params).
     pub fn rust_input_type(&self) -> String {
-        self.rust_value_type()
-    }
-
-    /// Rust source type for a method **return value**. Owned `DVec`/`DString`
-    /// are wrapped in an `OwnedDVec`/`OwnedDString` guard so the receiver
-    /// releases the buffer exactly once; views/inline DTypes are returned by
-    /// value.
-    pub fn rust_output_type(&self) -> String {
         match self {
-            FieldType::DVec(t) => format!("dynspire::managed::OwnedDVec<{}>", t.rust_type()),
-            FieldType::DString => "dynspire::managed::OwnedDString".into(),
+            // `&DVec<T>` IDL → DSlice<T> in Rust (view type, no allocator).
+            FieldType::Ref(inner) => match inner.as_ref() {
+                FieldType::DString => "dynspire::managed::DStr".into(),
+                FieldType::DVec(elem) => {
+                    format!("dynspire::managed::DSlice<{}>", elem.rust_type())
+                }
+                other => other.rust_value_type(),
+            },
+            FieldType::RefMut(inner) => format!("&mut {}", inner.rust_value_type()),
             other => other.rust_value_type(),
         }
     }
 
-    /// Whether this return type is wrapped in an owning guard (`OwnedDVec` /
-    /// `OwnedDString`) on the spier side, requiring `into_raw` before writing
-    /// slots.
+    /// Rust source type for a method **return value**. Owned DTypes
+    /// (`DVec`/`DString`) are returned by value — the type's own `Drop`
+    /// releases the buffer when the receiver lets it go out of scope.
+    pub fn rust_output_type(&self) -> String {
+        self.rust_value_type()
+    }
+
+    /// Whether this return type is wrapped in an owning guard on the spier
+    /// side, requiring `into_raw` before writing slots. After the
+    /// `OwnedDVec`/`OwnedDString` elimination, `DVec`/`DString` themselves
+    /// are RC-aware — `into_raw` lives on the type directly. This helper
+    /// flags returns that need the `into_raw` step in the codegen.
     pub fn is_guarded_return(&self) -> bool {
         matches!(self, FieldType::DVec(_) | FieldType::DString)
     }
@@ -215,17 +219,20 @@ impl FieldType {
             FieldType::I64 => "i64".into(),
             FieldType::F32 => "f32".into(),
             FieldType::F64 => "f64".into(),
-            FieldType::Str => "&str".into(),
-            FieldType::U8Slice => "&[u8]".into(),
-            FieldType::OutU8Vec => "&mut Vec<u8>".into(),
-            FieldType::String => "String".into(),
-            FieldType::Vec(t) => format!("Vec<{}>", t.rust_type()),
-            FieldType::Option(t) => format!("Option<{}>", t.rust_type()),
-            FieldType::DStr => "dynspire::managed::DStr".into(),
-            FieldType::DSlice(t) => format!("dynspire::managed::DSlice<{}>", t.rust_type()),
             FieldType::DString => "dynspire::managed::DString".into(),
             FieldType::DVec(t) => format!("dynspire::managed::DVec<{}>", t.rust_type()),
             FieldType::DOption(t) => format!("dynspire::managed::DOption<{}>", t.rust_type()),
+            // `&T` (IDL borrow) maps to the view type in Rust: DSlice<T> for
+            // `&DVec<T>`, DStr for `&DString`. For primitives/named types it
+            // recurses on the inner (the borrow is just a Rust hint).
+            FieldType::Ref(t) => match t.as_ref() {
+                FieldType::DString => "dynspire::managed::DStr".into(),
+                FieldType::DVec(elem) => {
+                    format!("dynspire::managed::DSlice<{}>", elem.rust_type())
+                }
+                other => other.rust_type(),
+            },
+            FieldType::RefMut(t) => format!("&mut {}", t.rust_type()),
             FieldType::Tuple(ts) => {
                 let parts: Vec<String> = ts.iter().map(|t| t.rust_type()).collect();
                 format!("({})", parts.join(", "))
@@ -238,29 +245,20 @@ impl FieldType {
     /// Whether this type is passed by reference (borrow) as an input parameter.
     /// The spier decode path differs for borrows vs owned.
     pub fn is_borrow(&self) -> bool {
-        matches!(
-            self,
-            FieldType::Str | FieldType::U8Slice | FieldType::OutU8Vec | FieldType::DStr | FieldType::DSlice(_)
-        )
+        matches!(self, FieldType::Ref(_) | FieldType::RefMut(_))
     }
 
     /// Rust source type for a **struct/enum field** in `repr(C)` layout.
-    /// Translates IDL types to their C-stable DType equivalents:
-    /// `String` → `DString`, `Vec<T>` → `DVec<T>`, `Option<T>` → `DOption<T>`,
-    /// `&str` → `DStr`, `&[u8]` → `DSlice<u8>`. Primitives and named types
-    /// pass through unchanged.
+    /// DTypes map to their C-stable managed equivalents; primitives and
+    /// named types pass through unchanged. Borrow types are not allowed
+    /// as struct fields (validated elsewhere).
     pub fn rust_field_type(&self) -> String {
         match self {
-            FieldType::String => "dynspire::managed::DString".into(),
-            FieldType::Vec(inner) => format!("dynspire::managed::DVec<{}>", inner.rust_field_type()),
-            FieldType::Option(inner) => format!("dynspire::managed::DOption<{}>", inner.rust_field_type()),
-            FieldType::Str => "dynspire::managed::DStr".into(),
-            FieldType::U8Slice => "dynspire::managed::DSlice<u8>".into(),
-            FieldType::DStr => "dynspire::managed::DStr".into(),
-            FieldType::DSlice(inner) => format!("dynspire::managed::DSlice<{}>", inner.rust_field_type()),
             FieldType::DString => "dynspire::managed::DString".into(),
             FieldType::DVec(inner) => format!("dynspire::managed::DVec<{}>", inner.rust_field_type()),
-            FieldType::DOption(inner) => format!("dynspire::managed::DOption<{}>", inner.rust_field_type()),
+            FieldType::DOption(inner) => {
+                format!("dynspire::managed::DOption<{}>", inner.rust_field_type())
+            }
             other => other.rust_type(),
         }
     }
@@ -269,30 +267,18 @@ impl FieldType {
     /// buffers that require a `drop_fn` to release.  True for `DString`,
     /// `DVec<T>`, and for any struct/enum containing them.
     pub fn has_dynamic_fields(&self) -> bool {
-        matches!(
-            self,
-            FieldType::DString | FieldType::DVec(_)
-        )
+        matches!(self, FieldType::DString | FieldType::DVec(_))
     }
 
     /// Convert an IDL type to its C-stable DType equivalent at the AST level.
     ///
-    /// Mirrors [`rust_field_type`]: `String` → `DString`, `Vec<T>` →
-    /// `DVec<T>`, `Option<T>` → `DOption<T>`, `&str` → `DStr`, `&[u8]` →
-    /// `DSlice<u8>`. Existing DTypes pass through unchanged (with recursive
-    /// inner conversion). Used by enum variant codecs to ensure reader/writer
-    /// functions use the same DType wire format as `rust_field_type` produces
-    /// in the enum definition.
+    /// After the native-type elimination, the IDL is already expressed in
+    /// DTypes — this function is now an identity for the wire-format
+    /// types (DString/DVec/DOption). Used by enum variant codecs to ensure
+    /// reader/writer functions use the same DType wire format as
+    /// `rust_field_type` produces in the enum definition.
     pub fn to_field_dtype(&self) -> FieldType {
         match self {
-            FieldType::String => FieldType::DString,
-            FieldType::Vec(inner) => FieldType::DVec(Box::new(inner.to_field_dtype())),
-            FieldType::Option(inner) => FieldType::DOption(Box::new(inner.to_field_dtype())),
-            FieldType::Str => FieldType::DStr,
-            FieldType::U8Slice => FieldType::DSlice(Box::new(FieldType::U8)),
-            FieldType::DStr => FieldType::DStr,
-            FieldType::DSlice(inner) => FieldType::DSlice(Box::new(inner.to_field_dtype())),
-            FieldType::DString => FieldType::DString,
             FieldType::DVec(inner) => FieldType::DVec(Box::new(inner.to_field_dtype())),
             FieldType::DOption(inner) => FieldType::DOption(Box::new(inner.to_field_dtype())),
             other => other.clone(),

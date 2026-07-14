@@ -218,25 +218,24 @@ fn gen_write_encode(ft: &FieldType, expr: &str, w: &str, types: &[TypeDecl]) -> 
         FieldType::I64 => format!("{w}.write_u64({expr} as u64);"),
         FieldType::F32 => format!("{w}.write_u64({expr}.to_bits() as u64);"),
         FieldType::F64 => format!("{w}.write_u64({expr}.to_bits());"),
-        FieldType::Str | FieldType::U8Slice => {
-            format!("{w}.write_u64({expr}.as_ptr() as u64); {w}.write_u64({expr}.len() as u64);")
-        }
-        FieldType::OutU8Vec => {
+        // Shared borrow of a DType: emit 2-slot (ptr, len) view. The
+        // underlying value's `as_ptr()` and `.len` are accessed via
+        // deref to the inner DType.
+        FieldType::Ref(inner) => match inner.as_ref() {
+            FieldType::DString => format!(
+                "{w}.write_u64(({expr}).ptr as u64); {w}.write_u64(({expr}).len as u64);"
+            ),
+            FieldType::DVec(_) => format!(
+                "{w}.write_u64(({expr}).ptr as u64); {w}.write_u64(({expr}).len as u64);"
+            ),
+            // For primitives/named, the borrow is a no-op at the wire level
+            // (the value is still passed inline). Recurse on the inner.
+            other => gen_write_encode(other, expr, w, types),
+        },
+        // Mutable borrow (out-param): write the address of the caller's
+        // DVec<T>. The spier reallocs / fills it via the host allocator.
+        FieldType::RefMut(_) => {
             format!("{w}.write_u64(core::ptr::addr_of!(*{expr}) as u64);")
-        }
-        FieldType::String => {
-            format!("{w}.write_u64({expr}.as_ptr() as u64); {w}.write_u64({expr}.len() as u64);")
-        }
-        FieldType::Vec(_) => {
-            format!("{w}.write_u64({expr}.as_ptr() as u64); {w}.write_u64({expr}.len() as u64);")
-        }
-        FieldType::Option(inner) => {
-            let some = gen_write_encode(inner, "__v", w, types);
-            if some.is_empty() {
-                format!("if {expr}.is_some() {{ {w}.write_u64(1); }} else {{ {w}.write_u64(0); }}")
-            } else {
-                format!("if let Some(__v) = {expr} {{ {w}.write_u64(1); {some} }} else {{ {w}.write_u64(0); }}")
-            }
         }
         FieldType::Tuple(elems) => {
             let mut s = String::new();
@@ -263,9 +262,6 @@ fn gen_write_encode(ft: &FieldType, expr: &str, w: &str, types: &[TypeDecl]) -> 
                 }
                 s
             }
-        }
-        FieldType::DStr | FieldType::DSlice(_) => {
-            format!("{w}.write_u64({expr}.ptr as u64); {w}.write_u64({expr}.len as u64);")
         }
         FieldType::DString => {
             format!(
@@ -313,83 +309,15 @@ fn gen_write_return(ft: &FieldType, expr: &str, w: &str, types: &[TypeDecl]) -> 
         FieldType::I64 => format!("{w}.write_u64({expr} as u64);"),
         FieldType::F32 => format!("{w}.write_u64({expr}.to_bits() as u64);"),
         FieldType::F64 => format!("{w}.write_u64({expr}.to_bits());"),
-        FieldType::Str | FieldType::U8Slice | FieldType::OutU8Vec => {
-            gen_write_encode(ft, expr, w, types)
-        }
-        FieldType::String => format!(
-            "if {expr}.is_empty() {{ {w}.write_u64(0); {w}.write_u64(0); }} else {{ \
-             let __len = {expr}.len(); \
-             let __data = dynspire::managed::dynspire_alloc(__alloc, __len, 1); \
-             if __data.is_null() {{ {w}.write_u64(0); {w}.write_u64(0); }} else {{ \
-             core::ptr::copy_nonoverlapping({expr}.as_ptr(), __data, __len); \
-             {w}.write_u64(__data as u64); \
-             {w}.write_u64(__len as u64); }} }}"
-        ),
-        FieldType::Vec(inner) => {
-            let rt = inner.rust_type();
-            match inner.as_ref() {
-                // Vec<String>: deep-copy each string as (ptr, len) pairs
-                FieldType::String => format!(
-                    "if {expr}.is_empty() {{ {w}.write_u64(0); {w}.write_u64(0); }} else {{ \
-                     let __len = {expr}.len(); \
-                     let __nbytes = __len * 16; \
-                     let __data = dynspire::managed::dynspire_alloc(__alloc, __nbytes, 8); \
-                     if __data.is_null() {{ {w}.write_u64(0); {w}.write_u64(0); }} else {{ \
-                     let __slots = __data as *mut u64; \
-                     for (__i, __s) in {expr}.iter().enumerate() {{ \
-                         if __s.is_empty() {{ *__slots.add(__i * 2) = 0; *__slots.add(__i * 2 + 1) = 0; }} \
-                         else {{ let __slen = __s.len(); \
-                         let __sdata = dynspire::managed::dynspire_alloc(__alloc, __slen, 1); \
-                         if __sdata.is_null() {{ *__slots.add(__i * 2) = 0; *__slots.add(__i * 2 + 1) = 0; }} \
-                         else {{ core::ptr::copy_nonoverlapping(__s.as_ptr(), __sdata, __slen); \
-                         *__slots.add(__i * 2) = __sdata as u64; *__slots.add(__i * 2 + 1) = __slen as u64; }} }} }} \
-                     {w}.write_u64(__data as u64); \
-                     {w}.write_u64(__len as u64); }} }}"
-                ),
-                // Vec<Vec<T>>: deep-copy each inner vec as (ptr, len) pairs
-                FieldType::Vec(b) => {
-                    let bt = b.rust_type();
-                    format!(
-                        "if {expr}.is_empty() {{ {w}.write_u64(0); {w}.write_u64(0); }} else {{ \
-                         let __len = {expr}.len(); \
-                         let __nbytes = __len * 16; \
-                         let __data = dynspire::managed::dynspire_alloc(__alloc, __nbytes, 8); \
-                         if __data.is_null() {{ {w}.write_u64(0); {w}.write_u64(0); }} else {{ \
-                         let __slots = __data as *mut u64; \
-                         for (__i, __v) in {expr}.iter().enumerate() {{ \
-                             if __v.is_empty() {{ *__slots.add(__i * 2) = 0; *__slots.add(__i * 2 + 1) = 0; }} \
-                             else {{ let __vlen = __v.len(); \
-                             let __vnbytes = __vlen * core::mem::size_of::<{bt}>(); \
-                             let __vdata = dynspire::managed::dynspire_alloc(__alloc, __vnbytes, core::mem::align_of::<{bt}>()); \
-                             if __vdata.is_null() {{ *__slots.add(__i * 2) = 0; *__slots.add(__i * 2 + 1) = 0; }} \
-                             else {{ core::ptr::copy_nonoverlapping(__v.as_ptr() as *const u8, __vdata, __vnbytes); \
-                             *__slots.add(__i * 2) = __vdata as u64; *__slots.add(__i * 2 + 1) = __vlen as u64; }} }} }} \
-                         {w}.write_u64(__data as u64); \
-                         {w}.write_u64(__len as u64); }} }}"
-                    )
-                }
-                // Vec<primitive>: bitmap copy (works for Copy types)
-                _ => format!(
-                    "if {expr}.is_empty() {{ {w}.write_u64(0); {w}.write_u64(0); }} else {{ \
-                     let __len = {expr}.len(); \
-                     let __nbytes = __len * core::mem::size_of::<{rt}>(); \
-                     let __data = dynspire::managed::dynspire_alloc(__alloc, __nbytes, core::mem::align_of::<{rt}>()); \
-                     if __data.is_null() {{ {w}.write_u64(0); {w}.write_u64(0); }} else {{ \
-                     core::ptr::copy_nonoverlapping({expr}.as_ptr() as *const u8, __data, __nbytes); \
-                     {w}.write_u64(__data as u64); \
-                     {w}.write_u64(__len as u64); }} }}"
-                ),
-            }
-        }
-        FieldType::DStr => format!(
-            "{w}.write_u64({expr}.ptr as u64); {w}.write_u64({expr}.len as u64);"
-        ),
-        FieldType::DSlice(inner) => {
-            let rt = inner.rust_type();
-            format!(
-                "{w}.write_u64({expr}.ptr as *const {rt} as u64); {w}.write_u64({expr}.len as u64);"
-            )
-        }
+        // `&T` as a return type is unusual — for DTypes, emit the same
+        // 2-slot (ptr, len) view as in gen_write_encode. The caller must
+        // keep the underlying buffer alive for the receiver's duration.
+        FieldType::Ref(inner) => match inner.as_ref() {
+            FieldType::DString | FieldType::DVec(_) => format!(
+                "{w}.write_u64({expr}.ptr as u64); {w}.write_u64({expr}.len as u64);"
+            ),
+            other => gen_write_return(other, expr, w, types),
+        },
         FieldType::DString => format!(
             "{w}.write_u64({expr}.allocator as u64); {w}.write_u64({expr}.ptr as u64); \
              {w}.write_u64({expr}.len as u64); {w}.write_u64({expr}.cap as u64);"
@@ -405,14 +333,6 @@ fn gen_write_return(ft: &FieldType, expr: &str, w: &str, types: &[TypeDecl]) -> 
             format!(
                 "if {expr}.tag == 0 {{ {w}.write_u64(0); }} else {{ let __v = {expr}.value; {w}.write_u64(1); {some} }}"
             )
-        }
-        FieldType::Option(inner) => {
-            let some = gen_write_return(inner, "__v", w, types);
-            if some.is_empty() {
-                format!("if {expr}.is_some() {{ {w}.write_u64(1); }} else {{ {w}.write_u64(0); }}")
-            } else {
-                format!("if let Some(__v) = {expr} {{ {w}.write_u64(1); {some} }} else {{ {w}.write_u64(0); }}")
-            }
         }
         FieldType::Tuple(elems) => {
             let mut s = String::new();
@@ -450,6 +370,8 @@ fn gen_write_return(ft: &FieldType, expr: &str, w: &str, types: &[TypeDecl]) -> 
                 TypeDecl::Enum(e) => gen_write_enum_return(e, expr, w, types),
             }
         }
+        // RefMut as a return type is not valid (out-params are input-only).
+        FieldType::RefMut(_) => panic!("RefMut cannot appear as a return type"),
     }
 }
 
@@ -468,39 +390,25 @@ fn gen_read_decode(ft: &FieldType, r: &str, types: &[TypeDecl]) -> String {
         FieldType::I64 => format!("{r}.read_u64() as i64"),
         FieldType::F32 => format!("f32::from_bits({r}.read_u64() as u32)"),
         FieldType::F64 => format!("f64::from_bits({r}.read_u64())"),
-        FieldType::Str => format!(
-            "unsafe {{ let __p = {r}.read_u64() as *const u8; let __l = {r}.read_u64() as usize; \
-             if __p.is_null() || __l == 0 {{ \"\" }} \
-             else {{ core::str::from_utf8_unchecked(core::slice::from_raw_parts(__p, __l)) }} }}"
-        ),
-        FieldType::U8Slice => format!(
-            "unsafe {{ let __p = {r}.read_u64() as *const u8; let __l = {r}.read_u64() as usize; \
-             if __p.is_null() || __l == 0 {{ &[] as &[u8] }} \
-             else {{ core::slice::from_raw_parts(__p, __l) }} }}"
-        ),
-        FieldType::OutU8Vec => format!("unsafe {{ &mut *({r}.read_u64() as *mut Vec<u8>) }}"),
-        FieldType::String => format!(
-            "unsafe {{ let __p = {r}.read_u64() as *const u8; let __l = {r}.read_u64() as usize; \
-             if __p.is_null() || __l == 0 {{ String::new() }} \
-             else {{ String::from_utf8_unchecked(core::slice::from_raw_parts(__p, __l).to_vec()) }} }}"
-        ),
-        FieldType::Vec(inner) => {
-            let rt = inner.rust_type();
-            format!(
-                "unsafe {{ let __p = {r}.read_u64() as *const {rt}; let __l = {r}.read_u64() as usize; \
-                 if __p.is_null() || __l == 0 {{ Vec::new() }} \
-                 else {{ core::slice::from_raw_parts(__p, __l).to_vec() }} }}"
-            )
-        }
-        FieldType::DStr => format!(
-            "dynspire::managed::DStr {{ ptr: {r}.read_u64() as *const u8, len: {r}.read_u64() as usize }}"
-        ),
-        FieldType::DSlice(inner) => {
-            let rt = inner.rust_type();
-            format!(
-                "dynspire::managed::DSlice::<{rt}> {{ ptr: {r}.read_u64() as *const {rt}, len: {r}.read_u64() as usize }}"
-            )
-        }
+        // Shared borrow: emit a view struct (DStr/DSlice for DType
+        // payloads). The view does not own the buffer — no release on drop.
+        FieldType::Ref(inner) => match inner.as_ref() {
+            FieldType::DString => format!(
+                "dynspire::managed::DStr {{ ptr: {r}.read_u64() as *const u8, len: {r}.read_u64() as usize }}"
+            ),
+            FieldType::DVec(inner2) => {
+                let rt = inner2.rust_type();
+                format!(
+                    "dynspire::managed::DSlice::<{rt}> {{ ptr: {r}.read_u64() as *const {rt}, len: {r}.read_u64() as usize }}"
+                )
+            }
+            // For primitives/named, recurse on the inner type.
+            other => gen_read_decode(other, r, types),
+        },
+        // Mutable borrow (out-param): read the caller's DVec pointer.
+        // The actual fill-back is handled by the spier dispatch macro
+        // (gen_spier_macro) via post-call logic.
+        FieldType::RefMut(_) => format!("unsafe {{ &mut *({r}.read_u64() as *mut core::ffi::c_void) }}"),
         FieldType::DString => format!(
             "dynspire::managed::DString {{ \
              allocator: {r}.read_u64() as *mut dynspire::managed::DynSpireAllocator, \
@@ -519,12 +427,6 @@ fn gen_read_decode(ft: &FieldType, r: &str, types: &[TypeDecl]) -> String {
             let inner_decode = gen_read_decode(inner, r, types);
             format!(
                 "{{ let __tag = {r}.read_u64(); if __tag == 0 {{ dynspire::managed::DOption::<{rt}>::none() }} else {{ dynspire::managed::DOption::<{rt}>::some({inner_decode}) }} }}"
-            )
-        }
-        FieldType::Option(inner) => {
-            let inner_decode = gen_read_decode(inner, r, types);
-            format!(
-                "{{ let __tag = {r}.read_u64(); if __tag == 0 {{ None }} else {{ Some({inner_decode}) }} }}"
             )
         }
         FieldType::Tuple(elems) => {
@@ -580,80 +482,24 @@ fn gen_read_receive(ft: &FieldType, r: &str, types: &[TypeDecl]) -> String {
         FieldType::I64 => format!("{r}.read_u64() as i64"),
         FieldType::F32 => format!("f32::from_bits({r}.read_u64() as u32)"),
         FieldType::F64 => format!("f64::from_bits({r}.read_u64())"),
-        FieldType::Str | FieldType::U8Slice | FieldType::OutU8Vec => {
-            gen_read_decode(ft, r, types)
-        }
-        FieldType::String => format!(
-            "unsafe {{ \
-             let __ptr = {r}.read_u64() as *mut u8; \
-             let __len = {r}.read_u64() as usize; \
-             if __ptr.is_null() || __len == 0 {{ String::new() }} \
-             else {{ let __v = String::from_utf8_unchecked(core::slice::from_raw_parts(__ptr, __len).to_vec()); dynspire::managed::dynspire_release(__ptr); __v }} }}"
-        ),
-        FieldType::Vec(inner) => {
-            let rt = inner.rust_type();
-            match inner.as_ref() {
-                // Vec<String>: read (ptr, len) pairs, copy each string, release inner + outer
-                FieldType::String => format!(
-                    "unsafe {{ \
-                     let __ptr = {r}.read_u64() as *mut u64; \
-                     let __len = {r}.read_u64() as usize; \
-                     if __ptr.is_null() || __len == 0 {{ Vec::new() }} \
-                     else {{ \
-                         let mut __v: Vec<String> = Vec::with_capacity(__len); \
-                         for __i in 0..__len {{ \
-                             let __sp = *__ptr.add(__i * 2); \
-                             let __sl = *__ptr.add(__i * 2 + 1) as usize; \
-                             if __sp == 0 || __sl == 0 {{ __v.push(String::new()); }} \
-                             else {{ __v.push(String::from_utf8_unchecked(core::slice::from_raw_parts(__sp as *const u8, __sl).to_vec())); \
-                                    dynspire::managed::dynspire_release(__sp as *mut u8); }} }} \
-                         dynspire::managed::dynspire_release(__ptr as *mut u8); \
-                         __v }} }}"
-                ),
-                // Vec<Vec<T>>: read (ptr, len) pairs, copy each inner vec, release inner + outer
-                FieldType::Vec(b) => {
-                    let bt = b.rust_type();
-                    format!(
-                        "unsafe {{ \
-                         let __ptr = {r}.read_u64() as *mut u64; \
-                         let __len = {r}.read_u64() as usize; \
-                         if __ptr.is_null() || __len == 0 {{ Vec::new() }} \
-                         else {{ \
-                             let mut __v: Vec<Vec<{bt}>> = Vec::with_capacity(__len); \
-                             for __i in 0..__len {{ \
-                                 let __ep = *__ptr.add(__i * 2); \
-                                 let __el = *__ptr.add(__i * 2 + 1) as usize; \
-                                 if __ep == 0 || __el == 0 {{ __v.push(Vec::new()); }} \
-                                 else {{ __v.push(core::slice::from_raw_parts(__ep as *const {bt}, __el).to_vec()); \
-                                        dynspire::managed::dynspire_release(__ep as *mut u8); }} }} \
-                             dynspire::managed::dynspire_release(__ptr as *mut u8); \
-                             __v }} }}"
-                    )
-                }
-                // Vec<primitive>: bitmap copy
-                _ => format!(
-                    "unsafe {{ \
-                     let __ptr = {r}.read_u64() as *mut {rt}; \
-                     let __len = {r}.read_u64() as usize; \
-                     if __ptr.is_null() || __len == 0 {{ Vec::new() }} \
-                     else {{ let __v = core::slice::from_raw_parts(__ptr, __len).to_vec(); dynspire::managed::dynspire_release(__ptr as *mut u8); __v }} }}"
-                ),
+        // Shared borrow as a return — emits a view struct (no ownership transfer).
+        FieldType::Ref(inner) => match inner.as_ref() {
+            FieldType::DString => format!(
+                "dynspire::managed::DStr {{ ptr: {r}.read_u64() as *const u8, len: {r}.read_u64() as usize }}"
+            ),
+            FieldType::DVec(inner2) => {
+                let rt = inner2.rust_type();
+                format!(
+                    "dynspire::managed::DSlice::<{rt}> {{ ptr: {r}.read_u64() as *const {rt}, len: {r}.read_u64() as usize }}"
+                )
             }
-        }
-        FieldType::DStr => format!(
-            "dynspire::managed::DStr {{ ptr: {r}.read_u64() as *const u8, len: {r}.read_u64() as usize }}"
-        ),
-        FieldType::DSlice(inner) => {
-            let rt = inner.rust_type();
-            format!(
-                "dynspire::managed::DSlice::<{rt}> {{ ptr: {r}.read_u64() as *const {rt}, len: {r}.read_u64() as usize }}"
-            )
-        }
+            other => gen_read_receive(other, r, types),
+        },
         FieldType::DString => format!(
             "{{ let __alloc = {r}.read_u64() as *mut dynspire::managed::DynSpireAllocator; \
               let __ptr = {r}.read_u64() as *mut u8; let __len = {r}.read_u64() as usize; \
               let __cap = {r}.read_u64() as usize; \
-              dynspire::managed::OwnedDString::from_raw(dynspire::managed::DString {{ allocator: __alloc, ptr: __ptr, len: __len, cap: __cap }}) }}"
+              dynspire::managed::DString::from_raw(dynspire::managed::DString {{ allocator: __alloc, ptr: __ptr, len: __len, cap: __cap }}) }}"
         ),
         FieldType::DVec(inner) => {
             let rt = inner.rust_type();
@@ -661,7 +507,7 @@ fn gen_read_receive(ft: &FieldType, r: &str, types: &[TypeDecl]) -> String {
                 "{{ let __alloc = {r}.read_u64() as *mut dynspire::managed::DynSpireAllocator; \
                  let __ptr = {r}.read_u64() as *mut {rt}; let __len = {r}.read_u64() as usize; \
                  let __cap = {r}.read_u64() as usize; \
-                  dynspire::managed::OwnedDVec::<{rt}>::from_raw(dynspire::managed::DVec::<{rt}> {{ allocator: __alloc, ptr: __ptr, len: __len, cap: __cap }}) }}"
+                  dynspire::managed::DVec::<{rt}>::from_raw(dynspire::managed::DVec::<{rt}> {{ allocator: __alloc, ptr: __ptr, len: __len, cap: __cap }}) }}"
             )
         }
         FieldType::DOption(inner) => {
@@ -669,12 +515,6 @@ fn gen_read_receive(ft: &FieldType, r: &str, types: &[TypeDecl]) -> String {
             let inner_recv = gen_read_receive(inner, r, types);
             format!(
                 "{{ let __tag = {r}.read_u64(); if __tag == 0 {{ dynspire::managed::DOption::<{rt}>::none() }} else {{ dynspire::managed::DOption::<{rt}>::some({inner_recv}) }} }}"
-            )
-        }
-        FieldType::Option(inner) => {
-            let inner_recv = gen_read_receive(inner, r, types);
-            format!(
-                "{{ let __tag = {r}.read_u64(); if __tag == 0 {{ None }} else {{ Some({inner_recv}) }} }}"
             )
         }
         FieldType::Tuple(elems) => {
@@ -719,6 +559,8 @@ fn gen_read_receive(ft: &FieldType, r: &str, types: &[TypeDecl]) -> String {
                 TypeDecl::Enum(e) => gen_read_enum_receive(e, r, types),
             }
         }
+        // RefMut as a return type is not valid (out-params are input-only).
+        FieldType::RefMut(_) => panic!("RefMut cannot appear as a return type"),
     }
 }
 
@@ -814,9 +656,12 @@ fn gen_read_enum_receive(e: &EnumDecl, r: &str, types: &[TypeDecl]) -> String {
 /// Generate the Result<T, String> receive expression (host side).
 fn gen_read_result_receive(ret: &FieldType, r: &str, types: &[TypeDecl]) -> String {
     let ok_recv = gen_read_receive(ret, r, types);
-    let err_recv = gen_read_receive(&FieldType::String, r, types);
+    // The error variant is always an owned DString on the wire (RC-aware).
+    // The host extracts the inner buffer to a Rust `String` and releases
+    // the backing buffer via the Drop impl.
+    let err_recv = gen_read_receive(&FieldType::DString, r, types);
     format!(
-        "{{ let __tag = {r}.read_u64(); if __tag == 0 {{ Ok({ok_recv}) }} else {{ Err({err_recv}) }} }}"
+        "{{ let __tag = {r}.read_u64(); if __tag == 0 {{ Ok({ok_recv}) }} else {{ Err({{ let __ds = {err_recv}; __ds.as_str().to_owned() }}) }} }}"
     )
 }
 
@@ -892,6 +737,12 @@ fn gen_struct_def(s: &StructDecl) -> String {
         out.push_str(&format!("    pub {}: {},\n", fname, fty.rust_field_type()));
     }
     out.push_str("}\n\n");
+    // Emit the ReprC marker impl so this struct can appear as the inner
+    // type of DVec<T> / DOption<T> in user code.
+    out.push_str(&format!(
+        "unsafe impl dynspire::managed::ReprC for {} {{}}\n\n",
+        s.name
+    ));
     out
 }
 
@@ -911,6 +762,12 @@ fn gen_enum_def(e: &EnumDecl) -> String {
         }
     }
     out.push_str("}\n\n");
+    // Emit the ReprC marker impl so this enum can appear as the inner
+    // type of DVec<T> / DOption<T> in user code.
+    out.push_str(&format!(
+        "unsafe impl dynspire::managed::ReprC for {} {{}}\n\n",
+        e.name
+    ));
     out
 }
 
@@ -1101,19 +958,33 @@ fn gen_tower(iface: &Interface) -> String {
         let mut encode_stmts = String::new();
         let mut post_stmts = String::new();
         for p in &m.params {
-            if matches!(p.ty, FieldType::OutU8Vec) {
+            if let FieldType::RefMut(inner) = &p.ty {
+                // &mut DVec<T> out-param: the host owns the DVec<T>; we
+                // pass a pointer to it. After dispatch, the spier has
+                // realloc'd / filled the buffer in place via the host
+                // allocator, so we just need to update the caller's view
+                // of len/cap (which already happened — same DVec struct).
                 let n = &p.name;
+                let (elem_ty, _is_dvec) = match inner.as_ref() {
+                    FieldType::DVec(elem) => (elem.rust_type(), true),
+                    _ => panic!("only &mut DVec<T> out-params are supported"),
+                };
                 encode_stmts.push_str(&format!(
-                    "        let mut __ov_{n}: dynspire::managed::DVec<u8> = dynspire::managed::DVec::<u8> {{ allocator: self.client.alloc_ptr(), ptr: std::ptr::null_mut(), len: 0, cap: 0 }};\n\
-                     __w.write_u64(&mut __ov_{n} as *mut dynspire::managed::DVec<u8> as u64);\n",
+                    "        let mut __ov_{n}: dynspire::managed::DVec<{elem_ty}> = dynspire::managed::DVec::<{elem_ty}> {{ allocator: self.client.alloc_ptr(), ptr: std::ptr::null_mut(), len: 0, cap: 0 }};\n\
+                     __w.write_u64(&mut __ov_{n} as *mut dynspire::managed::DVec<{elem_ty}> as u64);\n",
                 ));
                 post_stmts.push_str(&format!(
                     "        if !__ov_{n}.ptr.is_null() {{\n\
-                     let __bytes = unsafe {{ core::slice::from_raw_parts(__ov_{n}.ptr, __ov_{n}.len) }};\n\
-                     {out}.extend_from_slice(__bytes);\n\
-                     unsafe {{ dynspire::managed::dynspire_release(__ov_{n}.ptr); }}\n\
-                     }}\n",
-                    n = n, out = p.name,
+                     // Spier realloc'd into the host allocator; copy back into the caller's DVec.\n\
+                     {n}.allocator = __ov_{n}.allocator;\n\
+                     {n}.ptr = __ov_{n}.ptr;\n\
+                     {n}.len = __ov_{n}.len;\n\
+                     {n}.cap = __ov_{n}.cap;\n\
+                     }} else {{\n\
+                     {n}.len = 0;\n\
+                     }}\n\
+                     std::mem::forget(__ov_{n});\n",
+                    n = n,
                 ));
             } else {
                 encode_stmts.push_str(&gen_write_encode(&p.ty, &p.name, "__w", types));
@@ -1166,16 +1037,16 @@ impl {cn} {{
     }}
 
     /// Allocate an owning `DVec` in the host allocator (for passing owned
-    /// buffers into spier methods that take a `DVec` parameter). Released when
-    /// the returned guard is dropped.
-    pub fn new_dvec<T: dynspire::managed::ReprC>(&self, cap: usize) -> dynspire::managed::OwnedDVec<T> {{
-        dynspire::managed::OwnedDVec::new_in(unsafe {{ &*self.client.alloc_ptr() }}, cap)
+    /// buffers into spier methods that take a `DVec` parameter). Released
+    /// automatically when the returned `DVec` is dropped (RC-aware).
+    pub fn new_dvec<T: dynspire::managed::ReprC>(&self, cap: usize) -> dynspire::managed::DVec<T> {{
+        dynspire::managed::DVec::new_in(unsafe {{ &*self.client.alloc_ptr() }}, cap)
     }}
 
-    /// Allocate an owning `DString` in the host allocator. Released when the
-    /// returned guard is dropped.
-    pub fn new_dstring(&self, s: &str) -> dynspire::managed::OwnedDString {{
-        dynspire::managed::OwnedDString::new_in(unsafe {{ &*self.client.alloc_ptr() }}, s)
+    /// Allocate an owning `DString` in the host allocator. Released
+    /// automatically when the returned `DString` is dropped (RC-aware).
+    pub fn new_dstring(&self, s: &str) -> dynspire::managed::DString {{
+        dynspire::managed::DString::new_in(unsafe {{ &*self.client.alloc_ptr() }}, s)
     }}
 }}
 
@@ -1229,25 +1100,38 @@ fn gen_spier_macro(iface: &Interface) -> String {
                 "            let __in_data = if !in_slots.is_null() && in_count > 0 {\n                unsafe { core::slice::from_raw_parts(in_slots, in_count) }\n            } else { &[] };\n            let mut __r = dynspire::slots::SlotReader::new(__in_data);\n",
             );
             for p in &m.params {
-                if matches!(p.ty, FieldType::OutU8Vec) {
+                if let FieldType::RefMut(inner) = &p.ty {
+                    // &mut DVec<T> out-param: receive a pointer to the
+                    // caller's DVec<T>. The spier trait method gets a
+                    // `&mut DVec<T>` that writes into a *fresh* DVec<T>
+                    // (allocated by the spier in the host allocator).
+                    // After the trait call returns, we realloc the
+                    // caller's DVec<T> and copy the bytes back so the
+                    // host sees them.
                     let n = &p.name;
+                    let elem_ty = match inner.as_ref() {
+                        FieldType::DVec(e) => e.rust_type(),
+                        _ => panic!("only &mut DVec<T> out-params are supported"),
+                    };
                     block.push_str(&format!(
-                        "            let __ov_{n}_dvec = __r.read_u64() as *mut dynspire::managed::DVec<u8>;\n\
-                         let mut __ov_{n}_vec: Vec<u8> = Vec::new();\n\
-                         let {n}: &mut Vec<u8> = &mut __ov_{n}_vec;\n",
+                        "            let __ov_{n}_dvec = __r.read_u64() as *mut dynspire::managed::DVec<{elem_ty}>;\n\
+                         let mut __ov_{n}_fresh = dynspire::managed::DVec::<{elem_ty}>::new_in(&*(*__ov_{n}_dvec).allocator, 0);\n\
+                         let {n}: &mut dynspire::managed::DVec<{elem_ty}> = &mut __ov_{n}_fresh;\n",
                     ));
                     post_call.push_str(&format!(
                         "            if !__ov_{n}_dvec.is_null() {{\n\
-                         let __dvec = &mut *(__ov_{n}_dvec as *mut dynspire::managed::DVec<u8>);\n\
-                         let __n = __ov_{n}_vec.len();\n\
+                         let __dvec = &mut *(__ov_{n}_dvec as *mut dynspire::managed::DVec<{elem_ty}>);\n\
+                         let __n = __ov_{n}_fresh.len;\n\
                          if __n > 0 {{\n\
-                         let __new = dynspire::managed::dynspire_realloc(__dvec.allocator, __dvec.ptr, __dvec.cap, __n, 1);\n\
+                         let __new = dynspire::managed::dynspire_realloc(__dvec.allocator, __dvec.ptr, __dvec.cap, __n * core::mem::size_of::<{elem_ty}>(), core::mem::align_of::<{elem_ty}>());\n\
                          if !__new.is_null() {{\n\
-                         core::ptr::copy_nonoverlapping(__ov_{n}_vec.as_ptr(), __new, __n);\n\
-                         __dvec.ptr = __new; __dvec.len = __n; __dvec.cap = __n; }}\n\
+                         core::ptr::copy_nonoverlapping(__ov_{n}_fresh.ptr as *const u8, __new, __n * core::mem::size_of::<{elem_ty}>());\n\
+                         __dvec.ptr = __new as *mut {elem_ty}; __dvec.len = __n; __dvec.cap = __n; }}\n\
                          }}\n\
+                         // __ov_{n}_fresh is dropped here: its Drop calls dynspire_release,\n\
+                         // freeing the spier-side temporary buffer. No manual release needed.\n\
                          }}\n",
-                        n = n,
+                        n = n, elem_ty = elem_ty,
                     ));
                 } else {
                     let decode_expr = gen_read_decode(&p.ty, "__r", types);
@@ -1284,7 +1168,13 @@ fn gen_spier_macro(iface: &Interface) -> String {
         let guarded = m.return_type.is_guarded_return();
         let ok_var = if guarded { "__raw" } else { "__v" };
         let ok_return = gen_write_return(&m.return_type, ok_var, "__w", types);
-        let err_return = gen_write_return(&FieldType::String, "__e", "__w", types);
+        // The error path: the trait returns `Result<_, String>`. We wrap
+        // the String in a DString allocated in the host allocator so the
+        // host can release it via the RC mechanism on Drop.
+        let err_return = format!(
+            "{{ let __eds = dynspire::managed::DString::new_in(&*__alloc, &__e); {} }}",
+            gen_write_return(&FieldType::DString, "__eds", "__w", types)
+        );
         let write_out = gen_write_out_epilogue("__w", "out_slots", "out_capacity");
 
         let result_encode = if ok_return.is_empty() && m.return_type == FieldType::Unit {
@@ -1484,13 +1374,15 @@ fn generate_host_suffix(iface: &Interface) -> String {
 // Python twin, so there is no risk of hash drift.
 
 /// Whether an owned return must be freed immediately after being copied into
-/// Python (as opposed to boxed structs/opaques, which are freed lazily by the
-/// `OpaqueHandle` wrapper on GC).
+/// Python via the `_release_list` mechanism. After the RC-aware unification,
+/// owned DString/DVec returns are wrapped in `DStringHandle` / `DVecHandle`
+/// Python wrappers that release on `__del__` — so they are NOT immediate-owned
+/// anymore. Only deep-copied leaf values (now gone) used this path. Returns
+/// false for all current types.
 fn is_immediate_owned(ft: &FieldType, types: &[TypeDecl]) -> bool {
     use FieldType::*;
     match ft {
-        String | Vec(_) => true,
-        Option(inner) => is_immediate_owned(inner, types),
+        DOption(inner) => is_immediate_owned(inner, types),
         Tuple(elems) => elems.iter().any(|e| is_immediate_owned(e, types)),
         Named(name) => match find_type(types, name) {
             TypeDecl::Enum(e) => e
@@ -1522,35 +1414,17 @@ fn gen_py_write(ft: &FieldType, expr: &str, w: &str, types: &[TypeDecl], indent:
         I64 => format!("{pad}{w}.write_i64({expr})\n"),
         F32 => format!("{pad}{w}.write_f32({expr})\n"),
         F64 => format!("{pad}{w}.write_f64({expr})\n"),
-        Str | String => format!("{pad}{w}.write_str({expr})\n"),
-        U8Slice => format!("{pad}{w}.write_bytes({expr})\n"),
-        OutU8Vec => unreachable!("OutU8Vec handled by gen_py_method"),
-        Vec(inner) => {
-            if matches!(inner.as_ref(), FieldType::U8) {
-                format!("{pad}{w}.write_bytes({expr})\n")
-            } else {
-                panic!(
-                    "dynspire-codegen: Vec<{}> input param is not supported in Python codegen",
-                    inner.canonical()
-                )
-            }
-        }
-        DStr | DSlice(_) => format!(
-            "{pad}{w}.write_u64(int({expr}.ptr));\n{pad}{w}.write_u64(int({expr}.len))\n"
-        ),
-        DString => format!(
-            "{pad}{w}.write_dstring({expr}, self._alloc_ptr)\n"
-        ),
-        DVec(_) => format!(
-            "{pad}{w}.write_dvec({expr}, self._alloc_ptr)\n"
-        ),
+        // Shared borrow: Python passes bytes/str; the wire is 2 slots (ptr, len).
+        Ref(inner) => match inner.as_ref() {
+            DString => format!("{pad}{w}.write_str({expr})\n"),
+            DVec(_) => format!("{pad}{w}.write_bytes({expr})\n"),
+            other => gen_py_write(other, expr, w, types, indent),
+        },
+        // Mutable borrow (out-param): handled by gen_py_method.
+        RefMut(_) => unreachable!("RefMut handled by gen_py_method"),
+        DString => format!("{pad}{w}.write_dstring({expr}, self._alloc_ptr)\n"),
+        DVec(_) => format!("{pad}{w}.write_dvec({expr}, self._alloc_ptr)\n"),
         DOption(inner) => {
-            let inner_w = gen_py_write(inner, expr, w, types, indent + 4);
-            format!(
-                "{pad}if {expr} is None:\n{inpad}{w}.write_u64(0)\n{pad}else:\n{inpad}{w}.write_u64(1)\n{inner_w}"
-            )
-        }
-        Option(inner) => {
             let inner_w = gen_py_write(inner, expr, w, types, indent + 4);
             format!(
                 "{pad}if {expr} is None:\n{inpad}{w}.write_u64(0)\n{pad}else:\n{inpad}{w}.write_u64(1)\n{inner_w}"
@@ -1630,24 +1504,23 @@ fn gen_py_read_expr(ft: &FieldType, r: &str, types: &[TypeDecl]) -> std::string:
         I64 => format!("{r}.read_i64()"),
         F32 => format!("{r}.read_f32()"),
         F64 => format!("{r}.read_f64()"),
-        Str | U8Slice => format!("{r}.read_bytes()"),
-        String => format!("{r}.read_string()"),
-        Vec(inner) => {
-            if matches!(inner.as_ref(), FieldType::U8) {
-                format!("{r}.read_bytes()")
-            } else if matches!(inner.as_ref(), FieldType::String) {
-                format!("{r}.read_vec_string()")
-            } else if matches!(inner.as_ref(), FieldType::Vec(ref b) if matches!(b.as_ref(), FieldType::U8)) {
-                format!("{r}.read_vec_bytes()")
-            } else {
-                panic!(
-                    "dynspire-codegen: Vec<{}> return is not supported in Python codegen",
-                    inner.canonical()
-                )
-            }
-        }
-        OutU8Vec => "None".into(),
-        Option(inner) => format!("None if {r}.read() == 0 else {}", gen_py_read_expr(inner, r, types)),
+        // Shared borrow as return: 2-slot (ptr, len) view decoded as
+        // plain str/bytes (deep-copy on the Python side — there is no
+        // way to safely keep the spier buffer alive past the call).
+        Ref(inner) => match inner.as_ref() {
+            DString => format!("{r}.read_bytes().decode('utf-8', 'replace')"),
+            DVec(_) => format!("{r}.read_bytes()"),
+            other => gen_py_read_expr(other, r, types),
+        },
+        // Owned DType returns: managed wrappers exposing the buffer.
+        // Release happens on __del__.
+        DString => format!(
+            "(lambda __a, __p, __n, __c: DStringHandle(self, __p, __n, __a))({r}.read(), {r}.read(), {r}.read(), {r}.read())"
+        ),
+        DVec(_) => format!(
+            "(lambda __a, __p, __n, __c: DVecHandle(self, __p, __n, __a))({r}.read(), {r}.read(), {r}.read(), {r}.read())"
+        ),
+        DOption(inner) => format!("None if {r}.read() == 0 else {}", gen_py_read_expr(inner, r, types)),
         Tuple(elems) => {
             let parts: std::vec::Vec<std::string::String> = elems.iter().map(|e| gen_py_read_expr(e, r, types)).collect();
             format!("({})", parts.join(", "))
@@ -1665,19 +1538,6 @@ fn gen_py_read_expr(ft: &FieldType, r: &str, types: &[TypeDecl]) -> std::string:
                 format!("[{}]", parts.join(", "))
             }
         }
-        DStr => format!(
-            "(lambda __p, __n: ctypes.string_at(__p, __n).decode('utf-8', 'replace') if __p else \"\")({r}.read(), {r}.read())"
-        ),
-        DSlice(_) => format!(
-            "(lambda __p, __n: ctypes.string_at(__p, __n) if __p else b\"\")({r}.read(), {r}.read())"
-        ),
-        DString => format!(
-            "(lambda __a, __p, __n, __c: DStringHandle(self, __p, __n, __a))({r}.read(), {r}.read(), {r}.read(), {r}.read())"
-        ),
-        DVec(_) => format!(
-            "(lambda __a, __p, __n, __c: OwnedDVec(self, __p, __n, __a))({r}.read(), {r}.read(), {r}.read(), {r}.read())"
-        ),
-        DOption(inner) => format!("None if {r}.read() == 0 else {}", gen_py_read_expr(inner, r, types)),
         Named(name) => match find_type(types, name) {
             TypeDecl::Struct(s) if s.fields.is_empty() => {
                 panic!("dynspire-codegen: empty struct '{name}' return is not supported in Python codegen")
@@ -1687,6 +1547,7 @@ fn gen_py_read_expr(ft: &FieldType, r: &str, types: &[TypeDecl]) -> std::string:
             }
             TypeDecl::Enum(_) => panic!("dynspire-codegen: enum decode must go through gen_py_decode_block"),
         },
+        RefMut(_) => "None".into(),
     }
 }
 
@@ -1706,7 +1567,7 @@ fn gen_py_decode_block(ft: &FieldType, r: &str, types: &[TypeDecl], indent: usiz
                 format!("{pad}_v = {name}._from_ptr(self, {r}.read())\n")
             }
         },
-        FieldType::Option(inner) => {
+        FieldType::DOption(inner) => {
             let inpad = " ".repeat(indent + 4);
             let mut s = format!("{pad}_opt = {r}.read()\n");
             s.push_str(&format!("{pad}if _opt == 0:\n"));
@@ -1791,11 +1652,14 @@ fn py_ctypes_field(ft: &FieldType, types: &[TypeDecl]) -> String {
         I64 => "ctypes.c_int64".into(),
         F32 => "ctypes.c_float".into(),
         F64 => "ctypes.c_double".into(),
-        String | DString => "DString".into(),
-        Vec(_) | DVec(_) => "DVec".into(),
-        Str | U8Slice | DStr | DSlice(_) => "DStr".into(),
+        // Owned DTypes: 4-field managed struct mirror.
+        DString => "DString".into(),
+        DVec(_) => "DVec".into(),
         DOption(_) => "DOption".into(),
-        Option(_) => "DOption".into(),
+        // Borrowed appearances (`&DString`/`&DVec<T>`) are not valid
+        // struct fields (validated elsewhere); we still provide a
+        // ctypes fallback for safety.
+        Ref(_) | RefMut(_) => "ctypes.c_uint64".into(),
         Named(name) => format!("{name}Ctypes"),
         Tuple(elems) => {
             let inner: std::vec::Vec<std::string::String> = elems.iter().map(|e| py_ctypes_field(e, types)).collect();
@@ -1815,13 +1679,12 @@ fn py_default_value(ft: &FieldType) -> String {
     match ft {
         Bool | U8 | U16 | U32 | U64 | I8 | I16 | I32 | I64 => "0".into(),
         F32 | F64 => "0.0".into(),
-        String | DString | Str | U8Slice | DStr | DSlice(_) | Vec(_) | DVec(_) => "None".into(),
-        Option(_) | DOption(_) => "None".into(),
+        DString | DVec(_) | Ref(_) | RefMut(_) => "None".into(),
+        DOption(_) => "None".into(),
         Named(name) => format!("{name}._default()"),
         Tuple(_) => "None".into(),
         Array(_, _) => "None".into(),
         Unit => "None".into(),
-        OutU8Vec => "None".into(),
     }
 }
 
@@ -1970,7 +1833,7 @@ fn gen_py_method(m: &Method, types: &[TypeDecl]) -> String {
     let user_params: Vec<&str> = m
         .params
         .iter()
-        .filter(|p| !matches!(p.ty, FieldType::OutU8Vec))
+        .filter(|p| !matches!(p.ty, FieldType::RefMut(_)))
         .map(|p| p.name.as_str())
         .collect();
     let sig = if user_params.is_empty() {
@@ -1984,7 +1847,7 @@ fn gen_py_method(m: &Method, types: &[TypeDecl]) -> String {
     let mut ov_count = 0usize;
     for p in &m.params {
         match &p.ty {
-            FieldType::OutU8Vec => {
+            FieldType::RefMut(_) => {
                 s.push_str(&format!("{inpad}_ov{ov_count} = self._new_outvec()\n"));
                 s.push_str(&format!("{inpad}_w.write_u64(_ov{ov_count})\n"));
                 ov_count += 1;
@@ -2109,8 +1972,8 @@ class DOption(ctypes.Structure):
     ]
 
 
-class OwnedDVec:
-    """Owning view of a `DVec<u8>` returned/crated across the FFI boundary.
+class DVecHandle:
+    """Owning view of a `DVec<u8>` returned/created across the FFI boundary.
 
     Holds the raw pointer; releases it on `__del__`. Provides zero-copy
     access via `as_bytes()` / `memoryview`.
@@ -2563,7 +2426,7 @@ class SpierClient:
         """Allocate an owning `DVec<u8>` in the host allocator (for passing
         owned buffers into spier methods that take a `DVec` parameter)."""
         ptr = self._alloc(cap, 1) if cap > 0 else None
-        return OwnedDVec(self, ptr, 0, self._alloc_ptr, cap)
+        return DVecHandle(self, ptr, 0, self._alloc_ptr, cap)
 
     def new_dstring(self, s):
         """Allocate an owning `DString` in the host allocator."""
@@ -2722,7 +2585,9 @@ mod tests {
         let iface = parse_rle();
         let code = generate(&iface);
         assert!(code.contains("pub trait RleEngine: Send + Sync"));
-        assert!(code.contains("fn compress(&self, data: &[u8]) -> Result<Vec<u8>, String>"));
+        // IDL `&DVec<u8>` is decoded as DSlice<u8> on the Rust side.
+        // Returns are RC-aware DVec<u8> directly (no OwnedDVec wrapper).
+        assert!(code.contains("fn compress(&self, data: dynspire::managed::DSlice<u8>) -> Result<dynspire::managed::DVec<u8>, String>"));
     }
 
     #[test]
@@ -2770,47 +2635,50 @@ interface Test {
 
     #[test]
     fn generated_enum_dtype_fields_use_dtype_codec() {
+        // After the IDL became language-agnostic, only DTypes are allowed.
+        // This test now exercises the DType-only enum variant directly.
         let src = r#"
 interface Codec {
   enum Tag {
     Empty,
-    Labelled(String),
-    Numbered(Vec<u32>),
-    Maybe(Option<String>),
+    Labelled(DString),
+    Numbered(DVec<u32>),
+    Maybe(DOption<DString>),
   }
-  fn make_tag(s: &str) -> Tag;
+  fn make_tag(s: &DString) -> Tag;
 }
 "#;
         let iface = crate::parser::parse(src).unwrap();
         let code = generate(&iface);
 
-        // The enum definition must use DType field types
+        // The enum definition uses DType field types directly (the IDL
+        // is already DType-only — no translation needed).
         assert!(
             code.contains("Labelled(dynspire::managed::DString)"),
-            "enum variant with String field must use DString:\n{}", code
+            "enum variant with DString field:\n{}", code
         );
         assert!(
             code.contains("Numbered(dynspire::managed::DVec<u32>)"),
-            "enum variant with Vec<u32> field must use DVec<u32>:\n{}", code
+            "enum variant with DVec<u32> field:\n{}", code
         );
         assert!(
             code.contains("Maybe(dynspire::managed::DOption<dynspire::managed::DString>)"),
-            "enum variant with Option<String> field must use DOption<DString>:\n{}", code
+            "enum variant with DOption<DString> field:\n{}", code
         );
 
         // Writer for Labelled variant must emit DString's 4-slot layout
-        // (allocator, ptr, len, cap) — not String's 2-slot (ptr, len)
+        // (allocator, ptr, len, cap).
         assert!(
             code.contains("__f0.allocator") && code.contains("__f0.ptr")
                 && code.contains("__f0.len") && code.contains("__f0.cap"),
             "enum encode must write DString's 4 fields (allocator/ptr/len/cap):\n{}", code
         );
 
-        // Reader for Option<String> variant must produce DOption<DString>
-        // (3-slot decode: tag + inner DString's 4) — not Option<String>
+        // Reader for DOption<DString> variant must produce DOption<DString>
+        // (3-slot decode: tag + inner DString's 4).
         assert!(
             code.contains("DOption::<dynspire::managed::DString>"),
-            "enum decode for Option<String> field must produce DOption<DString>:\n{}", code
+            "enum decode for DOption<DString> field:\n{}", code
         );
     }
 
@@ -2975,20 +2843,24 @@ interface Codec {
     fn generated_dtype_methods() {
         let iface = parse_rle();
         let code = generate(&iface);
-        // Spier trait declares owning guards for owned-DType returns.
-        assert!(code.contains("fn echo_bytes(&self, data: &[u8]) -> Result<dynspire::managed::OwnedDVec<u8>, String>"));
+        // After RC-aware unification: returns are `DVec<u8>` / `DString`
+        // directly (no OwnedDVec/OwnedDString wrapper). Inputs use the
+        // view types (DSlice<u8> / DStr) for `&DVec<_>` / `&DString` IDL.
+        assert!(code.contains("fn echo_bytes(&self, data: dynspire::managed::DSlice<u8>) -> Result<dynspire::managed::DVec<u8>, String>"));
         assert!(code.contains("fn consume_dvec(&self, data: dynspire::managed::DVec<u8>) -> Result<u64, String>"));
-        // Host client matches the trait via rust_output_type (guarded return).
-        assert!(code.contains("fn echo_bytes(&self, data: &[u8]) -> Result<dynspire::managed::OwnedDVec<u8>, String>"));
-        // DView params are passed by value (no Copy needed).
+        // Host client matches the trait (no separate guarded wrapper).
+        assert!(code.contains("fn consume_dvec(&self, data: dynspire::managed::DVec<u8>) -> Result<u64, String>"));
+        // DSlice params appear when the IDL uses `&DVec<T>`.
         assert!(code.contains("fn view_slice(&self, data: dynspire::managed::DSlice<u8>) -> Result<u64, String>"));
         // DOption is a managed struct on both sides, not Rust Option.
-        assert!(code.contains("fn probe(&self, data: &[u8]) -> Result<dynspire::managed::DOption<u8>, String>"));
-        // The spier dispatch converts owned guards to raw (into_raw) before write.
+        assert!(code.contains("fn probe(&self, data: dynspire::managed::DSlice<u8>) -> Result<dynspire::managed::DOption<u8>, String>"));
+        // The spier dispatch converts owned DVec/DString to raw (into_raw)
+        // before write — same mechanism as before, now on the type itself.
         assert!(code.contains("into_raw()"), "owned returns must hand raw DType to host");
-        // The host receive path reconstructs an owning guard.
-        assert!(code.contains("OwnedDVec::<u8>::from_raw"), "host must reconstruct OwnedDVec");
-        assert!(code.contains("OwnedDString::from_raw"), "host must reconstruct OwnedDString");
+        // The host receive path reconstructs an owning DVec / DString
+        // via from_raw on the type directly.
+        assert!(code.contains("DVec::<u8>::from_raw"), "host must reconstruct DVec");
+        assert!(code.contains("DString::from_raw"), "host must reconstruct DString");
         // DOption decode writes a tag, not a Rust Some/None pattern, on spier side.
         assert!(code.contains(".tag == 0"), "DOption decode must branch on tag field");
     }
@@ -3016,12 +2888,13 @@ interface Codec {
         assert!(py.contains("def consume_dvec(self, data)"), "python client must accept DVec");
         assert!(py.contains("def view_slice(self, data)"), "python client must accept DSlice");
         assert!(py.contains("def probe(self, data)"), "python client must return DOption");
-        assert!(py.contains("class OwnedDVec"), "python must define owning DVec wrapper");
+        assert!(py.contains("class DVecHandle"), "python must define owning DVec wrapper");
         assert!(py.contains("class DStringHandle"), "python must define owning DString wrapper");
         assert!(py.contains("def new_dvec(self, cap)"), "python client must expose allocator helper");
         assert!(py.contains("def new_dstring(self, s)"), "python client must expose allocator helper");
-        // DOption (IDL) decode maps to None or the inner value, not a struct.
-        assert!(py.contains("None if"), "python DOption must map to None/value");
+        // DOption (IDL) decode maps to None or the inner value via a
+        // tag check (gen_py_decode_block emits a Python if/else).
+        assert!(py.contains("if _opt == 0:"), "python DOption must map to None/value");
     }
 
 
@@ -3361,7 +3234,7 @@ interface Codec {
         generate_with_ctx(&iface_a, &mut ctx);
 
         let iface_b = parser::parse(
-            r#"interface B { struct Handle { name: String, } fn f() -> Handle; }"#,
+            r#"interface B { struct Handle { name: DString, } fn f() -> Handle; }"#,
         ).unwrap();
         generate_with_ctx(&iface_b, &mut ctx);
     }

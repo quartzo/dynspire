@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use dynspire::managed::{DOption, DSlice, DStr, DVec};
+use dynspire::managed::{DOption, DSlice, DStr, DVec, DString};
 
 include!(concat!(env!("OUT_DIR"), "/rle_host.rs"));
 
@@ -38,43 +38,50 @@ fn main() {
     println!("  input  : \"{}\" ({} bytes)", String::from_utf8_lossy(input), input.len());
     println!();
 
-    // --- compress: &[u8] -> Result<Vec<u8>, String> ---
-    let compressed = client.compress(&input[..]).expect("compress failed");
+    // Helper: wrap a byte slice as a DSlice<u8> for spier calls that
+    // take a `&DVec<u8>` (which becomes DSlice<u8> on the Rust side).
+    let input_view = || DSlice::<u8> {
+        ptr: input.as_ptr(),
+        len: input.len(),
+    };
+
+    // --- compress: DSlice<u8> -> Result<DVec<u8>, String> ---
+    let compressed = client.compress(input_view()).expect("compress failed");
     println!("compress()");
-    println!("  -> [{}] ({} bytes)", hex(&compressed), compressed.len());
+    println!("  -> [{}] ({} bytes)", hex(compressed.as_slice()), compressed.len());
     println!();
 
     // --- decompress: round-trip verification ---
-    let decompressed = client.decompress(&compressed[..]).expect("decompress failed");
+    let decompressed = client.decompress(DSlice::<u8> {
+        ptr: compressed.as_ptr(),
+        len: compressed.len(),
+    }).expect("decompress failed");
     let roundtrip_ok = decompressed.as_slice() == input;
     println!("decompress()");
     println!(
         "  -> \"{}\" ({} bytes) {}",
-        String::from_utf8_lossy(&decompressed),
+        String::from_utf8_lossy(decompressed.as_slice()),
         decompressed.len(),
         if roundtrip_ok { "[round-trip OK]" } else { "[MISMATCH]" },
     );
     println!();
 
-    // --- compress_into: (&[u8], &mut Vec<u8>) -> Result<(), String> ---
-    // Out-vec: the host passes a DVec<u8> backed by the host allocator; the
-    // spier fills it (via dynspire_realloc) and the host copies the bytes back
-    // into the caller's Vec, then releases the buffer.
-    let mut buf: Vec<u8> = Vec::new();
-    client.compress_into(&input[..], &mut buf).expect("compress_into failed");
-    let mut_ok = buf == compressed;
-    println!("compress_into(&mut Vec<u8>)");
+    // --- compress_into: (DSlice<u8>, &mut DVec<u8>) -> Result<(), String> ---
+    let mut buf: DVec<u8> = client.new_dvec(0);
+    client.compress_into(input_view(), &mut buf).expect("compress_into failed");
+    let mut_ok = buf.as_slice() == compressed.as_slice();
+    println!("compress_into(&mut DVec<u8>)");
     println!("  caller buffer before: [] (empty)");
     println!(
         "  caller buffer after : [{}] ({} bytes) {}",
-        hex(&buf),
+        hex(buf.as_slice()),
         buf.len(),
         if mut_ok { "[matches compress]" } else { "[MISMATCH]" },
     );
     println!();
 
-    // --- stats: &[u8] -> Result<(u64, u64), String> ---
-    let (orig, comp) = client.stats(&input[..]).expect("stats failed");
+    // --- stats: DSlice<u8> -> Result<(u64, u64), String> ---
+    let (orig, comp) = client.stats(input_view()).expect("stats failed");
     let ratio = if orig > 0 {
         comp as f64 * 100.0 / orig as f64
     } else {
@@ -86,10 +93,8 @@ fn main() {
     println!("  ratio     : {ratio:.1}%");
     println!();
 
-    // --- analyze: &[u8] -> Result<CompressionReport, String> ---
-    // opaque struct crosses FFI as 1 slot (boxed pointer).
-    // Rust host accesses fields natively — no serialization, no navigator.
-    let report: CompressionReport = client.analyze(&input[..]).expect("analyze failed");
+    // --- analyze: DSlice<u8> -> Result<CompressionReport, String> ---
+    let report: CompressionReport = client.analyze(input_view()).expect("analyze failed");
     println!("analyze() -> CompressionReport (opaque box, 1 slot)");
     println!("  original_size  : {}", report.original_size);
     println!("  compressed_size: {}", report.compressed_size);
@@ -102,42 +107,37 @@ fn main() {
         .report_summary(report.clone())
         .expect("report_summary failed");
     println!("report_summary(CompressionReport)");
-    println!("  -> \"{summary}\"");
+    println!("  -> \"{}\"", summary.as_str());
     println!();
 
     // --- Optional managed types (DVec / DString) ---
-    // echo_bytes allocates a DVec in the spier allocator (owned return). The host
-    // receives an OwnedDVec and is the sole owner: it frees the buffer on drop.
-    let echoed = client.echo_bytes(&input[..]).expect("echo_bytes failed");
-    println!("echo_bytes(&[u8]) -> DVec<u8> (owned, zero-copy)");
+    let echoed = client.echo_bytes(input_view()).expect("echo_bytes failed");
+    println!("echo_bytes(&DVec<u8>) -> DVec<u8> (owned, RC-aware)");
     println!(
         "  -> [{}] ({} bytes)",
-        hex(&echoed.as_slice()),
+        hex(echoed.as_slice()),
         echoed.len()
     );
     println!();
 
-    // consume_dvec takes the raw DVec back (Copy view); spier only reads it, the
-    // host still owns and frees it. This exercises the full round-trip.
-    let dv: DVec<u8> = *echoed;
-    let consumed = client.consume_dvec(dv).expect("consume_dvec failed");
+    // consume_dvec takes ownership of the DVec; spier reads it, host
+    // still owns and releases via Drop (RC-aware single type).
+    let consumed = client.consume_dvec(echoed).expect("consume_dvec failed");
     println!("consume_dvec(DVec<u8>)");
-    println!("  -> {consumed} (host still owns the buffer, freed on drop)");
+    println!("  -> {consumed} (RC-aware ownership transfer)");
     println!();
 
-    // build_string allocates a DString in the spier allocator (owned return).
-    let built = client.build_string(&input[..]).expect("build_string failed");
-    println!("build_string(&[u8]) -> DString (owned, zero-copy)");
+    let built = client.build_string(input_view()).expect("build_string failed");
+    println!("build_string(&DVec<u8>) -> DString (owned, RC-aware)");
     println!("  -> \"{}\" ({} bytes)", built.as_str(), built.len());
     println!();
 
-    let ds: dynspire::managed::DString = *built;
-    let consumed_s = client.consume_dstring(ds).expect("consume_dstring failed");
+    let consumed_s = client.consume_dstring(built).expect("consume_dstring failed");
     println!("consume_dstring(DString)");
-    println!("  -> {consumed_s} (host still owns the buffer, freed on drop)");
+    println!("  -> {consumed_s}");
     println!();
 
-    // Views: pass a DStr / DSlice pointing at host-owned memory (no copy).
+    // Views: pass DStr / DSlice pointing at host-owned memory (no copy).
     let dstr = DStr {
         ptr: input.as_ptr(),
         len: input.len(),
@@ -157,9 +157,9 @@ fn main() {
     println!();
 
     // DOption return: managed tag+value, no boxing.
-    let present = client.probe(&input[..]).expect("probe failed");
+    let present = client.probe(input_view()).expect("probe failed");
     let maxv = client
-        .opt_classify(&input[..])
+        .opt_classify(input_view())
         .expect("opt_classify failed");
     let show = |o: DOption<u8>| -> String {
         if o.tag == 0 {
@@ -168,14 +168,14 @@ fn main() {
             format!("Some({})", o.value)
         }
     };
-    println!("probe(&[u8]) / opt_classify(&[u8]) -> DOption<u8>");
+    println!("probe(&DVec<u8>) / opt_classify(&DVec<u8>) -> DOption<u8>");
     println!("  probe        -> {}", show(present));
     println!("  opt_classify -> {} (max byte)", show(maxv));
     println!();
 
     // --- Opaque type round-trip ---
-    let snap = client.make_snapshot(&input[..]).expect("make_snapshot failed");
-    println!("make_snapshot(&[u8]) -> Snapshot (opaque, boxed pointer)");
+    let snap = client.make_snapshot(input_view()).expect("make_snapshot failed");
+    println!("make_snapshot(&DVec<u8>) -> Snapshot (opaque, boxed pointer)");
     println!("  -> {} bytes", snap.data.len());
     let snap_len = client.snapshot_len(snap).expect("snapshot_len failed");
     println!("snapshot_len(Snapshot)");
@@ -185,21 +185,18 @@ fn main() {
     println!("Done. Spier was loaded, verified, and dispatched entirely at runtime.");
     println!();
 
-    println!();
-    println!("Done. Spier was loaded, verified, and dispatched entirely at runtime.");
-    println!();
-
     // --- allocator report (debug allocator) ---
-    // A separate client backed by the debug allocator tracks live/peak/total
-    // memory occupation across all spier allocations (owned returns, out-vecs).
     let debug_client = DynSpireRle::connect_with_debug("rle_spier", &HashMap::new(), true)
         .expect("debug connect failed");
-    let _ = debug_client.compress(&input[..]);
-    let _ = debug_client.analyze(&input[..]);
+    let _ = debug_client.compress(input_view());
+    let _ = debug_client.analyze(input_view());
     let report = debug_client.allocator_report();
     println!("allocator_report() (debug allocator)");
     println!("  live bytes        : {}", report.live_bytes);
     println!("  live allocations  : {}", report.live_allocations);
     println!("  peak bytes        : {}", report.peak_bytes);
     println!("  total allocations : {}", report.total_allocations);
+
+    // Touch DString to avoid unused import warning.
+    let _ds: Option<DString> = None;
 }
