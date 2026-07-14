@@ -13,7 +13,7 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn main() {
-    let client = DynSpireRle::connect("rle_spier", &HashMap::new(), false)
+    let client = DynSpireRle::connect("rle_spier", &HashMap::new())
         .unwrap_or_else(|e| {
             eprintln!("{e}");
             std::process::exit(1);
@@ -172,7 +172,7 @@ fn main() {
     // --- allocator report (debug allocator) ---
     // A separate client backed by the debug allocator tracks live/peak/total
     // memory occupation across all spier allocations (owned returns, out-vecs).
-    let debug_client = DynSpireRle::connect("rle_spier", &HashMap::new(), true)
+    let debug_client = DynSpireRle::connect_with_debug("rle_spier", &HashMap::new(), true)
         .expect("debug connect failed");
     let _ = debug_client.compress(&input[..]);
     let _ = debug_client.analyze(&input[..]);

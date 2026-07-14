@@ -205,6 +205,19 @@ impl DynSpireClient {
         Arc::new(lib).create_client(config)
     }
 
+    /// Convenience: `connect` with `debug = false`.
+    ///
+    /// ```ignore
+    /// let client = DynSpireClient::connect_default("my_spier", &my_idl::IDL, &config)?;
+    /// ```
+    pub fn connect_default(
+        spier_name: &str,
+        idl: &'static IdlDescriptor,
+        config: &HashMap<String, String>,
+    ) -> Result<Self, String> {
+        Self::connect(spier_name, idl, config, false)
+    }
+
     pub fn load(
         so_path: &str,
         idl_hash: u64,

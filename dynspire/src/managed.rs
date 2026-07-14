@@ -650,6 +650,20 @@ unsafe impl ReprC for DString {}
 unsafe impl<T: ReprC> ReprC for DVec<T> {}
 unsafe impl<T: ReprC> ReprC for DOption<T> {}
 
+// DTypes carry raw pointers and don't get Send/Sync automatically. The RC
+// header uses AtomicUsize (thread-safe), the allocator is already Send+Sync,
+// and the payload is POD — so sharing across threads is sound.
+unsafe impl Send for DStr {}
+unsafe impl Sync for DStr {}
+unsafe impl<T: ReprC + Send> Send for DSlice<T> {}
+unsafe impl<T: ReprC + Sync> Sync for DSlice<T> {}
+unsafe impl Send for DString {}
+unsafe impl Sync for DString {}
+unsafe impl<T: ReprC + Send> Send for DVec<T> {}
+unsafe impl<T: ReprC + Sync> Sync for DVec<T> {}
+unsafe impl<T: ReprC + Send> Send for DOption<T> {}
+unsafe impl<T: ReprC + Sync> Sync for DOption<T> {}
+
 // ---------------------------------------------------------------------------
 // DType constructors + owning guards
 //

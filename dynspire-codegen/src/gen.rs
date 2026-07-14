@@ -660,7 +660,8 @@ fn gen_write_enum_encode(e: &EnumDecl, expr: &str, w: &str, types: &[TypeDecl]) 
                     | FieldType::Bool => format!("*{fname}"),
                     _ => fname.clone(),
                 };
-                field_stmts.push_str(&gen_write_encode(fty, &actual_expr, w, types));
+                let dt = fty.to_field_dtype();
+                field_stmts.push_str(&gen_write_encode(&dt, &actual_expr, w, types));
             }
             arms.push_str(&format!(
                 "{n}::{vn}({pats}) => {{ {w}.write_u64({disc}); {field_stmts} }} ",
@@ -682,7 +683,7 @@ fn gen_write_enum_return(e: &EnumDecl, expr: &str, w: &str, types: &[TypeDecl]) 
             let fnames: Vec<String> = (0..v.fields.len()).map(|i| format!("__f{i}")).collect();
             let mut field_stmts = String::new();
             for (fty, fname) in v.fields.iter().zip(&fnames) {
-                field_stmts.push_str(&gen_write_return(fty, fname, w, types));
+                field_stmts.push_str(&gen_write_return(&fty.to_field_dtype(), fname, w, types));
             }
             arms.push_str(&format!(
                 "{n}::{vn}({pats}) => {{ {w}.write_u64({disc}); {field_stmts} }} ",
@@ -701,7 +702,7 @@ fn gen_read_enum_decode(e: &EnumDecl, r: &str, types: &[TypeDecl]) -> String {
         if v.fields.is_empty() {
             arms.push_str(&format!("{disc} => {n}::{vn}, ", vn=v.name));
         } else {
-            let fields: Vec<String> = v.fields.iter().map(|fty| gen_read_decode(fty, r, types)).collect();
+            let fields: Vec<String> = v.fields.iter().map(|fty| gen_read_decode(&fty.to_field_dtype(), r, types)).collect();
             arms.push_str(&format!("{disc} => {n}::{vn}({fields}), ", vn=v.name, fields=fields.join(", ")));
         }
     }
@@ -718,7 +719,7 @@ fn gen_read_enum_receive(e: &EnumDecl, r: &str, types: &[TypeDecl]) -> String {
         if v.fields.is_empty() {
             arms.push_str(&format!("{disc} => {n}::{vn}, ", vn=v.name));
         } else {
-            let fields: Vec<String> = v.fields.iter().map(|fty| gen_read_receive(fty, r, types)).collect();
+            let fields: Vec<String> = v.fields.iter().map(|fty| gen_read_receive(&fty.to_field_dtype(), r, types)).collect();
             arms.push_str(&format!("{disc} => {n}::{vn}({fields}), ", vn=v.name, fields=fields.join(", ")));
         }
     }
@@ -1065,7 +1066,11 @@ fn gen_tower(iface: &Interface) -> String {
 }}
 
 impl {cn} {{
-    pub fn connect(spier_name: &str, config: &std::collections::HashMap<String, String>, debug: bool) -> Result<Self, String> {{
+    pub fn connect(spier_name: &str, config: &std::collections::HashMap<String, String>) -> Result<Self, String> {{
+        Self::connect_with_debug(spier_name, config, false)
+    }}
+
+    pub fn connect_with_debug(spier_name: &str, config: &std::collections::HashMap<String, String>, debug: bool) -> Result<Self, String> {{
         let client = dynspire::DynSpireClient::connect(spier_name, &IDL, config, debug)?;
         Ok(Self {{ client }})
     }}
@@ -2579,6 +2584,52 @@ interface Test {
             code2.contains("#[repr(u32)]\n#[derive(Clone, Debug, PartialEq)]\npub enum Color"),
             "fieldless enum Color must use #[repr(u32)], got:\n{}",
             code2
+        );
+    }
+
+    #[test]
+    fn generated_enum_dtype_fields_use_dtype_codec() {
+        let src = r#"
+interface Codec {
+  enum Tag {
+    Empty,
+    Labelled(String),
+    Numbered(Vec<u32>),
+    Maybe(Option<String>),
+  }
+  fn make_tag(s: &str) -> Tag;
+}
+"#;
+        let iface = crate::parser::parse(src).unwrap();
+        let code = generate(&iface);
+
+        // The enum definition must use DType field types
+        assert!(
+            code.contains("Labelled(dynspire::managed::DString)"),
+            "enum variant with String field must use DString:\n{}", code
+        );
+        assert!(
+            code.contains("Numbered(dynspire::managed::DVec<u32>)"),
+            "enum variant with Vec<u32> field must use DVec<u32>:\n{}", code
+        );
+        assert!(
+            code.contains("Maybe(dynspire::managed::DOption<dynspire::managed::DString>)"),
+            "enum variant with Option<String> field must use DOption<DString>:\n{}", code
+        );
+
+        // Writer for Labelled variant must emit DString's 4-slot layout
+        // (allocator, ptr, len, cap) — not String's 2-slot (ptr, len)
+        assert!(
+            code.contains("__f0.allocator") && code.contains("__f0.ptr")
+                && code.contains("__f0.len") && code.contains("__f0.cap"),
+            "enum encode must write DString's 4 fields (allocator/ptr/len/cap):\n{}", code
+        );
+
+        // Reader for Option<String> variant must produce DOption<DString>
+        // (3-slot decode: tag + inner DString's 4) — not Option<String>
+        assert!(
+            code.contains("DOption::<dynspire::managed::DString>"),
+            "enum decode for Option<String> field must produce DOption<DString>:\n{}", code
         );
     }
 

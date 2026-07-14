@@ -274,6 +274,30 @@ impl FieldType {
             FieldType::DString | FieldType::DVec(_)
         )
     }
+
+    /// Convert an IDL type to its C-stable DType equivalent at the AST level.
+    ///
+    /// Mirrors [`rust_field_type`]: `String` → `DString`, `Vec<T>` →
+    /// `DVec<T>`, `Option<T>` → `DOption<T>`, `&str` → `DStr`, `&[u8]` →
+    /// `DSlice<u8>`. Existing DTypes pass through unchanged (with recursive
+    /// inner conversion). Used by enum variant codecs to ensure reader/writer
+    /// functions use the same DType wire format as `rust_field_type` produces
+    /// in the enum definition.
+    pub fn to_field_dtype(&self) -> FieldType {
+        match self {
+            FieldType::String => FieldType::DString,
+            FieldType::Vec(inner) => FieldType::DVec(Box::new(inner.to_field_dtype())),
+            FieldType::Option(inner) => FieldType::DOption(Box::new(inner.to_field_dtype())),
+            FieldType::Str => FieldType::DStr,
+            FieldType::U8Slice => FieldType::DSlice(Box::new(FieldType::U8)),
+            FieldType::DStr => FieldType::DStr,
+            FieldType::DSlice(inner) => FieldType::DSlice(Box::new(inner.to_field_dtype())),
+            FieldType::DString => FieldType::DString,
+            FieldType::DVec(inner) => FieldType::DVec(Box::new(inner.to_field_dtype())),
+            FieldType::DOption(inner) => FieldType::DOption(Box::new(inner.to_field_dtype())),
+            other => other.clone(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
