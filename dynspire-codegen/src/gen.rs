@@ -1538,8 +1538,11 @@ fn gen_py_write(ft: &FieldType, expr: &str, w: &str, types: &[TypeDecl], indent:
         DStr | DSlice(_) => format!(
             "{pad}{w}.write_u64(int({expr}.ptr));\n{pad}{w}.write_u64(int({expr}.len))\n"
         ),
-        DString | DVec(_) => format!(
-            "{pad}{w}.write_u64(int({expr}.allocator));\n{pad}{w}.write_u64(int({expr}.ptr));\n{pad}{w}.write_u64(int({expr}.len));\n{pad}{w}.write_u64(int({expr}.cap))\n"
+        DString => format!(
+            "{pad}{w}.write_dstring({expr}, self._alloc_ptr)\n"
+        ),
+        DVec(_) => format!(
+            "{pad}{w}.write_dvec({expr}, self._alloc_ptr)\n"
         ),
         DOption(inner) => {
             let inner_w = gen_py_write(inner, expr, w, types, indent + 4);
@@ -1596,7 +1599,8 @@ fn gen_py_enum_write(e: &EnumDecl, expr: &str, w: &str, types: &[TypeDecl], inde
         s.push_str(&format!("{pad}{kw} {expr}.variant == '{vn}':\n", vn = v.name));
         s.push_str(&format!("{inpad}{w}.write_u64({i})\n"));
         for (fi, fty) in v.fields.iter().enumerate() {
-            s.push_str(&gen_py_write(fty, &format!("{expr}.fields[{fi}]"), w, types, indent + 4));
+            let dt = fty.to_field_dtype();
+            s.push_str(&gen_py_write(&dt, &format!("{expr}.fields[{fi}]"), w, types, indent + 4));
         }
     }
     s.push_str(&format!(
@@ -1715,7 +1719,7 @@ fn gen_py_decode_block(ft: &FieldType, r: &str, types: &[TypeDecl], indent: usiz
     }
 }
 
-fn gen_py_enum_read_block(e: &EnumDecl, r: &str, _types: &[TypeDecl], indent: usize) -> String {
+fn gen_py_enum_read_block(e: &EnumDecl, r: &str, types: &[TypeDecl], indent: usize) -> String {
     let pad = " ".repeat(indent);
     let inpad = " ".repeat(indent + 4);
     let n = &e.name;
@@ -1726,7 +1730,7 @@ fn gen_py_enum_read_block(e: &EnumDecl, r: &str, _types: &[TypeDecl], indent: us
         if v.fields.is_empty() {
             s.push_str(&format!("{inpad}_v = {n}('{vn}')\n", vn = v.name));
         } else {
-            let args: Vec<String> = v.fields.iter().map(|fty| gen_py_read_expr(fty, r, _types)).collect();
+            let args: Vec<String> = v.fields.iter().map(|fty| gen_py_read_field_expr(&fty.to_field_dtype(), r, types)).collect();
             s.push_str(&format!("{inpad}_v = {n}('{vn}', {args})\n", vn = v.name, args = args.join(", ")));
         }
     }
@@ -1734,6 +1738,19 @@ fn gen_py_enum_read_block(e: &EnumDecl, r: &str, _types: &[TypeDecl], indent: us
         "{pad}else:\n{inpad}raise DynSpireError('invalid {n} discriminant ' + str(_disc))\n"
     ));
     s
+}
+
+/// Read expression for enum variant fields: returns plain Python values
+/// (str/bytes/None) for DTypes instead of DStringHandle/OwnedDVec, so they
+/// can be stored directly in the Python enum variant.
+fn gen_py_read_field_expr(ft: &FieldType, r: &str, types: &[TypeDecl]) -> String {
+    use FieldType::*;
+    match ft {
+        DString => format!("{r}.read_dstring_str()"),
+        DVec(_) => format!("{r}.read_dvec_bytes()"),
+        DOption(inner) => format!("None if {r}.read() == 0 else {}", gen_py_read_field_expr(inner, r, types)),
+        _ => gen_py_read_expr(ft, r, types),
+    }
 }
 
 // --- type classes ---
@@ -2201,6 +2218,48 @@ class SlotWriter:
         else:
             self.write_bytes(s)
 
+    def write_dstring(self, val, alloc_ptr):
+        """Write DString (4 slots) from a DStringHandle or plain str/bytes."""
+        if hasattr(val, 'allocator'):
+            self.write_u64(int(val.allocator))
+            self.write_u64(int(val.ptr))
+            self.write_u64(int(val.len))
+            self.write_u64(int(val.cap))
+        else:
+            data = val.encode("utf-8") if isinstance(val, str) else bytes(val)
+            n = len(data)
+            self.write_u64(int(alloc_ptr))
+            if n == 0:
+                self.write_u64(0)
+                self.write_u64(0)
+                self.write_u64(0)
+            else:
+                ptr, _ = self._pin_bytes(data)
+                self.write_u64(ptr)
+                self.write_u64(n)
+                self.write_u64(n)
+
+    def write_dvec(self, val, alloc_ptr):
+        """Write DVec<u8> (4 slots) from a DVec handle or plain bytes."""
+        if hasattr(val, 'allocator'):
+            self.write_u64(int(val.allocator))
+            self.write_u64(int(val.ptr))
+            self.write_u64(int(val.len))
+            self.write_u64(int(val.cap))
+        else:
+            data = bytes(val)
+            n = len(data)
+            self.write_u64(int(alloc_ptr))
+            if n == 0:
+                self.write_u64(0)
+                self.write_u64(0)
+                self.write_u64(0)
+            else:
+                ptr, _ = self._pin_bytes(data)
+                self.write_u64(ptr)
+                self.write_u64(n)
+                self.write_u64(n)
+
     def write_opaque(self, handle):
         self.write_u64(handle._ptr)
 
@@ -2322,6 +2381,28 @@ class OutReader:
                 out.append(b"")
         self._release_list.append(ptr)
         return out
+
+    def read_dstring_str(self):
+        """Read DString (4 slots: allocator, ptr, len, cap) and return str."""
+        _alloc = self.read()
+        ptr = self.read()
+        n = self.read()
+        _cap = self.read()
+        if not ptr or not n:
+            return ""
+        self._release_list.append(ptr)
+        return ctypes.string_at(ptr, n).decode("utf-8", "replace")
+
+    def read_dvec_bytes(self):
+        """Read DVec<u8> (4 slots: allocator, ptr, len, cap) and return bytes."""
+        _alloc = self.read()
+        ptr = self.read()
+        n = self.read()
+        _cap = self.read()
+        if not ptr or not n:
+            return b""
+        self._release_list.append(ptr)
+        return ctypes.string_at(ptr, n)
 
     def release_owned(self):
         for p in self._release_list:
