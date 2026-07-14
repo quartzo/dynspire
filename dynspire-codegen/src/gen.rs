@@ -327,16 +327,59 @@ fn gen_write_return(ft: &FieldType, expr: &str, w: &str, types: &[TypeDecl]) -> 
         ),
         FieldType::Vec(inner) => {
             let rt = inner.rust_type();
-            format!(
-                "if {expr}.is_empty() {{ {w}.write_u64(0); {w}.write_u64(0); }} else {{ \
-                 let __len = {expr}.len(); \
-                 let __nbytes = __len * core::mem::size_of::<{rt}>(); \
-                 let __data = dynspire::managed::dynspire_alloc(__alloc, __nbytes, core::mem::align_of::<{rt}>()); \
-                 if __data.is_null() {{ {w}.write_u64(0); {w}.write_u64(0); }} else {{ \
-                 core::ptr::copy_nonoverlapping({expr}.as_ptr() as *const u8, __data, __nbytes); \
-                 {w}.write_u64(__data as u64); \
-                 {w}.write_u64(__len as u64); }} }}"
-            )
+            match inner.as_ref() {
+                // Vec<String>: deep-copy each string as (ptr, len) pairs
+                FieldType::String => format!(
+                    "if {expr}.is_empty() {{ {w}.write_u64(0); {w}.write_u64(0); }} else {{ \
+                     let __len = {expr}.len(); \
+                     let __nbytes = __len * 16; \
+                     let __data = dynspire::managed::dynspire_alloc(__alloc, __nbytes, 8); \
+                     if __data.is_null() {{ {w}.write_u64(0); {w}.write_u64(0); }} else {{ \
+                     let __slots = __data as *mut u64; \
+                     for (__i, __s) in {expr}.iter().enumerate() {{ \
+                         if __s.is_empty() {{ *__slots.add(__i * 2) = 0; *__slots.add(__i * 2 + 1) = 0; }} \
+                         else {{ let __slen = __s.len(); \
+                         let __sdata = dynspire::managed::dynspire_alloc(__alloc, __slen, 1); \
+                         if __sdata.is_null() {{ *__slots.add(__i * 2) = 0; *__slots.add(__i * 2 + 1) = 0; }} \
+                         else {{ core::ptr::copy_nonoverlapping(__s.as_ptr(), __sdata, __slen); \
+                         *__slots.add(__i * 2) = __sdata as u64; *__slots.add(__i * 2 + 1) = __slen as u64; }} }} }} \
+                     {w}.write_u64(__data as u64); \
+                     {w}.write_u64(__len as u64); }} }}"
+                ),
+                // Vec<Vec<T>>: deep-copy each inner vec as (ptr, len) pairs
+                FieldType::Vec(b) => {
+                    let bt = b.rust_type();
+                    format!(
+                        "if {expr}.is_empty() {{ {w}.write_u64(0); {w}.write_u64(0); }} else {{ \
+                         let __len = {expr}.len(); \
+                         let __nbytes = __len * 16; \
+                         let __data = dynspire::managed::dynspire_alloc(__alloc, __nbytes, 8); \
+                         if __data.is_null() {{ {w}.write_u64(0); {w}.write_u64(0); }} else {{ \
+                         let __slots = __data as *mut u64; \
+                         for (__i, __v) in {expr}.iter().enumerate() {{ \
+                             if __v.is_empty() {{ *__slots.add(__i * 2) = 0; *__slots.add(__i * 2 + 1) = 0; }} \
+                             else {{ let __vlen = __v.len(); \
+                             let __vnbytes = __vlen * core::mem::size_of::<{bt}>(); \
+                             let __vdata = dynspire::managed::dynspire_alloc(__alloc, __vnbytes, core::mem::align_of::<{bt}>()); \
+                             if __vdata.is_null() {{ *__slots.add(__i * 2) = 0; *__slots.add(__i * 2 + 1) = 0; }} \
+                             else {{ core::ptr::copy_nonoverlapping(__v.as_ptr() as *const u8, __vdata, __vnbytes); \
+                             *__slots.add(__i * 2) = __vdata as u64; *__slots.add(__i * 2 + 1) = __vlen as u64; }} }} }} \
+                         {w}.write_u64(__data as u64); \
+                         {w}.write_u64(__len as u64); }} }}"
+                    )
+                }
+                // Vec<primitive>: bitmap copy (works for Copy types)
+                _ => format!(
+                    "if {expr}.is_empty() {{ {w}.write_u64(0); {w}.write_u64(0); }} else {{ \
+                     let __len = {expr}.len(); \
+                     let __nbytes = __len * core::mem::size_of::<{rt}>(); \
+                     let __data = dynspire::managed::dynspire_alloc(__alloc, __nbytes, core::mem::align_of::<{rt}>()); \
+                     if __data.is_null() {{ {w}.write_u64(0); {w}.write_u64(0); }} else {{ \
+                     core::ptr::copy_nonoverlapping({expr}.as_ptr() as *const u8, __data, __nbytes); \
+                     {w}.write_u64(__data as u64); \
+                     {w}.write_u64(__len as u64); }} }}"
+                ),
+            }
         }
         FieldType::DStr => format!(
             "{w}.write_u64({expr}.ptr as u64); {w}.write_u64({expr}.len as u64);"
@@ -549,13 +592,53 @@ fn gen_read_receive(ft: &FieldType, r: &str, types: &[TypeDecl]) -> String {
         ),
         FieldType::Vec(inner) => {
             let rt = inner.rust_type();
-            format!(
-                "unsafe {{ \
-                 let __ptr = {r}.read_u64() as *mut {rt}; \
-                 let __len = {r}.read_u64() as usize; \
-                 if __ptr.is_null() || __len == 0 {{ Vec::new() }} \
-                 else {{ let __v = core::slice::from_raw_parts(__ptr, __len).to_vec(); dynspire::managed::dynspire_release(__ptr as *mut u8); __v }} }}"
-            )
+            match inner.as_ref() {
+                // Vec<String>: read (ptr, len) pairs, copy each string, release inner + outer
+                FieldType::String => format!(
+                    "unsafe {{ \
+                     let __ptr = {r}.read_u64() as *mut u64; \
+                     let __len = {r}.read_u64() as usize; \
+                     if __ptr.is_null() || __len == 0 {{ Vec::new() }} \
+                     else {{ \
+                         let mut __v: Vec<String> = Vec::with_capacity(__len); \
+                         for __i in 0..__len {{ \
+                             let __sp = *__ptr.add(__i * 2); \
+                             let __sl = *__ptr.add(__i * 2 + 1) as usize; \
+                             if __sp == 0 || __sl == 0 {{ __v.push(String::new()); }} \
+                             else {{ __v.push(String::from_utf8_unchecked(core::slice::from_raw_parts(__sp as *const u8, __sl).to_vec())); \
+                                    dynspire::managed::dynspire_release(__sp as *mut u8); }} }} \
+                         dynspire::managed::dynspire_release(__ptr as *mut u8); \
+                         __v }} }}"
+                ),
+                // Vec<Vec<T>>: read (ptr, len) pairs, copy each inner vec, release inner + outer
+                FieldType::Vec(b) => {
+                    let bt = b.rust_type();
+                    format!(
+                        "unsafe {{ \
+                         let __ptr = {r}.read_u64() as *mut u64; \
+                         let __len = {r}.read_u64() as usize; \
+                         if __ptr.is_null() || __len == 0 {{ Vec::new() }} \
+                         else {{ \
+                             let mut __v: Vec<Vec<{bt}>> = Vec::with_capacity(__len); \
+                             for __i in 0..__len {{ \
+                                 let __ep = *__ptr.add(__i * 2); \
+                                 let __el = *__ptr.add(__i * 2 + 1) as usize; \
+                                 if __ep == 0 || __el == 0 {{ __v.push(Vec::new()); }} \
+                                 else {{ __v.push(core::slice::from_raw_parts(__ep as *const {bt}, __el).to_vec()); \
+                                        dynspire::managed::dynspire_release(__ep as *mut u8); }} }} \
+                             dynspire::managed::dynspire_release(__ptr as *mut u8); \
+                             __v }} }}"
+                    )
+                }
+                // Vec<primitive>: bitmap copy
+                _ => format!(
+                    "unsafe {{ \
+                     let __ptr = {r}.read_u64() as *mut {rt}; \
+                     let __len = {r}.read_u64() as usize; \
+                     if __ptr.is_null() || __len == 0 {{ Vec::new() }} \
+                     else {{ let __v = core::slice::from_raw_parts(__ptr, __len).to_vec(); dynspire::managed::dynspire_release(__ptr as *mut u8); __v }} }}"
+                ),
+            }
         }
         FieldType::DStr => format!(
             "dynspire::managed::DStr {{ ptr: {r}.read_u64() as *const u8, len: {r}.read_u64() as usize }}"
@@ -2212,22 +2295,32 @@ class OutReader:
         ptr, n = self.read(), self.read()
         if not ptr or not n:
             return []
-        self._release_list.append(ptr)
+        arr = (ctypes.c_uint64 * (n * 2)).from_address(ptr)
         out = []
         for i in range(n):
-            view = self._client._vec_view_at_fn(ptr, i)
-            out.append("" if not view.len else ctypes.string_at(view.ptr, view.len).decode("utf-8", "replace"))
+            p, l = arr[i * 2], arr[i * 2 + 1]
+            if p and l:
+                self._release_list.append(p)
+                out.append(ctypes.string_at(p, l).decode("utf-8", "replace"))
+            else:
+                out.append("")
+        self._release_list.append(ptr)
         return out
 
     def read_vec_bytes(self):
         ptr, n = self.read(), self.read()
         if not ptr or not n:
             return []
-        self._release_list.append(ptr)
+        arr = (ctypes.c_uint64 * (n * 2)).from_address(ptr)
         out = []
         for i in range(n):
-            view = self._client._vec_view_at_fn(ptr, i)
-            out.append(b"" if not view.len else ctypes.string_at(view.ptr, view.len))
+            p, l = arr[i * 2], arr[i * 2 + 1]
+            if p and l:
+                self._release_list.append(p)
+                out.append(ctypes.string_at(p, l))
+            else:
+                out.append(b"")
+        self._release_list.append(ptr)
         return out
 
     def release_owned(self):
